@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Iterable, Literal
+from typing import Literal
 from uuid import NAMESPACE_URL, uuid5
 
 from markdown_it import MarkdownIt
@@ -13,6 +13,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    PayloadSchemaType,
     PointStruct,
     VectorParams,
 )
@@ -376,6 +377,13 @@ class VectorStore:
                 ),
             )
 
+        self.client.create_payload_index(
+            collection_name=self.config.collection_name,
+            field_name="source",
+            field_schema=PayloadSchemaType.KEYWORD,
+            wait=True,
+        )
+
     def ingest_markdown_dir(
         self,
         docs_dir: Path | None = None,
@@ -384,18 +392,24 @@ class VectorStore:
         docs_path = docs_dir or self.config.docs_dir
         self.ensure_collection(recreate=recreate)
 
-        points: list[PointStruct] = []
-        for file_path in sorted(docs_path.glob("*.md")):
-            points.extend(self._points_for_file(file_path))
+        file_points = [
+            (file_path, self._points_for_file(file_path))
+            for file_path in sorted(docs_path.glob("*.md"))
+        ]
 
-        if not points:
-            return 0
+        inserted = 0
+        for file_path, points in file_points:
+            self._delete_source_points(str(file_path))
+            if not points:
+                continue
 
-        self.client.upsert(
-            collection_name=self.config.collection_name,
-            points=points,
-        )
-        return len(points)
+            self.client.upsert(
+                collection_name=self.config.collection_name,
+                points=points,
+                wait=True,
+            )
+            inserted += len(points)
+        return inserted
 
     def search(
         self,
@@ -449,7 +463,7 @@ class VectorStore:
             )
         return results
 
-    def _points_for_file(self, file_path: Path) -> Iterable[PointStruct]:
+    def _points_for_file(self, file_path: Path) -> list[PointStruct]:
         text = file_path.read_text(encoding="utf-8")
         chunks = chunk_markdown(
             text,
@@ -464,14 +478,15 @@ class VectorStore:
             normalize_embeddings=True,
         )
         points: list[PointStruct] = []
+        source = str(file_path)
         for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            point_id = str(uuid5(NAMESPACE_URL, f"{file_path}:{idx}:{chunk.text}"))
+            point_id = str(uuid5(NAMESPACE_URL, f"{source}:{idx}"))
             points.append(
                 PointStruct(
                     id=point_id,
                     vector=embedding.tolist(),
                     payload={
-                        "source": str(file_path),
+                        "source": source,
                         "chunk_id": idx,
                         "text": chunk.text,
                         "content_type": chunk.content_type,
@@ -485,6 +500,20 @@ class VectorStore:
                 )
             )
         return points
+
+    def _delete_source_points(self, source: str) -> None:
+        self.client.delete(
+            collection_name=self.config.collection_name,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="source",
+                        match=MatchValue(value=source),
+                    )
+                ]
+            ),
+            wait=True,
+        )
 
     def _embed_one(self, text: str) -> list[float]:
         embedding = self.model.encode(text, normalize_embeddings=True)

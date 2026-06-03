@@ -342,6 +342,12 @@ Smoke-test Markdown chunking:
 python scripts/test_chunking.py
 ```
 
+Smoke-test incremental document replacement:
+
+```bash
+python scripts/test_vector_store.py
+```
+
 Smoke-test intent routing:
 
 ```bash
@@ -387,14 +393,22 @@ but kept separate from stored chunk text to avoid duplicating titles in every
 chunk. Oversized text chunks use an effective chunk budget that leaves room for
 overlap, while fenced code chunks preserve complete fences.
 
-After adding or editing documents, or after changing chunking logic, rebuild the
-collection:
+After adding or editing documents, run an incremental ingest:
+
+```bash
+python scripts/ingest_docs.py
+```
+
+Each current Markdown file replaces all previously indexed chunks with the same
+`source`, so edited or shortened files do not leave stale chunks behind. Use
+`--recreate` when deleting documents, replacing the whole corpus, or changing
+the embedding model's vector size:
 
 ```bash
 python scripts/ingest_docs.py --recreate
 ```
 
-or restart Compose with `RECREATE_COLLECTION=1`.
+The equivalent Compose setting is `RECREATE_COLLECTION=1`.
 
 ## Before Pushing to GitHub
 
@@ -404,6 +418,7 @@ Run these checks from the repository root:
 git status --short --ignored
 python -m compileall app scripts
 python scripts/test_chunking.py
+python scripts/test_vector_store.py
 python scripts/test_intent_router.py
 python scripts/test_prompt_budget.py
 python scripts/test_settings.py

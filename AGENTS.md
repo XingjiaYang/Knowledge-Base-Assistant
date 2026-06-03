@@ -21,6 +21,7 @@ This repository is Knowledge Base Assistant, a general-purpose RAG and direct-ch
 - `python scripts/ingest_docs.py --recreate`: rebuild the Qdrant collection from `data/docs/*.md`.
 - `python scripts/test_retrieve.py`: smoke-test vector retrieval.
 - `python scripts/test_chunking.py`: validate Markdown-aware chunk boundaries.
+- `python scripts/test_vector_store.py`: validate incremental document replacement.
 - `python scripts/test_intent_router.py`: smoke-test routing for RAG vs direct-chat questions.
 - `uvicorn app.main:app --host 0.0.0.0 --port 8080`: run the API manually.
 - `python -m compileall app scripts`: quick syntax check before pushing.
