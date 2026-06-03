@@ -22,9 +22,9 @@ def main() -> None:
     store = VectorStore(settings)
     inserted = store.ingest_markdown_dir(recreate=args.recreate)
     if inserted == 0:
-        print(f"No markdown documents found in {settings.docs_dir}")
+        print(f"No chunks generated from Markdown documents in {settings.docs_dir}")
         return
-    print(f"Upserted {inserted} chunks into collection: {settings.collection_name}")
+    print(f"Ingested {inserted} chunks into collection: {settings.collection_name}")
 
 
 if __name__ == "__main__":
