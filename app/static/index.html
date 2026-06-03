@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Local RAG LLM</title>
+  <title>Knowledge Base Assistant</title>
   <style>
     :root {
       color-scheme: light;
@@ -492,7 +492,7 @@
   <main class="app-shell">
     <aside class="sidebar">
       <div class="brand">
-        <h1>Local RAG LLM</h1>
+        <h1>Knowledge Base Assistant</h1>
         <p id="modelName">Loading model metadata</p>
       </div>
 
@@ -528,7 +528,7 @@
       <header class="chat-header">
         <div class="chat-title">
           <h2>Conversation</h2>
-          <span id="subtitle">Retrieval augmented chat over local Markdown docs</span>
+          <span id="subtitle">Answers grounded in a local Markdown knowledge base</span>
         </div>
         <div id="compactChip" class="compact-chip" hidden>Memory compacted</div>
       </header>
@@ -537,7 +537,7 @@
 
       <form id="composer" class="composer">
         <div class="composer-inner">
-          <textarea id="prompt" rows="2" placeholder="Ask a question about the indexed database notes"></textarea>
+          <textarea id="prompt" rows="2" placeholder="Ask a question about the indexed knowledge base"></textarea>
           <button id="sendButton" class="send-button" type="submit">Send</button>
         </div>
       </form>

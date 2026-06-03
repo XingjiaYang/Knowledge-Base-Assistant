@@ -93,9 +93,10 @@ class Settings:
         "INTENT_EMBEDDING_TEXT_MAX_CHARS",
         7000,
     )
-    intent_embedding_db_threshold: float = _env_float(
-        "INTENT_EMBEDDING_DB_THRESHOLD",
-        0.38,
+    intent_embedding_rag_threshold: float = _env_float(
+        "INTENT_EMBEDDING_RAG_THRESHOLD",
+        # Preserve manual-development compatibility with older .env files.
+        _env_float("INTENT_EMBEDDING_DB_THRESHOLD", 0.38),
     )
     intent_embedding_direct_threshold: float = _env_float(
         "INTENT_EMBEDDING_DIRECT_THRESHOLD",

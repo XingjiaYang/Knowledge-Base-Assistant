@@ -8,7 +8,7 @@ from typing import Literal, Protocol, Sequence
 import numpy as np
 
 from app.config import Settings, settings
-from app.llm_client import LocalLLMClient
+from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget, TrimStrategy
 
 
@@ -20,6 +20,7 @@ RouteName = Literal[
     "embedding_direct",
     "llm_rag",
     "llm_direct",
+    "fallback_rag",
     "fallback_direct",
 ]
 
@@ -37,79 +38,6 @@ class IntentDecision:
 
 
 class IntentRouter:
-    DB_KEYWORDS = (
-        "postgresql",
-        "postgres",
-        "mysql",
-        "innodb",
-        "sqlite",
-        "duckdb",
-        "rocksdb",
-        "lmdb",
-        "clickhouse",
-        "druid",
-        "pinot",
-        "snowflake",
-        "bigquery",
-        "mongodb",
-        "mongo",
-        "cassandra",
-        "scylladb",
-        "redis",
-        "elasticsearch",
-        "opensearch",
-        "neo4j",
-        "timescaledb",
-        "influxdb",
-        "qdrant",
-        "milvus",
-        "weaviate",
-        "pgvector",
-        "chroma",
-        "faiss",
-        "cockroachdb",
-        "yugabytedb",
-        "tidb",
-        "database",
-        "databases",
-        "data warehouse",
-        "oltp",
-        "olap",
-        "sql",
-        "nosql",
-        "mvcc",
-        "transaction",
-        "transactions",
-        "replication",
-        "sharding",
-        "consistency",
-        "cap theorem",
-        "storage engine",
-        "query optimizer",
-        "vector database",
-        "vector db",
-        "ann search",
-        "数据库",
-        "向量库",
-        "向量数据库",
-        "关系型数据库",
-        "文档数据库",
-        "图数据库",
-        "时序数据库",
-        "数据仓库",
-        "湖仓",
-        "事务",
-        "索引",
-        "查询优化",
-        "存储引擎",
-        "分布式数据库",
-        "一致性",
-        "复制",
-        "分片",
-        "列存",
-        "行存",
-    )
-
     FORCE_RAG_PHRASES = (
         "use rag",
         "use retrieval",
@@ -163,42 +91,39 @@ class IntentRouter:
         r"\b(tell|make)\b.{0,40}\bjoke\b",
         r"\btranslate\b",
         r"\bsummarize my resume\b",
+        r"^\s*(hi|hello|hey|thanks|thank you)[!.?\s]*$",
         r"(写|创作|生成).{0,40}(诗|邮件|简历)",
         r"讲.{0,20}笑话",
         r"翻译",
         r"简历",
+        r"^\s*(你好|您好|谢谢|感谢)[！!。.\s]*$",
     )
 
-    DB_ANCHORS = (
-        "database systems, SQL, NoSQL, storage engines, transactions, indexes, query planning",
-        "OLTP databases, concurrency control, MVCC, replication, sharding, consistency",
-        "OLAP databases, analytics engines, data warehouses, columnar storage, ClickHouse, DuckDB",
-        "vector databases, embedding indexes, ANN search, semantic search, Qdrant, Milvus, Weaviate, pgvector",
-        "embedded databases, RocksDB, LMDB, SQLite, local storage engines",
-        "time series databases, graph databases, document databases, distributed SQL systems",
-        "数据库 系统 SQL 事务 索引 OLTP OLAP 向量数据库 分布式数据库 数据仓库",
+    RAG_ANCHORS = (
+        "knowledge base documentation facts concepts explanations and specifications",
+        "questions asking for comparisons recommendations procedures or implementation details",
+        "troubleshooting questions and follow-up questions about documented topics",
+        "知识库 文档 资料 事实 概念 说明 规范 对比 流程 故障排查",
     )
 
     DIRECT_ANCHORS = (
         "casual conversation, greetings, thanks, personal messages",
-        "writing, translation, resume editing, emails, jokes, poetry, creative tasks",
-        "general programming, Docker, GitHub, project deployment unrelated to database documentation",
-        "math, travel, weather, personal advice, daily life questions",
-        "general AI assistant question that does not require local database notes",
-        "闲聊 翻译 写作 简历 编程 数学 天气 生活问题 不需要数据库资料",
+        "creative writing, translation, rewriting, emails, jokes, poetry, and resume editing",
+        "requests that explicitly do not need documentation or retrieval",
+        "闲聊 问候 感谢 翻译 写作 简历 创作 不需要文档 不需要知识库",
     )
 
     def __init__(
         self,
         config: Settings = settings,
         embedder: object | None = None,
-        llm_client: LocalLLMClient | None = None,
+        llm_client: LLMClient | None = None,
     ) -> None:
         self.config = config
         self.budget = PromptBudget.from_config(config)
         self.embedder = embedder
         self.llm_client = llm_client
-        self._db_anchor_vectors: np.ndarray | None = None
+        self._rag_anchor_vectors: np.ndarray | None = None
         self._direct_anchor_vectors: np.ndarray | None = None
 
     def route(
@@ -233,9 +158,9 @@ class IntentRouter:
                 return llm_decision
 
         return IntentDecision(
-            False,
-            "fallback_direct",
-            "No confident database-document intent matched.",
+            True,
+            "fallback_rag",
+            "No clear direct-chat intent matched; defaulting to knowledge-base retrieval.",
         )
 
     def _route_with_keywords(
@@ -262,15 +187,7 @@ class IntentRouter:
             return IntentDecision(
                 False,
                 "keyword_direct",
-                "Question is a writing or creative task.",
-            )
-
-        matched_db_keyword = self._first_match(text, self.DB_KEYWORDS)
-        if matched_db_keyword:
-            return IntentDecision(
-                True,
-                "keyword_rag",
-                f"Matched database keyword: {matched_db_keyword}",
+                "Question is a clear direct-chat task.",
             )
 
         return None
@@ -296,23 +213,23 @@ class IntentRouter:
         except Exception:
             return None
 
-        if self._db_anchor_vectors is None or self._direct_anchor_vectors is None:
+        if self._rag_anchor_vectors is None or self._direct_anchor_vectors is None:
             return None
 
-        db_score = float(np.max(self._db_anchor_vectors @ query_vector))
+        rag_score = float(np.max(self._rag_anchor_vectors @ query_vector))
         direct_score = float(np.max(self._direct_anchor_vectors @ query_vector))
-        margin = db_score - direct_score
+        margin = rag_score - direct_score
 
         if (
-            db_score >= self.config.intent_embedding_db_threshold
+            rag_score >= self.config.intent_embedding_rag_threshold
             and margin >= self.config.intent_embedding_margin
         ):
             return IntentDecision(
                 True,
                 "embedding_rag",
                 (
-                    "Embedding intent matched database topics "
-                    f"(db={db_score:.3f}, direct={direct_score:.3f})."
+                    "Embedding intent matched knowledge-base question patterns "
+                    f"(rag={rag_score:.3f}, direct={direct_score:.3f})."
                 ),
             )
 
@@ -325,7 +242,7 @@ class IntentRouter:
                 "embedding_direct",
                 (
                     "Embedding intent matched direct-chat topics "
-                    f"(db={db_score:.3f}, direct={direct_score:.3f})."
+                    f"(rag={rag_score:.3f}, direct={direct_score:.3f})."
                 ),
             )
 
@@ -348,15 +265,18 @@ class IntentRouter:
             strategy="middle",
         ) or "None"
         prompt = (
-            "Local corpus scope: database systems and database selection. It "
-            "covers embedded databases, OLTP, OLAP, distributed SQL, search, "
-            "graph, time-series, vector databases, and related storage/retrieval "
-            "concepts.\n\n"
+            "This application has a replaceable local Markdown knowledge base. "
+            "Its subject can vary. Use retrieval for factual, explanatory, "
+            "comparison, procedural, troubleshooting, or follow-up questions "
+            "that may benefit from indexed documents. Use direct chat for "
+            "greetings, casual conversation, creative writing, translation, or "
+            "requests that explicitly do not need documents. Do not assume a "
+            "specific knowledge domain.\n\n"
             f"Compact memory:\n{summary_text}\n\n"
             f"Recent conversation:\n{history_text or 'None'}\n\n"
             f"Current question:\n{question}\n\n"
-            "Decide whether answering should use this local database-document "
-            "vector store. Return only JSON with keys use_rag and reason."
+            "Decide whether answering should use the knowledge-base vector "
+            "store. Return only JSON with keys use_rag and reason."
         )
         messages = [
             {
@@ -395,11 +315,11 @@ class IntentRouter:
 
     def _ensure_anchor_vectors(self) -> None:
         if (
-            self._db_anchor_vectors is not None
+            self._rag_anchor_vectors is not None
             and self._direct_anchor_vectors is not None
         ):
             return
-        self._db_anchor_vectors = self._embed_many(self.DB_ANCHORS)
+        self._rag_anchor_vectors = self._embed_many(self.RAG_ANCHORS)
         self._direct_anchor_vectors = self._embed_many(self.DIRECT_ANCHORS)
 
     def _embed_many(self, texts: Sequence[str]) -> np.ndarray:

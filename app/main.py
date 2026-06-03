@@ -9,12 +9,12 @@ from pydantic import BaseModel, Field
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.config import settings
-from app.llm_client import LocalLLMClient
+from app.llm_client import LLMClient
 from app.rag import ChatMessage, RAGPipeline
 from app.vector_store import SearchResult, VectorStore
 
 
-app = FastAPI(title="Local RAG LLM", version="0.1.0")
+app = FastAPI(title="Knowledge Base Assistant", version="0.1.0")
 
 INDEX_HTML_PATH = Path(__file__).with_name("static") / "index.html"
 INDEX_HTML_FALLBACK = """
@@ -23,11 +23,11 @@ INDEX_HTML_FALLBACK = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Local RAG LLM</title>
+  <title>Knowledge Base Assistant</title>
 </head>
 <body>
   <main>
-    <h1>Local RAG LLM</h1>
+    <h1>Knowledge Base Assistant</h1>
     <p>The web UI file is missing. Check app/static/index.html.</p>
   </main>
 </body>
@@ -102,7 +102,7 @@ class RAGResponse(BaseModel):
 
 
 vector_store = VectorStore(settings)
-llm_client = LocalLLMClient(settings)
+llm_client = LLMClient(settings)
 rag_pipeline = RAGPipeline(
     settings,
     vector_store=vector_store,

@@ -2,11 +2,11 @@
 
 ## Project Structure & Module Organization
 
-This repository is a local RAG MVP built with FastAPI, Qdrant, SentenceTransformers, and vLLM.
+This repository is Knowledge Base Assistant, a general-purpose RAG and direct-chat application built with FastAPI, Qdrant, SentenceTransformers, and a configurable LLM provider.
 
-- `app/`: application code. `main.py` exposes the FastAPI app, `static/` contains the web UI, `intent_router.py` decides whether retrieval is needed, `rag.py` coordinates retrieval and generation, `vector_store.py` manages Qdrant, `llm_client.py` calls the OpenAI-compatible vLLM API, and `config.py` reads environment settings.
+- `app/`: application code. `main.py` exposes the FastAPI app, `static/` contains the web UI, `intent_router.py` decides whether retrieval is needed, `rag.py` coordinates retrieval and generation, `vector_store.py` manages Qdrant, `llm_client.py` calls the configured cloud or local LLM API, and `config.py` reads environment settings.
 - `scripts/`: operational scripts for starting local services, ingesting Markdown, and testing retrieval.
-- `data/docs/`: source Markdown documents used for ingestion.
+- `data/docs/`: replaceable source Markdown documents used for ingestion. The committed files are a database-focused sample corpus.
 - `docker/`, `Dockerfile`, `compose.yaml`: container entrypoint and Docker Compose deployment.
 - `configs/`, `benchmark/`: supporting configuration and evaluation assets when present.
 - Runtime state such as `qdrant_storage/`, `models/`, caches, logs, and `.env` must stay uncommitted.
@@ -14,7 +14,7 @@ This repository is a local RAG MVP built with FastAPI, Qdrant, SentenceTransform
 ## Build, Test, and Development Commands
 
 - `cp .env.example .env`: create local deployment settings.
-- `docker compose up --build`: build and start Qdrant, vLLM, document ingest, and FastAPI.
+- `docker compose up --build`: build and start Qdrant, document ingest, and FastAPI using the configured LLM API.
 - `APP_PORT=9000 docker compose up --build`: run the frontend/API on a different host port.
 - `docker compose down`: stop the stack.
 - `conda activate rag_llm && pip install -r requirements.txt`: set up manual local development.

@@ -5,7 +5,7 @@ import httpx
 from app.config import Settings, settings
 
 
-class LocalLLMClient:
+class LLMClient:
     def __init__(self, config: Settings = settings) -> None:
         self.config = config
 
