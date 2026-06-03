@@ -1,19 +1,26 @@
-# Local RAG LLM
+# Knowledge Base Assistant
 
-A self-hosted Retrieval-Augmented Generation application for querying a local
-Markdown knowledge base. The project runs Qdrant for vector search, vLLM for an
-OpenAI-compatible local LLM endpoint, SentenceTransformers for embeddings, and
-FastAPI for both the API and the browser UI.
+Knowledge Base Assistant is a general-purpose chat application for exploring a
+replaceable local Markdown knowledge base. It uses intent routing to choose
+between retrieval-augmented answers grounded in the indexed corpus and direct
+chat for requests that do not need retrieval.
 
-The current dataset focuses on database systems, including embedded databases,
-OLTP engines, OLAP engines, distributed SQL systems, time-series databases,
-search engines, graph databases, and vector databases.
+Qdrant provides vector search, SentenceTransformers generates embeddings, and
+FastAPI serves both the API and browser UI. Generation is provider-configurable:
+the default setup targets an OpenAI-compatible cloud API, Anthropic is supported,
+and a local vLLM service remains available as an optional Docker Compose profile.
+
+The repository ships with database-system notes as a sample corpus. The
+application and intent router are not tied to that subject: replace the Markdown
+files under `data/docs/` and rebuild the Qdrant collection to use another domain.
 
 ## Highlights
 
-- Docker Compose deployment for Qdrant, vLLM, document ingestion, and FastAPI.
+- Docker Compose deployment for Qdrant, document ingestion, and FastAPI.
+- Configurable cloud LLM providers with an optional local vLLM profile.
+- Replaceable Markdown corpus without domain-specific routing code.
 - Chat-style web UI at `/` with adjustable `top_k` retrieval.
-- Intent routing avoids vector search for off-topic or direct-chat questions.
+- Intent routing avoids vector search for clear direct-chat questions.
 - Source references are shown when retrieval is used.
 - Conversation history is sent to the backend and older turns are compacted into
   a reusable summary.
@@ -31,11 +38,11 @@ FastAPI /rag
 IntentRouter
    |-- keyword rules
    |-- embedding similarity
-   |-- vLLM zero-shot fallback for ambiguous cases
+   |-- configured LLM zero-shot fallback for ambiguous cases
    |
 RAGPipeline or Direct Chat
    |-- optional SentenceTransformers -> Qdrant vector search
-   |-- vLLM OpenAI-compatible /v1/chat/completions
+   |-- OpenAI-compatible or Anthropic LLM API
    |
 Answer + retrieved references + compacted conversation memory
 ```
@@ -48,9 +55,9 @@ Main modules:
 - `app/rag.py`: retrieval, prompt construction, and history compaction.
 - `app/vector_store.py`: Markdown chunking, embeddings, Qdrant collection
   management, and search.
-- `app/llm_client.py`: local OpenAI-compatible LLM client.
+- `app/llm_client.py`: provider-aware client for cloud APIs or local vLLM.
 - `scripts/`: manual service, ingest, and retrieval smoke-test commands.
-- `data/docs/`: Markdown documents ingested into Qdrant.
+- `data/docs/`: replaceable Markdown documents ingested into Qdrant.
 
 ## Repository Contents
 
@@ -194,7 +201,7 @@ INTENT_LLM_MAX_TOKENS=120
 INTENT_EMBEDDING_HISTORY_MAX_CHARS=5000
 INTENT_EMBEDDING_SUMMARY_MAX_CHARS=2500
 INTENT_EMBEDDING_TEXT_MAX_CHARS=7000
-INTENT_EMBEDDING_DB_THRESHOLD=0.38
+INTENT_EMBEDDING_RAG_THRESHOLD=0.38
 INTENT_EMBEDDING_DIRECT_THRESHOLD=0.40
 INTENT_EMBEDDING_MARGIN=0.06
 ```
@@ -203,6 +210,19 @@ INTENT_EMBEDDING_MARGIN=0.06
 local vLLM. For Anthropic Claude, use `LLM_PROVIDER=anthropic` and
 `LLM_BASE_URL=https://api.anthropic.com/v1`. Embeddings remain local through
 SentenceTransformers.
+
+## Replace the Knowledge Base
+
+The Markdown files under `data/docs/` provide the runtime domain content. The
+committed files cover database systems as an example, but the retrieval pipeline
+and intent router use general knowledge-base question patterns rather than
+database keywords.
+
+To use another subject:
+
+1. Replace or edit the Markdown files under `data/docs/`.
+2. Rebuild the Qdrant collection with `python scripts/ingest_docs.py --recreate`.
+3. Ask questions about the new corpus through the same UI or `/rag` API.
 
 ## Restricted Network Setup
 
@@ -290,8 +310,8 @@ pip install -r requirements.txt
 `requirements.txt` lists direct development dependencies only; transitive pins
 are intentionally not committed as a `pip freeze` dump.
 
-For API-only development with Docker-managed vLLM/Qdrant, the smaller runtime
-dependency set is:
+For API development with a configured LLM API and Docker-managed Qdrant, the
+smaller runtime dependency set is:
 
 ```bash
 pip install -r requirements.api.txt
@@ -354,11 +374,11 @@ python -m compileall app scripts
 
 ## Document Corpus
 
-Markdown files in `data/docs/` are the RAG source of truth. Current files cover
-PostgreSQL, MySQL/InnoDB, SQLite, DuckDB, RocksDB, LMDB, ClickHouse, Druid,
-Pinot, Snowflake, BigQuery, MongoDB, Cassandra, ScyllaDB, Redis, Elasticsearch,
-Neo4j, TimescaleDB, InfluxDB, Qdrant, Milvus, Weaviate, pgvector, Chroma, FAISS,
-CockroachDB, YugabyteDB, TiDB, and a database selection guide.
+Markdown files in `data/docs/` are the RAG source of truth. The bundled sample
+files cover PostgreSQL, MySQL/InnoDB, SQLite, DuckDB, RocksDB, LMDB, ClickHouse,
+Druid, Pinot, Snowflake, BigQuery, MongoDB, Cassandra, ScyllaDB, Redis,
+Elasticsearch, Neo4j, TimescaleDB, InfluxDB, Qdrant, Milvus, Weaviate, pgvector,
+Chroma, FAISS, CockroachDB, YugabyteDB, TiDB, and a database selection guide.
 
 Chunking is Markdown-aware and metadata-driven: Markdown blocks are parsed,
 headings are stored as `h1`/`h2`/`h3` payload metadata, and text, code, and

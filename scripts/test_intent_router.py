@@ -30,8 +30,8 @@ class FakeVectorStore:
         self.search_calls += 1
         return [
             SearchResult(
-                text="PostgreSQL is an OLTP database.",
-                source="data/docs/postgresql.md",
+                text="New employees request equipment through the IT portal.",
+                source="data/docs/onboarding.md",
                 chunk_id=0,
                 score=0.9,
             )
@@ -77,29 +77,25 @@ class FakeIntentEmbedder:
         lowered = text.lower()
         direct_markers = (
             "casual conversation",
-            "writing, translation",
-            "unrelated to database documentation",
-            "math, travel",
-            "general ai assistant",
+            "creative writing",
+            "explicitly do not need",
             "闲聊",
-            "周末旅行",
-            "天气",
+            "你好",
+            "谢谢",
         )
         if any(marker in lowered for marker in direct_markers):
             return [0.0, 1.0]
 
-        db_markers = (
-            "database",
-            "databases",
-            "postgresql",
-            "mysql",
-            "oltp",
-            "olap",
-            "storage",
-            "数据库",
-            "事务",
+        rag_markers = (
+            "knowledge base documentation",
+            "questions asking for comparisons",
+            "troubleshooting questions",
+            "知识库",
+            "employee handbook",
+            "onboarding",
+            "vacation policy",
         )
-        if any(marker in lowered for marker in db_markers):
+        if any(marker in lowered for marker in rag_markers):
             return [1.0, 0.0]
 
         return [0.5, 0.5]
@@ -139,13 +135,13 @@ def assert_pipeline_search_behavior() -> None:
         intent_router=router,
     )
 
-    direct_answer = pipeline.answer("今天天气怎么样？")
+    direct_answer = pipeline.answer("写一首短诗")
     if direct_answer.used_rag or vector_store.search_calls != 0:
         raise AssertionError("Direct route should not call vector search.")
 
-    rag_answer = pipeline.answer("PostgreSQL 的事务隔离怎么理解？")
+    rag_answer = pipeline.answer("新员工如何申请开发设备？")
     if not rag_answer.used_rag or vector_store.search_calls != 1:
-        raise AssertionError("Database route should call vector search once.")
+        raise AssertionError("Knowledge-base route should call vector search once.")
 
     print("Pipeline search behavior -> ok")
 
@@ -153,33 +149,33 @@ def assert_pipeline_search_behavior() -> None:
 def assert_embedding_context_behavior() -> None:
     router = IntentRouter(Settings(), embedder=FakeIntentEmbedder(), llm_client=None)
     history = [
-        Message("user", "PostgreSQL 和 MySQL 怎么选？"),
-        Message("assistant", "PostgreSQL 更适合需要复杂 SQL 和扩展的 OLTP。"),
+        Message("user", "员工手册里的入职流程是什么？"),
+        Message("assistant", "入职流程包括账号开通和设备申请。"),
     ]
 
     classification_text = router._classification_text(
-        "那它和另一个相比呢？",
+        "设备申请具体怎么做？",
         history,
-        "User is comparing transactional databases.",
+        "The user is reviewing the employee onboarding process.",
     )
-    if "USER: PostgreSQL 和 MySQL 怎么选？" not in classification_text:
+    if "USER: 员工手册里的入职流程是什么？" not in classification_text:
         raise AssertionError("Embedding classification text should include user turns.")
-    if "ASSISTANT: PostgreSQL 更适合" not in classification_text:
+    if "ASSISTANT: 入职流程包括账号开通" not in classification_text:
         raise AssertionError(
             "Embedding classification text should include assistant turns."
         )
 
     assert_route(
         router,
-        "那它和另一个相比呢？",
+        "设备申请具体怎么做？",
         True,
         history=history,
         expected_route="embedding_rag",
-        conversation_summary="User is comparing transactional databases.",
+        conversation_summary="The user is reviewing the employee onboarding process.",
     )
     assert_route(
         router,
-        "周末旅行怎么规划？",
+        "谢谢你刚才的帮助",
         False,
         expected_route="embedding_direct",
     )
@@ -190,14 +186,14 @@ def assert_llm_fallback_behavior() -> None:
         Settings(),
         embedder=None,
         llm_client=FakeClassifierLLM(
-            '{"use_rag": "true", "reason": "DB follow-up"}'
+            '{"use_rag": "true", "reason": "knowledge-base follow-up"}'
         ),
     )
     assert_route(
         rag_router,
-        "那长期维护成本呢？",
+        "那审批时限呢？",
         True,
-        history=[Message("assistant", "We compared PostgreSQL and MySQL.")],
+        history=[Message("assistant", "We reviewed the vacation policy.")],
         expected_route="llm_rag",
     )
 
@@ -221,21 +217,21 @@ def main() -> None:
 
     assert_route(
         router,
-        "Compare PostgreSQL and MySQL for OLTP.",
+        "How should new employees request equipment?",
         True,
-        expected_route="keyword_rag",
+        expected_route="fallback_rag",
     )
     assert_route(
         router,
         "Hi, what is PostgreSQL?",
         True,
-        expected_route="keyword_rag",
+        expected_route="fallback_rag",
     )
     assert_route(
         router,
-        "今天天气怎么样？",
+        "你好",
         False,
-        expected_route="fallback_direct",
+        expected_route="keyword_direct",
     )
     assert_route(
         router,
@@ -247,7 +243,7 @@ def main() -> None:
         router,
         "PostgreSQL email notification pattern 怎么设计？",
         True,
-        expected_route="keyword_rag",
+        expected_route="fallback_rag",
     )
     assert_route(
         router,

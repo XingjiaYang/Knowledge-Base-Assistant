@@ -5,7 +5,7 @@ from typing import Literal
 
 from app.config import Settings, settings
 from app.intent_router import IntentRouter
-from app.llm_client import LocalLLMClient
+from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget, TrimStrategy
 from app.vector_store import SearchResult, VectorStore
 
@@ -32,13 +32,13 @@ class RAGPipeline:
         self,
         config: Settings = settings,
         vector_store: VectorStore | None = None,
-        llm_client: LocalLLMClient | None = None,
+        llm_client: LLMClient | None = None,
         intent_router: IntentRouter | None = None,
     ) -> None:
         self.config = config
         self.budget = PromptBudget.from_config(config)
         self.vector_store = vector_store or VectorStore(config)
-        self.llm_client = llm_client or LocalLLMClient(config)
+        self.llm_client = llm_client or LLMClient(config)
         self.intent_router = intent_router or IntentRouter(
             config,
             embedder=getattr(self.vector_store, "model", None),
@@ -143,7 +143,7 @@ class RAGPipeline:
             {
                 "role": "system",
                 "content": (
-                    "You compact chat history for a technical RAG assistant. "
+                    "You compact chat history for Knowledge Base Assistant. "
                     "Return only the compact memory."
                 ),
             },
@@ -219,10 +219,10 @@ class RAGPipeline:
             context_text = "No retrieved context."
 
         system_prompt = (
-            "You are a technical AI assistant for a local RAG application. Use "
-            "the retrieved context when it is relevant, combine it with the "
-            "conversation history, and avoid inventing details when evidence is "
-            "insufficient. Give complete answers when the user asks for depth."
+            "You are Knowledge Base Assistant. Use the retrieved context when it "
+            "is relevant, combine it with the conversation history, and avoid "
+            "inventing details when evidence is insufficient. Give complete "
+            "answers when the user asks for depth."
         )
         user_prompt = (
             "Retrieved context:\n"
@@ -269,10 +269,10 @@ class RAGPipeline:
         conversation_summary: str,
     ) -> list[dict[str, str]]:
         system_prompt = (
-            "You are a technical AI assistant. This request was routed to "
-            "direct chat, so no vector database retrieval was used. Answer from "
-            "the conversation context and your general knowledge, and do not "
-            "claim that local documents support the answer."
+            "You are Knowledge Base Assistant. This request was routed to direct "
+            "chat, so no knowledge-base retrieval was used. Answer from the "
+            "conversation context and your general knowledge, and do not claim "
+            "that local documents support the answer."
         )
         user_prompt = (
             "Current question:\n"

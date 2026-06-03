@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import Settings
-from app.llm_client import LocalLLMClient
+from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget
 
 
@@ -44,6 +44,7 @@ def assert_llm_settings() -> None:
         llm_health_check_enabled=True,
         llm_health_path="/models",
         llm_anthropic_version="2023-06-01",
+        intent_embedding_rag_threshold=0.55,
     )
 
     if config.llm_provider != "anthropic":
@@ -54,6 +55,8 @@ def assert_llm_settings() -> None:
         raise AssertionError("LLM model should be configurable.")
     if not config.llm_health_check_enabled:
         raise AssertionError("LLM health check flag should be configurable.")
+    if config.intent_embedding_rag_threshold != 0.55:
+        raise AssertionError("RAG embedding threshold should be configurable.")
 
     print("LLM settings -> ok")
 
@@ -65,7 +68,7 @@ def assert_llm_client_provider_helpers() -> None:
         llm_anthropic_version="2023-06-01",
         llm_health_check_enabled=False,
     )
-    client = LocalLLMClient(config)
+    client = LLMClient(config)
     system, messages = client._to_anthropic_messages(
         [
             {"role": "system", "content": "System A"},
