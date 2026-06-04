@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
+from threading import Lock
 from typing import Literal, Protocol, Sequence
 
 import numpy as np
@@ -125,6 +126,7 @@ class IntentRouter:
         self.llm_client = llm_client
         self._rag_anchor_vectors: np.ndarray | None = None
         self._direct_anchor_vectors: np.ndarray | None = None
+        self._anchor_lock = Lock()
 
     def route(
         self,
@@ -319,8 +321,14 @@ class IntentRouter:
             and self._direct_anchor_vectors is not None
         ):
             return
-        self._rag_anchor_vectors = self._embed_many(self.RAG_ANCHORS)
-        self._direct_anchor_vectors = self._embed_many(self.DIRECT_ANCHORS)
+        with self._anchor_lock:
+            if (
+                self._rag_anchor_vectors is not None
+                and self._direct_anchor_vectors is not None
+            ):
+                return
+            self._rag_anchor_vectors = self._embed_many(self.RAG_ANCHORS)
+            self._direct_anchor_vectors = self._embed_many(self.DIRECT_ANCHORS)
 
     def _embed_many(self, texts: Sequence[str]) -> np.ndarray:
         vectors = self.embedder.encode(texts, normalize_embeddings=True)
@@ -394,7 +402,7 @@ class IntentRouter:
 
     def _matches_direct_task(self, text: str) -> bool:
         return any(
-            re.search(pattern, text)
+            re.search(pattern, text, flags=re.IGNORECASE)
             for pattern in self.DIRECT_TASK_PATTERNS
         )
 

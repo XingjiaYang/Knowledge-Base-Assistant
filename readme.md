@@ -128,7 +128,7 @@ docker compose down -v
 `compose.yaml` starts two services by default:
 
 - `qdrant`: stores vectors in the `qdrant_storage` Docker volume.
-- `api`: waits for Qdrant, optionally ingests `data/docs/*.md`, and starts
+- `api`: waits for Qdrant, optionally ingests Markdown under `data/docs/`, and starts
   FastAPI on container port `8080`.
 
 The `vllm` service is optional and only starts under the `local-llm` profile:
@@ -240,10 +240,11 @@ the token on the first authenticated request and stores it in local storage.
 
 ## Replace the Knowledge Base
 
-The Markdown files under `data/docs/` provide the runtime domain content. The
-committed files cover database systems as an example, but the retrieval pipeline
-and intent router use general knowledge-base question patterns rather than
-database keywords.
+The Markdown files under `data/docs/` provide the runtime domain content.
+Ingestion scans that tree recursively, so nested topic folders are supported.
+The committed files cover database systems as an example, but the retrieval
+pipeline and intent router use general knowledge-base question patterns rather
+than database keywords.
 
 To use another subject:
 

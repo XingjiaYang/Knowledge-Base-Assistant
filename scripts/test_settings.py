@@ -250,6 +250,73 @@ def assert_public_health_endpoint() -> None:
     print("Public health endpoint -> ok")
 
 
+def assert_app_lifespan_recreates_resources() -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+        if response.status_code != 200:
+            raise AssertionError("Health endpoint should work during lifespan.")
+        first_pipeline = app.state.rag_pipeline
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+        if response.status_code != 200:
+            raise AssertionError("Health endpoint should work after restart.")
+        second_pipeline = app.state.rag_pipeline
+
+    if first_pipeline is second_pipeline:
+        raise AssertionError("App lifespan should recreate runtime resources.")
+
+    print("App lifespan resources -> ok")
+
+
+def assert_rag_endpoint_accepts_original_body_shape() -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from app.rag import RAGAnswer
+
+    class FakePipeline:
+        def answer(
+            self,
+            question: str,
+            top_k: int | None = None,
+            history: object | None = None,
+            conversation_summary: str | None = None,
+        ) -> RAGAnswer:
+            return RAGAnswer(
+                answer=f"echo: {question}",
+                contexts=[],
+                conversation_summary=conversation_summary or "",
+                compacted_history_messages=0,
+                used_rag=False,
+                route="fallback_direct",
+                route_reason="test",
+            )
+
+    with TestClient(app) as client:
+        app.state.rag_pipeline = FakePipeline()
+        response = client.post(
+            "/rag",
+            json={
+                "question": "Hello",
+                "top_k": 1,
+                "history": [],
+                "conversation_summary": "",
+            },
+        )
+
+    if response.status_code != 200:
+        raise AssertionError(f"RAG endpoint rejected original body: {response.text}")
+    if response.json()["answer"] != "echo: Hello":
+        raise AssertionError("RAG endpoint should use the parsed request body.")
+
+    print("RAG endpoint body shape -> ok")
+
+
 def assert_invalid_settings_rejected() -> None:
     invalid_configs = [
         {"chunk_size": 100, "chunk_overlap": 100},
@@ -320,6 +387,8 @@ def main() -> None:
     assert_llm_client_connection_reuse()
     assert_api_auth()
     assert_public_health_endpoint()
+    assert_app_lifespan_recreates_resources()
+    assert_rag_endpoint_accepts_original_body_shape()
     assert_invalid_settings_rejected()
     assert_prompt_budget_settings()
 

@@ -455,7 +455,7 @@ class VectorStore:
         logger.info("Ingesting Markdown documents from %s.", docs_path)
 
         inserted = 0
-        for file_path in sorted(docs_path.glob("*.md")):
+        for file_path in sorted(docs_path.rglob("*.md")):
             points = self._points_for_file(file_path)
             if not recreate:
                 self._delete_file_points(file_path)
@@ -616,6 +616,7 @@ class VectorStore:
     def _delete_file_points(self, file_path: Path) -> None:
         for key, value in (
             ("source_key", self._source_key(file_path)),
+            ("source", self._display_source(file_path)),
             ("source", str(file_path)),
         ):
             self.client.delete(
@@ -635,11 +636,15 @@ class VectorStore:
     def _source_key(file_path: Path) -> str:
         return str(file_path.resolve())
 
-    @staticmethod
-    def _display_source(file_path: Path) -> str:
+    def _display_source(self, file_path: Path) -> str:
         resolved = file_path.resolve()
         try:
             return resolved.relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            pass
+
+        try:
+            return resolved.relative_to(self.config.docs_dir.resolve()).as_posix()
         except ValueError:
             return file_path.name
 

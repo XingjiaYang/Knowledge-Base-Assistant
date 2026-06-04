@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -24,11 +24,18 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    _app.state.vector_store = VectorStore(settings)
+    _app.state.llm_client = LLMClient(settings)
+    _app.state.rag_pipeline = RAGPipeline(
+        settings,
+        vector_store=_app.state.vector_store,
+        llm_client=_app.state.llm_client,
+    )
     try:
         yield
     finally:
-        llm_client.close()
-        vector_store.close()
+        _app.state.llm_client.close()
+        _app.state.vector_store.close()
 
 
 app = FastAPI(
@@ -127,15 +134,6 @@ class RAGResponse(BaseModel):
     route_reason: str
 
 
-vector_store = VectorStore(settings)
-llm_client = LLMClient(settings)
-rag_pipeline = RAGPipeline(
-    settings,
-    vector_store=vector_store,
-    llm_client=llm_client,
-)
-
-
 def require_api_auth(
     authorization: Annotated[str | None, Header()] = None,
 ) -> None:
@@ -159,10 +157,10 @@ async def health() -> dict[str, object]:
 
 
 @app.get("/health/details", dependencies=[Depends(require_api_auth)])
-async def health_details() -> dict[str, object]:
+async def health_details(request: Request) -> dict[str, object]:
     qdrant_ok, llm_ok = await asyncio.gather(
-        asyncio.to_thread(_qdrant_health),
-        asyncio.to_thread(llm_client.health),
+        asyncio.to_thread(_qdrant_health, request.app.state.vector_store),
+        asyncio.to_thread(request.app.state.llm_client.health),
     )
 
     return {
@@ -186,18 +184,18 @@ async def health_details() -> dict[str, object]:
     response_model=RAGResponse,
     dependencies=[Depends(require_api_auth)],
 )
-async def rag(request: RAGRequest) -> RAGResponse:
+async def rag(http_request: Request, rag_request: RAGRequest) -> RAGResponse:
     history = [
         ChatMessage(role=item.role, content=item.content)
-        for item in request.history
+        for item in rag_request.history
     ]
     try:
         result = await asyncio.to_thread(
-            rag_pipeline.answer,
-            request.question,
-            top_k=request.top_k,
+            http_request.app.state.rag_pipeline.answer,
+            rag_request.question,
+            top_k=rag_request.top_k,
             history=history,
-            conversation_summary=request.conversation_summary,
+            conversation_summary=rag_request.conversation_summary,
         )
     except UnexpectedResponse as exc:
         logger.exception("Vector store request failed during RAG.")
@@ -231,7 +229,7 @@ async def rag(request: RAGRequest) -> RAGResponse:
     )
 
 
-def _qdrant_health() -> bool:
+def _qdrant_health(vector_store: VectorStore) -> bool:
     try:
         vector_store.client.get_collections()
     except Exception:

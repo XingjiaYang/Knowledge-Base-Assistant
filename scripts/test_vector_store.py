@@ -9,7 +9,7 @@ import warnings
 
 import numpy as np
 from qdrant_client import QdrantClient
-from qdrant_client.models import Record
+from qdrant_client.models import PointStruct, Record
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -117,6 +117,23 @@ def assert_incremental_ingest_replaces_source_points() -> None:
         if not all(record.payload.get("source_key") for record in first_records):
             raise AssertionError("Source key should be stored for internal replacement.")
 
+        legacy_display_id = "00000000-0000-0000-0000-000000000001"
+        client.upsert(
+            collection_name=collection_name,
+            points=[
+                PointStruct(
+                    id=legacy_display_id,
+                    vector=[1.0, 0.0],
+                    payload={
+                        "source": store._display_source(file_path),
+                        "chunk_id": 99,
+                        "text": "legacy display-source stale chunk",
+                    },
+                )
+            ],
+            wait=True,
+        )
+
         file_path.write_text("# Guide\n\nCurrent content only.", encoding="utf-8")
         second_count = store.ingest_markdown_dir()
         records = _records(client, collection_name)
@@ -124,6 +141,8 @@ def assert_incremental_ingest_replaces_source_points() -> None:
             raise AssertionError("Updated document should replace all previous chunks.")
         if any("old-content" in str(record.payload) for record in records):
             raise AssertionError("Updated document left stale chunk content in Qdrant.")
+        if any("legacy display-source" in str(record.payload) for record in records):
+            raise AssertionError("Display-source legacy chunks should be deleted.")
         if records[0].id not in first_ids:
             raise AssertionError("Chunk point IDs should remain stable across content updates.")
 
@@ -232,6 +251,9 @@ def assert_ingest_streams_files_and_skips_recreate_deletes() -> None:
         docs_dir = Path(temp_dir)
         (docs_dir / "a.md").write_text("# A\n\nalpha beta gamma", encoding="utf-8")
         (docs_dir / "b.md").write_text("# B\n\none two three", encoding="utf-8")
+        nested_dir = docs_dir / "topic"
+        nested_dir.mkdir()
+        (nested_dir / "c.md").write_text("# C\n\nnested topic", encoding="utf-8")
         client = CountingQdrantClient()
         store = SequencingVectorStore(
             Settings(
@@ -255,9 +277,23 @@ def assert_ingest_streams_files_and_skips_recreate_deletes() -> None:
 
         store.events.clear()
         store.ingest_markdown_dir(recreate=False)
-        expected_prefix = ["points:a.md", "delete:a.md", "points:b.md", "delete:b.md"]
-        if store.events[:4] != expected_prefix:
+        expected_prefix = [
+            "points:a.md",
+            "delete:a.md",
+            "points:b.md",
+            "delete:b.md",
+            "points:c.md",
+            "delete:c.md",
+        ]
+        if store.events[:6] != expected_prefix:
             raise AssertionError(f"Ingest should process files incrementally: {store.events}")
+
+        sources = {
+            str(record.payload.get("source", ""))
+            for record in _records(client, "streaming-ingest-test")
+        }
+        if "topic/c.md" not in sources:
+            raise AssertionError(f"Recursive ingest should preserve nested source paths: {sources}")
 
     print("Streaming ingest behavior -> ok")
 

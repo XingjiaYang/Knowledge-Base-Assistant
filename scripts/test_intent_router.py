@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import sys
+from threading import Lock, Thread
+import time
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -101,6 +103,23 @@ class FakeIntentEmbedder:
         return [0.5, 0.5]
 
 
+class CountingIntentEmbedder(FakeIntentEmbedder):
+    def __init__(self) -> None:
+        self.anchor_encode_calls = 0
+        self._lock = Lock()
+
+    def encode(
+        self,
+        texts: str | list[str] | tuple[str, ...],
+        normalize_embeddings: bool = True,
+    ) -> list[float] | list[list[float]]:
+        if not isinstance(texts, str) and len(texts) > 1:
+            time.sleep(0.01)
+            with self._lock:
+                self.anchor_encode_calls += 1
+        return super().encode(texts, normalize_embeddings=normalize_embeddings)
+
+
 def assert_route(
     router: IntentRouter,
     question: str,
@@ -181,6 +200,44 @@ def assert_embedding_context_behavior() -> None:
     )
 
 
+def assert_direct_task_matching_is_case_insensitive() -> None:
+    router = IntentRouter(Settings(), embedder=None, llm_client=None)
+    assert_route(
+        router,
+        "DRAFT an email for the onboarding team",
+        False,
+        expected_route="keyword_direct",
+    )
+
+    print("Case-insensitive direct task matching -> ok")
+
+
+def assert_anchor_vectors_initialize_once_under_concurrency() -> None:
+    embedder = CountingIntentEmbedder()
+    router = IntentRouter(Settings(), embedder=embedder, llm_client=None)
+    threads = [
+        Thread(
+            target=lambda: router.route(
+                "设备申请具体怎么做？",
+                [],
+                "The user is reviewing employee onboarding.",
+            )
+        )
+        for _ in range(8)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    if embedder.anchor_encode_calls != 2:
+        raise AssertionError(
+            "Anchor vectors should initialize once for RAG and direct anchors."
+        )
+
+    print("Concurrent anchor initialization -> ok")
+
+
 def assert_llm_fallback_behavior() -> None:
     rag_router = IntentRouter(
         Settings(),
@@ -257,7 +314,9 @@ def main() -> None:
         True,
         expected_route="keyword_rag",
     )
+    assert_direct_task_matching_is_case_insensitive()
     assert_embedding_context_behavior()
+    assert_anchor_vectors_initialize_once_under_concurrency()
     assert_llm_fallback_behavior()
     assert_pipeline_search_behavior()
 
