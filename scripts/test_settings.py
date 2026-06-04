@@ -10,6 +10,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from app.config import Settings
 from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget
+from app.security import is_authorized_api_request
 
 
 def assert_api_limits() -> None:
@@ -42,9 +43,10 @@ def assert_llm_settings() -> None:
         llm_api_key="test-key",
         llm_model="claude-test",
         llm_health_check_enabled=True,
-        llm_health_path="/models",
+        llm_health_path="",
         llm_anthropic_version="2023-06-01",
         intent_embedding_rag_threshold=0.55,
+        api_auth_token="secret-token",
     )
 
     if config.llm_provider != "anthropic":
@@ -57,6 +59,8 @@ def assert_llm_settings() -> None:
         raise AssertionError("LLM health check flag should be configurable.")
     if config.intent_embedding_rag_threshold != 0.55:
         raise AssertionError("RAG embedding threshold should be configurable.")
+    if config.api_auth_token != "secret-token":
+        raise AssertionError("API auth token should be configurable.")
 
     print("LLM settings -> ok")
 
@@ -87,6 +91,78 @@ def assert_llm_client_provider_helpers() -> None:
         raise AssertionError("Disabled LLM health check should return healthy.")
 
     print("LLM client provider helpers -> ok")
+
+
+def assert_llm_client_input_validation() -> None:
+    client = LLMClient(Settings(llm_health_check_enabled=False))
+    invalid_messages = [
+        [],
+        [{"role": "system", "content": "Only system"}],
+        [{"role": "user", "content": ""}],
+        [{"role": "tool", "content": "No"}],
+    ]
+    for messages in invalid_messages:
+        try:
+            client.chat(messages)
+        except ValueError:
+            continue
+        raise AssertionError(f"Invalid messages should be rejected: {messages!r}")
+
+    print("LLM client input validation -> ok")
+
+
+def assert_llm_health_requests() -> None:
+    anthropic = LLMClient(
+        Settings(
+            llm_provider="anthropic",
+            llm_base_url="https://api.anthropic.com/v1",
+            llm_model="claude-test",
+            llm_health_path="",
+        )
+    )
+    method, url, payload = anthropic._health_request()
+    if method != "POST" or url != "https://api.anthropic.com/v1/messages/count_tokens":
+        raise AssertionError("Anthropic health should use count_tokens by default.")
+    if payload is None or payload.get("model") != "claude-test":
+        raise AssertionError("Anthropic health payload should include the configured model.")
+
+    openai_compatible = LLMClient(
+        Settings(
+            llm_provider="openai_compatible",
+            llm_base_url="https://api.openai.com/v1",
+            llm_health_path="",
+        )
+    )
+    method, url, payload = openai_compatible._health_request()
+    if method != "GET" or url != "https://api.openai.com/v1/models":
+        raise AssertionError("OpenAI-compatible health should use /models by default.")
+    if payload is not None:
+        raise AssertionError("GET health checks should not send a JSON payload.")
+
+    print("LLM health request routing -> ok")
+
+
+def assert_api_auth() -> None:
+    open_config = Settings(api_auth_token="")
+    if not is_authorized_api_request(open_config, None):
+        raise AssertionError("Empty API auth token should leave local API open.")
+
+    protected_config = Settings(api_auth_token="secret-token")
+    if not is_authorized_api_request(protected_config, "Bearer secret-token"):
+        raise AssertionError("Matching bearer token should authorize request.")
+
+    rejected = [
+        None,
+        "",
+        "secret-token",
+        "Basic secret-token",
+        "Bearer wrong-token",
+    ]
+    for authorization in rejected:
+        if is_authorized_api_request(protected_config, authorization):
+            raise AssertionError(f"Invalid authorization accepted: {authorization!r}")
+
+    print("API bearer auth -> ok")
 
 
 def assert_prompt_budget_settings() -> None:
@@ -131,6 +207,9 @@ def main() -> None:
     assert_api_limits()
     assert_llm_settings()
     assert_llm_client_provider_helpers()
+    assert_llm_client_input_validation()
+    assert_llm_health_requests()
+    assert_api_auth()
     assert_prompt_budget_settings()
 
 

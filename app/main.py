@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -11,6 +11,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from app.config import settings
 from app.llm_client import LLMClient
 from app.rag import ChatMessage, RAGPipeline
+from app.security import is_authorized_api_request
 from app.vector_store import SearchResult, VectorStore
 
 
@@ -110,6 +111,18 @@ rag_pipeline = RAGPipeline(
 )
 
 
+def require_api_auth(
+    authorization: Annotated[str | None, Header()] = None,
+) -> None:
+    if is_authorized_api_request(settings, authorization):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     if INDEX_HTML_PATH.exists():
@@ -117,7 +130,7 @@ def index() -> str:
     return INDEX_HTML_FALLBACK
 
 
-@app.get("/health")
+@app.get("/health", dependencies=[Depends(require_api_auth)])
 def health() -> dict[str, object]:
     qdrant_ok = True
     try:
@@ -142,7 +155,11 @@ def health() -> dict[str, object]:
     }
 
 
-@app.post("/rag", response_model=RAGResponse)
+@app.post(
+    "/rag",
+    response_model=RAGResponse,
+    dependencies=[Depends(require_api_auth)],
+)
 def rag(request: RAGRequest) -> RAGResponse:
     history = [
         ChatMessage(role=item.role, content=item.content)

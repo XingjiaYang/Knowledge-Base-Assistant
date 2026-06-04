@@ -47,7 +47,7 @@ class Settings:
     llm_max_tokens: int = _env_int("LLM_MAX_TOKENS", 4096)
     llm_timeout_seconds: float = _env_float("LLM_TIMEOUT_SECONDS", 300.0)
     llm_health_check_enabled: bool = _env_bool("LLM_HEALTH_CHECK_ENABLED", False)
-    llm_health_path: str = os.getenv("LLM_HEALTH_PATH", "/models")
+    llm_health_path: str = os.getenv("LLM_HEALTH_PATH", "")
     llm_anthropic_version: str = os.getenv(
         "LLM_ANTHROPIC_VERSION",
         "2023-06-01",
@@ -57,6 +57,7 @@ class Settings:
     api_question_max_chars: int = _env_int("API_QUESTION_MAX_CHARS", 16000)
     api_summary_max_chars: int = _env_int("API_SUMMARY_MAX_CHARS", 12000)
     api_history_max_messages: int = _env_int("API_HISTORY_MAX_MESSAGES", 120)
+    api_auth_token: str = os.getenv("API_AUTH_TOKEN", "")
 
     history_recent_turns: int = _env_int("HISTORY_RECENT_TURNS", 16)
     history_compact_after_turns: int = _env_int("HISTORY_COMPACT_AFTER_TURNS", 40)

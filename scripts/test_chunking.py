@@ -75,6 +75,29 @@ def assert_metadata_filter() -> None:
     print("Metadata filter -> ok")
 
 
+def assert_gfm_like_markdown() -> None:
+    sample = """# GFM
+
+| Feature | Status |
+| --- | --- |
+| Tables | ~~legacy~~ current |
+
+- [x] Keep task list text
+- [ ] Keep unchecked task
+"""
+    chunks = chunk_markdown(sample, chunk_size=240, overlap=20)
+    if not any(chunk.content_type == "table" for chunk in chunks):
+        raise AssertionError("GFM-style tables should be parsed as table blocks.")
+
+    combined_text = "\n".join(chunk.text for chunk in chunks)
+    if "~~legacy~~" not in combined_text:
+        raise AssertionError("Strikethrough text should remain in chunk payload.")
+    if "[x] Keep task list text" not in combined_text:
+        raise AssertionError("Task-list text should remain retrievable.")
+
+    print("GFM-like Markdown -> ok")
+
+
 def main() -> None:
     total_chunks = 0
 
@@ -110,6 +133,7 @@ def main() -> None:
     assert_synthetic_markdown()
     assert_overlap_budget()
     assert_metadata_filter()
+    assert_gfm_like_markdown()
 
 
 if __name__ == "__main__":

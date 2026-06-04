@@ -71,7 +71,12 @@ def assert_incremental_ingest_replaces_source_points() -> None:
             first_count = store.ingest_markdown_dir()
         if first_count < 2:
             raise AssertionError("Expected the initial document to produce multiple chunks.")
-        first_ids = {record.id for record in _records(client, collection_name)}
+        first_records = _records(client, collection_name)
+        first_ids = {record.id for record in first_records}
+        if any(Path(record.payload["source"]).is_absolute() for record in first_records):
+            raise AssertionError("Public source payload should not expose server paths.")
+        if not all(record.payload.get("source_key") for record in first_records):
+            raise AssertionError("Source key should be stored for internal replacement.")
 
         file_path.write_text("# Guide\n\nCurrent content only.", encoding="utf-8")
         second_count = store.ingest_markdown_dir()
@@ -82,6 +87,10 @@ def assert_incremental_ingest_replaces_source_points() -> None:
             raise AssertionError("Updated document left stale chunk content in Qdrant.")
         if records[0].id not in first_ids:
             raise AssertionError("Chunk point IDs should remain stable across content updates.")
+
+        result = store._public_source(str(file_path))
+        if Path(result).is_absolute() or str(docs_dir) in result:
+            raise AssertionError("Legacy absolute sources should be sanitized on read.")
 
         file_path.write_text("", encoding="utf-8")
         empty_count = store.ingest_markdown_dir()
