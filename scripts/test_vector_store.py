@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from threading import Lock, Thread
+import time
 from tempfile import TemporaryDirectory
 import warnings
 
@@ -15,6 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import Settings
 from app.rag import RAGPipeline
+import app.vector_store as vector_store_module
 from app.vector_store import VectorStore
 
 
@@ -148,6 +151,56 @@ def assert_vector_store_lazy_loads_dependencies() -> None:
     print("VectorStore lazy loading -> ok")
 
 
+def assert_vector_store_lazy_loads_once_under_concurrency() -> None:
+    original_qdrant_client = vector_store_module.QdrantClient
+    original_sentence_transformer = vector_store_module.SentenceTransformer
+    counts = {"client": 0, "model": 0}
+    count_lock = Lock()
+
+    def fake_qdrant_client(*args: object, **kwargs: object) -> QdrantClient:
+        time.sleep(0.01)
+        with count_lock:
+            counts["client"] += 1
+        return QdrantClient(":memory:")
+
+    def fake_sentence_transformer(*args: object, **kwargs: object) -> FakeEmbeddingModel:
+        time.sleep(0.01)
+        with count_lock:
+            counts["model"] += 1
+        return FakeEmbeddingModel()
+
+    try:
+        vector_store_module.QdrantClient = fake_qdrant_client
+        vector_store_module.SentenceTransformer = fake_sentence_transformer
+        store = VectorStore(Settings())
+
+        clients: list[object] = []
+        models: list[object] = []
+        threads = [
+            Thread(target=lambda: clients.append(store.client))
+            for _ in range(8)
+        ] + [
+            Thread(target=lambda: models.append(store.model))
+            for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        vector_store_module.QdrantClient = original_qdrant_client
+        vector_store_module.SentenceTransformer = original_sentence_transformer
+
+    if counts != {"client": 1, "model": 1}:
+        raise AssertionError(f"Lazy dependencies should load once: {counts}")
+    if len({id(client) for client in clients}) != 1:
+        raise AssertionError("Concurrent client access should reuse one instance.")
+    if len({id(model) for model in models}) != 1:
+        raise AssertionError("Concurrent model access should reuse one instance.")
+
+    print("VectorStore concurrent lazy loading -> ok")
+
+
 def assert_collection_setup_avoids_redundant_indexes() -> None:
     client = CountingQdrantClient()
     config = Settings(collection_name="index-test")
@@ -209,10 +262,43 @@ def assert_ingest_streams_files_and_skips_recreate_deletes() -> None:
     print("Streaming ingest behavior -> ok")
 
 
+def assert_search_score_threshold() -> None:
+    with TemporaryDirectory() as temp_dir:
+        docs_dir = Path(temp_dir)
+        file_path = docs_dir / "guide.md"
+        file_path.write_text("# Guide\n\nCurrent content only.", encoding="utf-8")
+        client = QdrantClient(":memory:")
+        store = VectorStore(
+            Settings(
+                docs_dir=docs_dir,
+                collection_name="score-threshold-test",
+                chunk_size=80,
+                chunk_overlap=10,
+                retrieve_score_threshold=1.1,
+            ),
+            client=client,
+            model=FakeEmbeddingModel(),
+        )
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Payload indexes have no effect in the local Qdrant.*",
+            )
+            store.ingest_markdown_dir(recreate=True)
+
+        if store.search("anything"):
+            raise AssertionError("Score threshold should filter low-scoring results.")
+
+    print("Search score threshold -> ok")
+
+
 def main() -> None:
     assert_vector_store_lazy_loads_dependencies()
+    assert_vector_store_lazy_loads_once_under_concurrency()
     assert_collection_setup_avoids_redundant_indexes()
     assert_ingest_streams_files_and_skips_recreate_deletes()
+    assert_search_score_threshold()
     assert_incremental_ingest_replaces_source_points()
 
 

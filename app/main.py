@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 from pathlib import Path
 from typing import Annotated, Literal
@@ -20,7 +21,21 @@ from app.vector_store import SearchResult, VectorStore
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Knowledge Base Assistant", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        llm_client.close()
+        vector_store.close()
+
+
+app = FastAPI(
+    title="Knowledge Base Assistant",
+    version="0.1.0",
+    lifespan=lifespan,
+)
 
 INDEX_HTML_PATH = Path(__file__).with_name("static") / "index.html"
 INDEX_HTML_FALLBACK = """
@@ -39,6 +54,11 @@ INDEX_HTML_FALLBACK = """
 </body>
 </html>
 """
+INDEX_HTML = (
+    INDEX_HTML_PATH.read_text(encoding="utf-8")
+    if INDEX_HTML_PATH.exists()
+    else INDEX_HTML_FALLBACK
+)
 
 
 class ChatMessageRequest(BaseModel):
@@ -130,18 +150,16 @@ def require_api_auth(
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    if INDEX_HTML_PATH.exists():
-        return INDEX_HTML_PATH.read_text(encoding="utf-8")
-    return INDEX_HTML_FALLBACK
+    return INDEX_HTML
 
 
-@app.on_event("shutdown")
-def shutdown_resources() -> None:
-    llm_client.close()
-
-
-@app.get("/health", dependencies=[Depends(require_api_auth)])
+@app.get("/health")
 async def health() -> dict[str, object]:
+    return {"status": "ok"}
+
+
+@app.get("/health/details", dependencies=[Depends(require_api_auth)])
+async def health_details() -> dict[str, object]:
     qdrant_ok, llm_ok = await asyncio.gather(
         asyncio.to_thread(_qdrant_health),
         asyncio.to_thread(llm_client.health),
@@ -156,6 +174,7 @@ async def health() -> dict[str, object]:
         "llm_model": settings.llm_model,
         "llm_max_tokens": settings.llm_max_tokens,
         "retrieve_top_k": settings.retrieve_top_k,
+        "retrieve_score_threshold": settings.retrieve_score_threshold,
         "history_recent_turns": settings.history_recent_turns,
         "api_top_k_max": settings.api_top_k_max,
         "intent_router": settings.intent_router_enabled,

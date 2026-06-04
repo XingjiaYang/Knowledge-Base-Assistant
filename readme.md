@@ -147,9 +147,10 @@ Important startup flags:
 
 ```bash
 INGEST_ON_STARTUP=1      # ingest docs before API starts
-RECREATE_COLLECTION=1    # rebuild the collection during startup
+RECREATE_COLLECTION=0    # set to 1 to rebuild the collection during startup
 WAIT_FOR_LLM=0           # set to 1 when a local LLM service must be ready first
 APP_PORT=8080            # host port mapped to FastAPI/UI
+QDRANT_IMAGE=qdrant/qdrant:v1.18.1
 ```
 
 For fast restarts after the image has already been built:
@@ -164,6 +165,7 @@ Common settings from `.env.example`:
 
 ```bash
 DEBUG=0
+QDRANT_IMAGE=qdrant/qdrant:v1.18.1
 
 LLM_PROVIDER=openai_compatible
 LLM_BASE_URL=https://api.openai.com/v1
@@ -189,6 +191,7 @@ API_AUTH_TOKEN=
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 QDRANT_COLLECTION=tech_docs
 RETRIEVE_TOP_K=4
+RETRIEVE_SCORE_THRESHOLD=0
 CHUNK_SIZE=800
 CHUNK_OVERLAP=120
 
@@ -227,9 +230,13 @@ LLM chat requests retry transient provider errors (`429`, `502`, `503`, `504`)
 with exponential backoff. Keep `DEBUG=0` outside local development so API errors
 return generic messages while details stay in server logs.
 
-Leave `API_AUTH_TOKEN` blank for local development. When set, `/health` and
-`/rag` require `Authorization: Bearer <token>`. The browser UI prompts for the
-token on the first authenticated request and stores it in local storage.
+Set `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector results
+before they enter the LLM prompt.
+
+Leave `API_AUTH_TOKEN` blank for local development. When set, `/health/details`
+and `/rag` require `Authorization: Bearer <token>`. The public `/health`
+endpoint only reports minimal liveness for probes. The browser UI prompts for
+the token on the first authenticated request and stores it in local storage.
 
 ## Replace the Knowledge Base
 
@@ -295,7 +302,7 @@ curl http://localhost:8080/health
 With `API_AUTH_TOKEN` set:
 
 ```bash
-curl http://localhost:8080/health \
+curl http://localhost:8080/health/details \
   -H "Authorization: Bearer ${API_AUTH_TOKEN}"
 ```
 

@@ -38,6 +38,7 @@ class Settings:
     chunk_size: int = _env_int("CHUNK_SIZE", 800)
     chunk_overlap: int = _env_int("CHUNK_OVERLAP", 120)
     retrieve_top_k: int = _env_int("RETRIEVE_TOP_K", 4)
+    retrieve_score_threshold: float = _env_float("RETRIEVE_SCORE_THRESHOLD", 0.0)
     api_top_k_max: int = _env_int("API_TOP_K_MAX", 20)
 
     llm_provider: str = os.getenv("LLM_PROVIDER", "openai_compatible")
@@ -124,6 +125,10 @@ class Settings:
             raise ValueError("CHUNK_OVERLAP must leave room for new chunk content.")
         if self.retrieve_top_k <= 0:
             raise ValueError("RETRIEVE_TOP_K must be greater than 0.")
+        if self.retrieve_score_threshold < 0:
+            raise ValueError(
+                "RETRIEVE_SCORE_THRESHOLD must be greater than or equal to 0."
+            )
         if self.api_top_k_max <= 0:
             raise ValueError("API_TOP_K_MAX must be greater than 0.")
         if self.llm_timeout_seconds <= 0:

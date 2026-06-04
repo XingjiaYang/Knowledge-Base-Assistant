@@ -50,6 +50,7 @@ def assert_llm_settings() -> None:
         llm_retry_attempts=4,
         llm_retry_backoff_seconds=0.5,
         llm_retry_backoff_max_seconds=4.0,
+        retrieve_score_threshold=0.42,
         intent_embedding_rag_threshold=0.55,
         api_auth_token="secret-token",
     )
@@ -72,6 +73,8 @@ def assert_llm_settings() -> None:
         raise AssertionError("LLM retry backoff should be configurable.")
     if config.llm_retry_backoff_max_seconds != 4.0:
         raise AssertionError("LLM retry max backoff should be configurable.")
+    if config.retrieve_score_threshold != 0.42:
+        raise AssertionError("Retrieval score threshold should be configurable.")
 
     print("LLM settings -> ok")
 
@@ -233,6 +236,20 @@ def assert_api_auth() -> None:
     print("API bearer auth -> ok")
 
 
+def assert_public_health_endpoint() -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    if response.status_code != 200 or response.json() != {"status": "ok"}:
+        raise AssertionError("Public health endpoint should return minimal liveness.")
+
+    print("Public health endpoint -> ok")
+
+
 def assert_invalid_settings_rejected() -> None:
     invalid_configs = [
         {"chunk_size": 100, "chunk_overlap": 100},
@@ -243,6 +260,7 @@ def assert_invalid_settings_rejected() -> None:
             "llm_retry_backoff_max_seconds": 1.0,
         },
         {"api_top_k_max": 0},
+        {"retrieve_score_threshold": -0.1},
     ]
     for kwargs in invalid_configs:
         try:
@@ -301,6 +319,7 @@ def main() -> None:
     assert_llm_retry_behavior()
     assert_llm_client_connection_reuse()
     assert_api_auth()
+    assert_public_health_endpoint()
     assert_invalid_settings_rejected()
     assert_prompt_budget_settings()
 

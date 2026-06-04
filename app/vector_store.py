@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import re
+from threading import Lock
 from typing import Literal
 from uuid import NAMESPACE_URL, uuid5
 
@@ -219,9 +220,9 @@ def _split_with_overlap(
     previous_tail = ""
     for part in parts:
         chunk = " ".join(
-            part
-            for part in [previous_tail, part.strip()]
-            if part
+            segment
+            for segment in [previous_tail, part.strip()]
+            if segment
         )
         chunks.append(chunk)
         previous_tail = _tail_text(part, overlap)
@@ -376,21 +377,39 @@ class VectorStore:
         self.config = config
         self._client = client
         self._model = model
+        self._client_lock = Lock()
+        self._model_lock = Lock()
         self._ensured_payload_indexes: set[str] = set()
 
     @property
     def client(self) -> QdrantClient:
         if self._client is None:
-            logger.info("Connecting to Qdrant at %s.", self.config.qdrant_url)
-            self._client = QdrantClient(url=self.config.qdrant_url)
+            with self._client_lock:
+                if self._client is None:
+                    logger.info("Connecting to Qdrant at %s.", self.config.qdrant_url)
+                    self._client = QdrantClient(url=self.config.qdrant_url)
         return self._client
 
     @property
     def model(self) -> SentenceTransformer:
         if self._model is None:
-            logger.info("Loading embedding model %s.", self.config.embedding_model)
-            self._model = SentenceTransformer(self.config.embedding_model)
+            with self._model_lock:
+                if self._model is None:
+                    logger.info(
+                        "Loading embedding model %s.",
+                        self.config.embedding_model,
+                    )
+                    self._model = SentenceTransformer(self.config.embedding_model)
         return self._model
+
+    def close(self) -> None:
+        with self._client_lock:
+            client = self._client
+            self._client = None
+            self._ensured_payload_indexes.clear()
+
+        if client is not None and hasattr(client, "close"):
+            client.close()
 
     @property
     def vector_size(self) -> int:
@@ -490,11 +509,14 @@ class VectorStore:
         metadata_filter: dict[str, str] | None = None,
     ) -> list[SearchResult]:
         limit = top_k or self.config.retrieve_top_k
+        score_threshold = self.config.retrieve_score_threshold
         query_vector = self._embed_one(query)
         query_filter = self._metadata_filter(metadata_filter)
         logger.info(
-            "Running vector search: top_k=%s metadata_filter_keys=%s.",
+            "Running vector search: top_k=%s score_threshold=%s "
+            "metadata_filter_keys=%s.",
             limit,
+            score_threshold or "disabled",
             sorted((metadata_filter or {}).keys()),
         )
 
@@ -506,6 +528,8 @@ class VectorStore:
                     "limit": limit,
                     "with_payload": True,
                 }
+                if score_threshold > 0:
+                    query_args["score_threshold"] = score_threshold
                 if query_filter is not None:
                     query_args["query_filter"] = query_filter
                 response = self.client.query_points(**query_args)
@@ -517,6 +541,8 @@ class VectorStore:
                     "limit": limit,
                     "with_payload": True,
                 }
+                if score_threshold > 0:
+                    search_args["score_threshold"] = score_threshold
                 if query_filter is not None:
                     search_args["query_filter"] = query_filter
                 hits = self.client.search(**search_args)
@@ -526,13 +552,16 @@ class VectorStore:
 
         results: list[SearchResult] = []
         for hit in hits:
+            score = float(hit.score)
+            if score_threshold > 0 and score < score_threshold:
+                continue
             payload = hit.payload or {}
             results.append(
                 SearchResult(
                     text=str(payload.get("text", "")),
                     source=self._public_source(str(payload.get("source", ""))),
                     chunk_id=int(payload.get("chunk_id", -1)),
-                    score=float(hit.score),
+                    score=score,
                     content_type=str(payload.get("content_type", "text")),
                     h1=str(payload.get("h1", "")),
                     h2=str(payload.get("h2", "")),

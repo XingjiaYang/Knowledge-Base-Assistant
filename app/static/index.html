@@ -321,6 +321,47 @@
       color: var(--danger);
     }
 
+    .bubble.markdown {
+      white-space: normal;
+    }
+
+    .bubble.markdown p,
+    .bubble.markdown ul,
+    .bubble.markdown ol,
+    .bubble.markdown pre {
+      margin: 0 0 0.85em;
+    }
+
+    .bubble.markdown > :last-child {
+      margin-bottom: 0;
+    }
+
+    .bubble.markdown ul,
+    .bubble.markdown ol {
+      padding-left: 1.25em;
+    }
+
+    .bubble.markdown code {
+      border-radius: 5px;
+      background: var(--code);
+      padding: 0.12em 0.32em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    .bubble.markdown pre {
+      overflow-x: auto;
+      border-radius: 8px;
+      background: var(--code);
+      padding: 11px 12px;
+      white-space: pre;
+    }
+
+    .bubble.markdown pre code {
+      padding: 0;
+      background: transparent;
+    }
+
     .message-refs {
       width: min(760px, 100%);
     }
@@ -606,7 +647,13 @@
 
     async function checkHealth() {
       try {
-        const response = await fetchWithAuth("/health");
+        const liveResponse = await fetch("/health");
+        if (!liveResponse.ok) {
+          setStatus("Offline", "bad");
+          return;
+        }
+
+        const response = await fetchWithAuth("/health/details");
         if (response.status === 401) {
           setStatus("Auth required", "bad");
           return;
@@ -628,6 +675,101 @@
       } catch {
         setStatus("Offline", "bad");
       }
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function renderInlineMarkdown(value) {
+      return String(value || "")
+        .split(/(`[^`]+`)/g)
+        .map((part) => {
+          if (part.startsWith("`") && part.endsWith("`")) {
+            return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
+          }
+          return escapeHtml(part)
+            .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+            .replace(/__([^_]+)__/g, "<strong>$1</strong>");
+        })
+        .join("");
+    }
+
+    function renderMarkdown(value) {
+      const lines = String(value || "").replace(/\r\n/g, "\n").split("\n");
+      const html = [];
+      let inCode = false;
+      let codeLines = [];
+      let listType = "";
+
+      const closeList = () => {
+        if (!listType) return;
+        html.push(`</${listType}>`);
+        listType = "";
+      };
+
+      const openList = (type) => {
+        if (listType === type) return;
+        closeList();
+        listType = type;
+        html.push(`<${type}>`);
+      };
+
+      const closeCode = () => {
+        html.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        codeLines = [];
+        inCode = false;
+      };
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("```")) {
+          closeList();
+          if (inCode) {
+            closeCode();
+          } else {
+            inCode = true;
+            codeLines = [];
+          }
+          continue;
+        }
+
+        if (inCode) {
+          codeLines.push(line);
+          continue;
+        }
+
+        if (!trimmed) {
+          closeList();
+          continue;
+        }
+
+        const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+        if (bullet) {
+          openList("ul");
+          html.push(`<li>${renderInlineMarkdown(bullet[1])}</li>`);
+          continue;
+        }
+
+        const numbered = line.match(/^\s*\d+\.\s+(.+)$/);
+        if (numbered) {
+          openList("ol");
+          html.push(`<li>${renderInlineMarkdown(numbered[1])}</li>`);
+          continue;
+        }
+
+        closeList();
+        html.push(`<p>${renderInlineMarkdown(line)}</p>`);
+      }
+
+      closeList();
+      if (inCode) closeCode();
+      return html.join("");
     }
 
     function renderMessages() {
@@ -659,7 +801,12 @@
         bubble.className = "bubble";
         if (message.loading) bubble.classList.add("loading");
         if (message.error) bubble.classList.add("error");
-        bubble.textContent = message.content;
+        if (message.loading || message.error) {
+          bubble.textContent = message.content;
+        } else {
+          bubble.classList.add("markdown");
+          bubble.innerHTML = renderMarkdown(message.content);
+        }
 
         wrapper.appendChild(role);
         wrapper.appendChild(bubble);

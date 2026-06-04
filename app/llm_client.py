@@ -218,7 +218,7 @@ class LLMClient:
                 return response
             except httpx.HTTPStatusError as exc:
                 if (
-                    exc.response.status_code not in _RETRYABLE_STATUS_CODES
+                    not self._is_retryable_status(exc.response.status_code)
                     or attempt >= attempts
                 ):
                     raise
