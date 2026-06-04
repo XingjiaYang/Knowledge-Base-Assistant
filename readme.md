@@ -171,12 +171,14 @@ LLM_TEMPERATURE=0.2
 LLM_TOP_P=0.9
 LLM_MAX_TOKENS=4096
 LLM_HEALTH_CHECK_ENABLED=0
+LLM_HEALTH_PATH=
 
 API_TOP_K_MAX=20
 API_MESSAGE_MAX_CHARS=16000
 API_QUESTION_MAX_CHARS=16000
 API_SUMMARY_MAX_CHARS=12000
 API_HISTORY_MAX_MESSAGES=120
+API_AUTH_TOKEN=
 
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 QDRANT_COLLECTION=tech_docs
@@ -210,6 +212,14 @@ INTENT_EMBEDDING_MARGIN=0.06
 local vLLM. For Anthropic Claude, use `LLM_PROVIDER=anthropic` and
 `LLM_BASE_URL=https://api.anthropic.com/v1`. Embeddings remain local through
 SentenceTransformers.
+
+Leave `LLM_HEALTH_PATH` blank to use provider-specific health defaults:
+OpenAI-compatible providers use `GET /models`, while Anthropic uses
+`POST /messages/count_tokens`.
+
+Leave `API_AUTH_TOKEN` blank for local development. When set, `/health` and
+`/rag` require `Authorization: Bearer <token>`. The browser UI prompts for the
+token on the first authenticated request and stores it in local storage.
 
 ## Replace the Knowledge Base
 
@@ -272,11 +282,19 @@ Health check:
 curl http://localhost:8080/health
 ```
 
+With `API_AUTH_TOKEN` set:
+
+```bash
+curl http://localhost:8080/health \
+  -H "Authorization: Bearer ${API_AUTH_TOKEN}"
+```
+
 RAG request:
 
 ```bash
 curl http://localhost:8080/rag \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${API_AUTH_TOKEN}" \
   -d '{
     "question": "When should I choose DuckDB over ClickHouse?",
     "top_k": 4,

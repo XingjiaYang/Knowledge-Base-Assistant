@@ -19,7 +19,7 @@ from qdrant_client.models import (
 )
 from sentence_transformers import SentenceTransformer
 
-from app.config import Settings, settings
+from app.config import PROJECT_ROOT, Settings, settings
 
 
 ContentType = Literal["text", "code", "table"]
@@ -69,7 +69,7 @@ _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _TABLE_DIVIDER_RE = re.compile(
     r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$"
 )
-_MARKDOWN = MarkdownIt("commonmark").enable("table")
+_MARKDOWN = MarkdownIt("gfm-like", {"linkify": False})
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -379,7 +379,7 @@ class VectorStore:
 
         self.client.create_payload_index(
             collection_name=self.config.collection_name,
-            field_name="source",
+            field_name="source_key",
             field_schema=PayloadSchemaType.KEYWORD,
             wait=True,
         )
@@ -399,7 +399,7 @@ class VectorStore:
 
         inserted = 0
         for file_path, points in file_points:
-            self._delete_source_points(str(file_path))
+            self._delete_file_points(file_path)
             if not points:
                 continue
 
@@ -449,7 +449,7 @@ class VectorStore:
             results.append(
                 SearchResult(
                     text=str(payload.get("text", "")),
-                    source=str(payload.get("source", "")),
+                    source=self._public_source(str(payload.get("source", ""))),
                     chunk_id=int(payload.get("chunk_id", -1)),
                     score=float(hit.score),
                     content_type=str(payload.get("content_type", "text")),
@@ -478,15 +478,17 @@ class VectorStore:
             normalize_embeddings=True,
         )
         points: list[PointStruct] = []
-        source = str(file_path)
+        source_key = self._source_key(file_path)
+        source = self._display_source(file_path)
         for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            point_id = str(uuid5(NAMESPACE_URL, f"{source}:{idx}"))
+            point_id = str(uuid5(NAMESPACE_URL, f"{source_key}:{idx}"))
             points.append(
                 PointStruct(
                     id=point_id,
                     vector=embedding.tolist(),
                     payload={
                         "source": source,
+                        "source_key": source_key,
                         "chunk_id": idx,
                         "text": chunk.text,
                         "content_type": chunk.content_type,
@@ -501,19 +503,49 @@ class VectorStore:
             )
         return points
 
-    def _delete_source_points(self, source: str) -> None:
-        self.client.delete(
-            collection_name=self.config.collection_name,
-            points_selector=Filter(
-                must=[
-                    FieldCondition(
-                        key="source",
-                        match=MatchValue(value=source),
-                    )
-                ]
-            ),
-            wait=True,
-        )
+    def _delete_file_points(self, file_path: Path) -> None:
+        for key, value in (
+            ("source_key", self._source_key(file_path)),
+            ("source", str(file_path)),
+        ):
+            self.client.delete(
+                collection_name=self.config.collection_name,
+                points_selector=Filter(
+                    must=[
+                        FieldCondition(
+                            key=key,
+                            match=MatchValue(value=value),
+                        )
+                    ]
+                ),
+                wait=True,
+            )
+
+    @staticmethod
+    def _source_key(file_path: Path) -> str:
+        return str(file_path.resolve())
+
+    @staticmethod
+    def _display_source(file_path: Path) -> str:
+        resolved = file_path.resolve()
+        try:
+            return resolved.relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            return file_path.name
+
+    @staticmethod
+    def _public_source(source: str) -> str:
+        if not source:
+            return ""
+
+        source_path = Path(source)
+        if not source_path.is_absolute():
+            return source.replace("\\", "/")
+
+        try:
+            return source_path.resolve().relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            return source_path.name
 
     def _embed_one(self, text: str) -> list[float]:
         embedding = self.model.encode(text, normalize_embeddings=True)

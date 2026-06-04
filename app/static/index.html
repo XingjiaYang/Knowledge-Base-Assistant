@@ -571,15 +571,46 @@
       summarizedMessageCount: 0,
       busy: false
     };
+    const apiTokenStorageKey = "knowledgeBaseAssistantApiToken";
 
     function setStatus(text, className) {
       statusTextEl.textContent = text;
       statusEl.className = `status ${className || ""}`.trim();
     }
 
+    function authHeaders(headers = {}) {
+      const token = localStorage.getItem(apiTokenStorageKey);
+      if (!token) return headers;
+      return {...headers, Authorization: `Bearer ${token}`};
+    }
+
+    async function fetchWithAuth(url, options = {}) {
+      const request = () => fetch(url, {
+        ...options,
+        headers: authHeaders(options.headers || {})
+      });
+
+      let response = await request();
+      if (response.status !== 401) return response;
+
+      const token = window.prompt("API token required");
+      if (!token) return response;
+
+      localStorage.setItem(apiTokenStorageKey, token.trim());
+      response = await request();
+      if (response.status === 401) {
+        localStorage.removeItem(apiTokenStorageKey);
+      }
+      return response;
+    }
+
     async function checkHealth() {
       try {
-        const response = await fetch("/health");
+        const response = await fetchWithAuth("/health");
+        if (response.status === 401) {
+          setStatus("Auth required", "bad");
+          return;
+        }
         const data = await response.json();
         const ready = Boolean(data.qdrant && data.llm);
         setStatus(ready ? "Ready" : "Degraded", ready ? "ok" : "bad");
@@ -762,7 +793,7 @@
       setBusy(true);
 
       try {
-        const response = await fetch("/rag", {
+        const response = await fetchWithAuth("/rag", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({
