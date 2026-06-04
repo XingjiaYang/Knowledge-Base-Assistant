@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from threading import Lock
 import time
 from typing import Literal
 
@@ -30,6 +31,8 @@ class LLMClient:
     ) -> None:
         self.config = config
         self.transport = transport
+        self._client: httpx.Client | None = None
+        self._client_lock = Lock()
 
     def chat(
         self,
@@ -193,20 +196,26 @@ class LLMClient:
         attempts = max(1, max_attempts or self.config.llm_retry_attempts)
         delay = self.config.llm_retry_backoff_seconds
         max_delay = self.config.llm_retry_backoff_max_seconds
+        request_timeout = self.config.llm_timeout_seconds if timeout is None else timeout
 
         for attempt in range(1, attempts + 1):
             try:
-                with self._http_client(timeout=timeout) as client:
-                    if method == "POST":
-                        response = client.post(
-                            url,
-                            headers=headers,
-                            json=json_payload,
-                        )
-                    else:
-                        response = client.get(url, headers=headers)
-                    response.raise_for_status()
-                    return response
+                client = self._http_client()
+                if method == "POST":
+                    response = client.post(
+                        url,
+                        headers=headers,
+                        json=json_payload,
+                        timeout=request_timeout,
+                    )
+                else:
+                    response = client.get(
+                        url,
+                        headers=headers,
+                        timeout=request_timeout,
+                    )
+                response.raise_for_status()
+                return response
             except httpx.HTTPStatusError as exc:
                 if (
                     exc.response.status_code not in _RETRYABLE_STATUS_CODES
@@ -230,11 +239,20 @@ class LLMClient:
 
         raise RuntimeError("LLM request retry loop exhausted unexpectedly.")
 
-    def _http_client(self, timeout: float | None = None) -> httpx.Client:
-        return httpx.Client(
-            timeout=self.config.llm_timeout_seconds if timeout is None else timeout,
-            transport=self.transport,
-        )
+    def close(self) -> None:
+        with self._client_lock:
+            if self._client is not None:
+                self._client.close()
+                self._client = None
+
+    def _http_client(self) -> httpx.Client:
+        with self._client_lock:
+            if self._client is None or self._client.is_closed:
+                self._client = httpx.Client(
+                    timeout=self.config.llm_timeout_seconds,
+                    transport=self.transport,
+                )
+            return self._client
 
     @staticmethod
     def _is_retryable_status(status_code: int) -> bool:

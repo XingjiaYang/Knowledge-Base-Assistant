@@ -135,6 +135,11 @@ def index() -> str:
     return INDEX_HTML_FALLBACK
 
 
+@app.on_event("shutdown")
+def shutdown_resources() -> None:
+    llm_client.close()
+
+
 @app.get("/health", dependencies=[Depends(require_api_auth)])
 async def health() -> dict[str, object]:
     qdrant_ok, llm_ok = await asyncio.gather(

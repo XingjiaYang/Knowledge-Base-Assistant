@@ -350,7 +350,20 @@ def _join_chunk_parts(parts: list[str]) -> str:
 def _tail_text(text: str, max_chars: int) -> str:
     if max_chars <= 0:
         return ""
-    return text[-max_chars:].strip()
+
+    tokens = re.findall(r"\S+\s*", text.strip())
+    tail_tokens: list[str] = []
+    current_len = 0
+    for token in reversed(tokens):
+        token_len = len(token)
+        if token_len > max_chars and not tail_tokens:
+            return token[-max_chars:].strip()
+        if current_len + token_len > max_chars:
+            break
+        tail_tokens.append(token)
+        current_len += token_len
+
+    return "".join(reversed(tail_tokens)).strip()
 
 
 class VectorStore:
@@ -363,6 +376,7 @@ class VectorStore:
         self.config = config
         self._client = client
         self._model = model
+        self._ensured_payload_indexes: set[str] = set()
 
     @property
     def client(self) -> QdrantClient:
@@ -399,6 +413,7 @@ class VectorStore:
         if recreate and self.config.collection_name in collection_names:
             self.client.delete_collection(collection_name=self.config.collection_name)
             collection_names.remove(self.config.collection_name)
+            self._ensured_payload_indexes.clear()
 
         if self.config.collection_name not in collection_names:
             self.client.create_collection(
@@ -409,12 +424,7 @@ class VectorStore:
                 ),
             )
 
-        self.client.create_payload_index(
-            collection_name=self.config.collection_name,
-            field_name="source_key",
-            field_schema=PayloadSchemaType.KEYWORD,
-            wait=True,
-        )
+        self._ensure_payload_index("source_key")
 
     def ingest_markdown_dir(
         self,
@@ -425,14 +435,11 @@ class VectorStore:
         self.ensure_collection(recreate=recreate)
         logger.info("Ingesting Markdown documents from %s.", docs_path)
 
-        file_points = [
-            (file_path, self._points_for_file(file_path))
-            for file_path in sorted(docs_path.glob("*.md"))
-        ]
-
         inserted = 0
-        for file_path, points in file_points:
-            self._delete_file_points(file_path)
+        for file_path in sorted(docs_path.glob("*.md")):
+            points = self._points_for_file(file_path)
+            if not recreate:
+                self._delete_file_points(file_path)
             if not points:
                 continue
 
@@ -448,6 +455,33 @@ class VectorStore:
             self.config.collection_name,
         )
         return inserted
+
+    def _ensure_payload_index(self, field_name: str) -> None:
+        if field_name in self._ensured_payload_indexes:
+            return
+
+        if self._payload_index_exists(field_name):
+            self._ensured_payload_indexes.add(field_name)
+            return
+
+        self.client.create_payload_index(
+            collection_name=self.config.collection_name,
+            field_name=field_name,
+            field_schema=PayloadSchemaType.KEYWORD,
+            wait=True,
+        )
+        self._ensured_payload_indexes.add(field_name)
+
+    def _payload_index_exists(self, field_name: str) -> bool:
+        try:
+            collection_info = self.client.get_collection(
+                collection_name=self.config.collection_name,
+            )
+        except Exception:
+            return False
+
+        payload_schema = getattr(collection_info, "payload_schema", {}) or {}
+        return field_name in payload_schema
 
     def search(
         self,

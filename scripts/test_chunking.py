@@ -6,7 +6,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import settings
-from app.vector_store import VectorStore, chunk_markdown
+from app.vector_store import VectorStore, _tail_text, chunk_markdown
 
 
 def assert_synthetic_markdown() -> None:
@@ -63,6 +63,15 @@ def assert_overlap_budget() -> None:
         raise AssertionError("Text overlap should carry boundary context forward.")
 
     print("Overlap budget -> ok")
+
+
+def assert_tail_text_word_boundary() -> None:
+    if _tail_text("alpha beta gamma", 10) != "beta gamma":
+        raise AssertionError("Tail text should prefer complete word boundaries.")
+    if _tail_text("supercalifragilistic", 6) != "listic":
+        raise AssertionError("Single over-budget tokens should still be bounded.")
+
+    print("Tail text word boundary -> ok")
 
 
 def assert_metadata_filter() -> None:
@@ -132,6 +141,7 @@ def main() -> None:
     print(f"Total chunks: {total_chunks}")
     assert_synthetic_markdown()
     assert_overlap_budget()
+    assert_tail_text_word_boundary()
     assert_metadata_filter()
     assert_gfm_like_markdown()
 

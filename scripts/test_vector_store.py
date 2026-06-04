@@ -32,6 +32,30 @@ class FakeEmbeddingModel:
         return np.asarray([[1.0, 0.0] for _ in texts], dtype=np.float32)
 
 
+class CountingQdrantClient(QdrantClient):
+    def __init__(self) -> None:
+        super().__init__(":memory:")
+        self.create_payload_index_calls = 0
+
+    def create_payload_index(self, *args: object, **kwargs: object) -> object:
+        self.create_payload_index_calls += 1
+        return super().create_payload_index(*args, **kwargs)
+
+
+class SequencingVectorStore(VectorStore):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.events: list[str] = []
+
+    def _points_for_file(self, file_path: Path) -> list[object]:
+        self.events.append(f"points:{file_path.name}")
+        return super()._points_for_file(file_path)
+
+    def _delete_file_points(self, file_path: Path) -> None:
+        self.events.append(f"delete:{file_path.name}")
+        super()._delete_file_points(file_path)
+
+
 class FakeLLMClient:
     def chat(
         self,
@@ -124,8 +148,71 @@ def assert_vector_store_lazy_loads_dependencies() -> None:
     print("VectorStore lazy loading -> ok")
 
 
+def assert_collection_setup_avoids_redundant_indexes() -> None:
+    client = CountingQdrantClient()
+    config = Settings(collection_name="index-test")
+    store = VectorStore(
+        config,
+        client=client,
+        model=FakeEmbeddingModel(),
+    )
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Payload indexes have no effect in the local Qdrant.*",
+        )
+        store.ensure_collection()
+        store.ensure_collection()
+        if client.create_payload_index_calls != 1:
+            raise AssertionError("Payload index should not be recreated every call.")
+
+        store.ensure_collection(recreate=True)
+        if client.create_payload_index_calls != 2:
+            raise AssertionError("Payload index should be recreated after collection reset.")
+
+    print("Payload index setup -> ok")
+
+
+def assert_ingest_streams_files_and_skips_recreate_deletes() -> None:
+    with TemporaryDirectory() as temp_dir:
+        docs_dir = Path(temp_dir)
+        (docs_dir / "a.md").write_text("# A\n\nalpha beta gamma", encoding="utf-8")
+        (docs_dir / "b.md").write_text("# B\n\none two three", encoding="utf-8")
+        client = CountingQdrantClient()
+        store = SequencingVectorStore(
+            Settings(
+                docs_dir=docs_dir,
+                collection_name="streaming-ingest-test",
+                chunk_size=80,
+                chunk_overlap=10,
+            ),
+            client=client,
+            model=FakeEmbeddingModel(),
+        )
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Payload indexes have no effect in the local Qdrant.*",
+            )
+            store.ingest_markdown_dir(recreate=True)
+        if any(event.startswith("delete:") for event in store.events):
+            raise AssertionError("Recreated collections should not delete per-file points.")
+
+        store.events.clear()
+        store.ingest_markdown_dir(recreate=False)
+        expected_prefix = ["points:a.md", "delete:a.md", "points:b.md", "delete:b.md"]
+        if store.events[:4] != expected_prefix:
+            raise AssertionError(f"Ingest should process files incrementally: {store.events}")
+
+    print("Streaming ingest behavior -> ok")
+
+
 def main() -> None:
     assert_vector_store_lazy_loads_dependencies()
+    assert_collection_setup_avoids_redundant_indexes()
+    assert_ingest_streams_files_and_skips_recreate_deletes()
     assert_incremental_ingest_replaces_source_points()
 
 

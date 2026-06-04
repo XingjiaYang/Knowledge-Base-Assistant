@@ -179,8 +179,35 @@ def assert_llm_retry_behavior() -> None:
         raise AssertionError("LLM retry should recover from transient 429 errors.")
     if not client._is_retryable_status(503) or client._is_retryable_status(400):
         raise AssertionError("LLM retry status classification is incorrect.")
+    client.close()
 
     print("LLM retry behavior -> ok")
+
+
+def assert_llm_client_connection_reuse() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    client = LLMClient(
+        Settings(),
+        transport=httpx.MockTransport(handler),
+    )
+    first_answer = client.chat([{"role": "user", "content": "first"}])
+    first_client = client._client
+    second_answer = client.chat([{"role": "user", "content": "second"}])
+    if first_answer != "ok" or second_answer != "ok":
+        raise AssertionError("Mocked LLM responses should be returned.")
+    if first_client is None or client._client is not first_client:
+        raise AssertionError("LLMClient should reuse one httpx.Client instance.")
+
+    client.close()
+    if client._client is not None or not first_client.is_closed:
+        raise AssertionError("LLMClient.close() should close and clear the client.")
+
+    print("LLM client connection reuse -> ok")
 
 
 def assert_api_auth() -> None:
@@ -272,6 +299,7 @@ def main() -> None:
     assert_llm_client_input_validation()
     assert_llm_health_requests()
     assert_llm_retry_behavior()
+    assert_llm_client_connection_reuse()
     assert_api_auth()
     assert_invalid_settings_rejected()
     assert_prompt_budget_settings()
