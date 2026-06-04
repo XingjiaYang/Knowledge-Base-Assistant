@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
 from typing import Annotated, Literal
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -14,6 +17,8 @@ from app.rag import ChatMessage, RAGPipeline
 from app.security import is_authorized_api_request
 from app.vector_store import SearchResult, VectorStore
 
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Knowledge Base Assistant", version="0.1.0")
 
@@ -131,14 +136,11 @@ def index() -> str:
 
 
 @app.get("/health", dependencies=[Depends(require_api_auth)])
-def health() -> dict[str, object]:
-    qdrant_ok = True
-    try:
-        vector_store.client.get_collections()
-    except Exception:
-        qdrant_ok = False
-
-    llm_ok = llm_client.health()
+async def health() -> dict[str, object]:
+    qdrant_ok, llm_ok = await asyncio.gather(
+        asyncio.to_thread(_qdrant_health),
+        asyncio.to_thread(llm_client.health),
+    )
 
     return {
         "status": "ok" if qdrant_ok and llm_ok else "degraded",
@@ -160,22 +162,37 @@ def health() -> dict[str, object]:
     response_model=RAGResponse,
     dependencies=[Depends(require_api_auth)],
 )
-def rag(request: RAGRequest) -> RAGResponse:
+async def rag(request: RAGRequest) -> RAGResponse:
     history = [
         ChatMessage(role=item.role, content=item.content)
         for item in request.history
     ]
     try:
-        result = rag_pipeline.answer(
+        result = await asyncio.to_thread(
+            rag_pipeline.answer,
             request.question,
             top_k=request.top_k,
             history=history,
             conversation_summary=request.conversation_summary,
         )
     except UnexpectedResponse as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        logger.exception("Vector store request failed during RAG.")
+        raise HTTPException(
+            status_code=502,
+            detail=_error_detail("Upstream vector store error.", exc),
+        ) from exc
+    except httpx.HTTPError as exc:
+        logger.exception("LLM provider request failed during RAG.")
+        raise HTTPException(
+            status_code=502,
+            detail=_error_detail("Upstream LLM provider error.", exc),
+        ) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        logger.exception("RAG request failed.")
+        raise HTTPException(
+            status_code=500,
+            detail=_error_detail("Internal server error.", exc),
+        ) from exc
 
     return RAGResponse(
         answer=result.answer,
@@ -188,3 +205,18 @@ def rag(request: RAGRequest) -> RAGResponse:
         route=result.route,
         route_reason=result.route_reason,
     )
+
+
+def _qdrant_health() -> bool:
+    try:
+        vector_store.client.get_collections()
+    except Exception:
+        logger.exception("Qdrant health check failed.")
+        return False
+    return True
+
+
+def _error_detail(message: str, exc: Exception) -> str:
+    if settings.debug:
+        return str(exc)
+    return message

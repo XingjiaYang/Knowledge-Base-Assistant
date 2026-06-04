@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Literal
 
 from app.config import Settings, settings
@@ -8,6 +9,9 @@ from app.intent_router import IntentRouter
 from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget, TrimStrategy
 from app.vector_store import SearchResult, VectorStore
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -41,7 +45,7 @@ class RAGPipeline:
         self.llm_client = llm_client or LLMClient(config)
         self.intent_router = intent_router or IntentRouter(
             config,
-            embedder=getattr(self.vector_store, "model", None),
+            embedder=self._intent_embedder(self.vector_store),
             llm_client=self.llm_client,
         )
 
@@ -58,10 +62,20 @@ class RAGPipeline:
             conversation_summary or "",
         )
         intent = self.intent_router.route(question, recent_history, summary)
+        logger.info(
+            "RAG request routed: route=%s use_rag=%s top_k=%s history=%s "
+            "compacted=%s",
+            intent.route,
+            intent.use_rag,
+            top_k or self.config.retrieve_top_k,
+            len(recent_history),
+            compacted_count,
+        )
 
         if intent.use_rag:
             search_query = self._build_search_query(question, recent_history)
             contexts = self.vector_store.search(search_query, top_k=top_k)
+            logger.info("Vector search returned %s contexts.", len(contexts))
             messages = self._build_rag_messages(
                 question,
                 contexts,
@@ -161,6 +175,7 @@ class RAGPipeline:
                 ),
             )
         except Exception:
+            logger.exception("Conversation summarization failed; using fallback.")
             fallback = "\n".join(
                 part
                 for part in [existing_summary, history_text]
@@ -298,3 +313,9 @@ class RAGPipeline:
         )
         messages.append({"role": "user", "content": user_prompt})
         return messages
+
+    @staticmethod
+    def _intent_embedder(vector_store: object) -> object | None:
+        if hasattr(vector_store, "encode"):
+            return vector_store
+        return getattr(vector_store, "model", None)

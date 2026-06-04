@@ -29,6 +29,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
+    debug: bool = _env_bool("DEBUG", False)
+
     docs_dir: Path = PROJECT_ROOT / "data" / "docs"
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     collection_name: str = os.getenv("QDRANT_COLLECTION", "tech_docs")
@@ -46,6 +48,12 @@ class Settings:
     llm_top_p: float = _env_float("LLM_TOP_P", 0.9)
     llm_max_tokens: int = _env_int("LLM_MAX_TOKENS", 4096)
     llm_timeout_seconds: float = _env_float("LLM_TIMEOUT_SECONDS", 300.0)
+    llm_retry_attempts: int = _env_int("LLM_RETRY_ATTEMPTS", 3)
+    llm_retry_backoff_seconds: float = _env_float("LLM_RETRY_BACKOFF_SECONDS", 1.0)
+    llm_retry_backoff_max_seconds: float = _env_float(
+        "LLM_RETRY_BACKOFF_MAX_SECONDS",
+        10.0,
+    )
     llm_health_check_enabled: bool = _env_bool("LLM_HEALTH_CHECK_ENABLED", False)
     llm_health_path: str = os.getenv("LLM_HEALTH_PATH", "")
     llm_anthropic_version: str = os.getenv(
@@ -104,6 +112,47 @@ class Settings:
         0.40,
     )
     intent_embedding_margin: float = _env_float("INTENT_EMBEDDING_MARGIN", 0.06)
+
+    def __post_init__(self) -> None:
+        if self.chunk_size <= 0:
+            raise ValueError("CHUNK_SIZE must be greater than 0.")
+        if self.chunk_overlap < 0:
+            raise ValueError("CHUNK_OVERLAP must be greater than or equal to 0.")
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE.")
+        if self.chunk_overlap and self.chunk_overlap >= self.chunk_size - 1:
+            raise ValueError("CHUNK_OVERLAP must leave room for new chunk content.")
+        if self.retrieve_top_k <= 0:
+            raise ValueError("RETRIEVE_TOP_K must be greater than 0.")
+        if self.api_top_k_max <= 0:
+            raise ValueError("API_TOP_K_MAX must be greater than 0.")
+        if self.llm_timeout_seconds <= 0:
+            raise ValueError("LLM_TIMEOUT_SECONDS must be greater than 0.")
+        if self.llm_retry_attempts <= 0:
+            raise ValueError("LLM_RETRY_ATTEMPTS must be greater than 0.")
+        if self.llm_retry_backoff_seconds < 0:
+            raise ValueError(
+                "LLM_RETRY_BACKOFF_SECONDS must be greater than or equal to 0."
+            )
+        if self.llm_retry_backoff_max_seconds < self.llm_retry_backoff_seconds:
+            raise ValueError(
+                "LLM_RETRY_BACKOFF_MAX_SECONDS must be greater than or equal to "
+                "LLM_RETRY_BACKOFF_SECONDS."
+            )
+        if self.llm_max_tokens <= 0:
+            raise ValueError("LLM_MAX_TOKENS must be greater than 0.")
+        if self.api_message_max_chars <= 0:
+            raise ValueError("API_MESSAGE_MAX_CHARS must be greater than 0.")
+        if self.api_question_max_chars <= 0:
+            raise ValueError("API_QUESTION_MAX_CHARS must be greater than 0.")
+        if self.api_summary_max_chars < 0:
+            raise ValueError(
+                "API_SUMMARY_MAX_CHARS must be greater than or equal to 0."
+            )
+        if self.api_history_max_messages < 0:
+            raise ValueError(
+                "API_HISTORY_MAX_MESSAGES must be greater than or equal to 0."
+            )
 
 
 settings = Settings()

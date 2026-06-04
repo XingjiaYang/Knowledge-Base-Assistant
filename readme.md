@@ -163,6 +163,8 @@ docker compose up -d
 Common settings from `.env.example`:
 
 ```bash
+DEBUG=0
+
 LLM_PROVIDER=openai_compatible
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
@@ -170,6 +172,10 @@ LLM_API_KEY=
 LLM_TEMPERATURE=0.2
 LLM_TOP_P=0.9
 LLM_MAX_TOKENS=4096
+LLM_TIMEOUT_SECONDS=300
+LLM_RETRY_ATTEMPTS=3
+LLM_RETRY_BACKOFF_SECONDS=1
+LLM_RETRY_BACKOFF_MAX_SECONDS=10
 LLM_HEALTH_CHECK_ENABLED=0
 LLM_HEALTH_PATH=
 
@@ -216,6 +222,10 @@ SentenceTransformers.
 Leave `LLM_HEALTH_PATH` blank to use provider-specific health defaults:
 OpenAI-compatible providers use `GET /models`, while Anthropic uses
 `POST /messages/count_tokens`.
+
+LLM chat requests retry transient provider errors (`429`, `502`, `503`, `504`)
+with exponential backoff. Keep `DEBUG=0` outside local development so API errors
+return generic messages while details stay in server logs.
 
 Leave `API_AUTH_TOKEN` blank for local development. When set, `/health` and
 `/rag` require `Authorization: Bearer <token>`. The browser UI prompts for the

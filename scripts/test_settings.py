@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import httpx
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -45,6 +47,9 @@ def assert_llm_settings() -> None:
         llm_health_check_enabled=True,
         llm_health_path="",
         llm_anthropic_version="2023-06-01",
+        llm_retry_attempts=4,
+        llm_retry_backoff_seconds=0.5,
+        llm_retry_backoff_max_seconds=4.0,
         intent_embedding_rag_threshold=0.55,
         api_auth_token="secret-token",
     )
@@ -61,6 +66,12 @@ def assert_llm_settings() -> None:
         raise AssertionError("RAG embedding threshold should be configurable.")
     if config.api_auth_token != "secret-token":
         raise AssertionError("API auth token should be configurable.")
+    if config.llm_retry_attempts != 4:
+        raise AssertionError("LLM retry attempts should be configurable.")
+    if config.llm_retry_backoff_seconds != 0.5:
+        raise AssertionError("LLM retry backoff should be configurable.")
+    if config.llm_retry_backoff_max_seconds != 4.0:
+        raise AssertionError("LLM retry max backoff should be configurable.")
 
     print("LLM settings -> ok")
 
@@ -142,6 +153,36 @@ def assert_llm_health_requests() -> None:
     print("LLM health request routing -> ok")
 
 
+def assert_llm_retry_behavior() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, json={"error": "rate limited"})
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    client = LLMClient(
+        Settings(
+            llm_retry_attempts=2,
+            llm_retry_backoff_seconds=0,
+            llm_retry_backoff_max_seconds=0,
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    answer = client.chat([{"role": "user", "content": "hello"}])
+    if answer != "ok" or calls != 2:
+        raise AssertionError("LLM retry should recover from transient 429 errors.")
+    if not client._is_retryable_status(503) or client._is_retryable_status(400):
+        raise AssertionError("LLM retry status classification is incorrect.")
+
+    print("LLM retry behavior -> ok")
+
+
 def assert_api_auth() -> None:
     open_config = Settings(api_auth_token="")
     if not is_authorized_api_request(open_config, None):
@@ -163,6 +204,27 @@ def assert_api_auth() -> None:
             raise AssertionError(f"Invalid authorization accepted: {authorization!r}")
 
     print("API bearer auth -> ok")
+
+
+def assert_invalid_settings_rejected() -> None:
+    invalid_configs = [
+        {"chunk_size": 100, "chunk_overlap": 100},
+        {"chunk_size": 100, "chunk_overlap": 99},
+        {"llm_retry_attempts": 0},
+        {
+            "llm_retry_backoff_seconds": 2.0,
+            "llm_retry_backoff_max_seconds": 1.0,
+        },
+        {"api_top_k_max": 0},
+    ]
+    for kwargs in invalid_configs:
+        try:
+            Settings(**kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"Invalid Settings should be rejected: {kwargs!r}")
+
+    print("Settings validation -> ok")
 
 
 def assert_prompt_budget_settings() -> None:
@@ -209,7 +271,9 @@ def main() -> None:
     assert_llm_client_provider_helpers()
     assert_llm_client_input_validation()
     assert_llm_health_requests()
+    assert_llm_retry_behavior()
     assert_api_auth()
+    assert_invalid_settings_rejected()
     assert_prompt_budget_settings()
 
 

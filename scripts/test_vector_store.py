@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import Settings
+from app.rag import RAGPipeline
 from app.vector_store import VectorStore
 
 
@@ -29,6 +30,17 @@ class FakeEmbeddingModel:
         if isinstance(texts, str):
             return np.asarray([1.0, 0.0], dtype=np.float32)
         return np.asarray([[1.0, 0.0] for _ in texts], dtype=np.float32)
+
+
+class FakeLLMClient:
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float | None = None,
+        top_p: float | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        return "ok"
 
 
 def _records(client: QdrantClient, collection_name: str) -> list[Record]:
@@ -100,7 +112,20 @@ def assert_incremental_ingest_replaces_source_points() -> None:
     print("Incremental ingest source replacement -> ok")
 
 
+def assert_vector_store_lazy_loads_dependencies() -> None:
+    store = VectorStore(Settings())
+    if store._client is not None or store._model is not None:
+        raise AssertionError("VectorStore should not connect or load models at init.")
+
+    RAGPipeline(Settings(), vector_store=store, llm_client=FakeLLMClient())
+    if store._client is not None or store._model is not None:
+        raise AssertionError("RAGPipeline init should not force VectorStore loading.")
+
+    print("VectorStore lazy loading -> ok")
+
+
 def main() -> None:
+    assert_vector_store_lazy_loads_dependencies()
     assert_incremental_ingest_replaces_source_points()
 
 

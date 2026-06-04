@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import re
 from typing import Literal
@@ -21,6 +23,8 @@ from sentence_transformers import SentenceTransformer
 
 from app.config import PROJECT_ROOT, Settings, settings
 
+
+logger = logging.getLogger(__name__)
 
 ContentType = Literal["text", "code", "table"]
 
@@ -86,13 +90,15 @@ def chunk_markdown(text: str, chunk_size: int, overlap: int) -> list[MarkdownChu
         raise ValueError("overlap must be greater than or equal to 0")
     if overlap >= chunk_size:
         raise ValueError("overlap must be smaller than chunk_size")
+    if overlap and overlap >= chunk_size - 1:
+        raise ValueError("overlap must leave room for non-overlap text")
 
     blocks = _markdown_blocks(text)
     if not blocks:
         return []
 
     chunks: list[MarkdownChunk] = []
-    effective_chunk_size = chunk_size - overlap - 1 if overlap else chunk_size
+    effective_chunk_size = _effective_chunk_size(chunk_size, overlap)
 
     for block in blocks:
         if block.content_type == "code":
@@ -105,6 +111,13 @@ def chunk_markdown(text: str, chunk_size: int, overlap: int) -> list[MarkdownChu
         chunks.extend(_chunk_from_block(block, part) for part in parts if part)
 
     return chunks
+
+
+def _effective_chunk_size(chunk_size: int, overlap: int) -> int:
+    if not overlap:
+        return chunk_size
+    # Reserve one separator character for the overlapped tail that is prepended.
+    return chunk_size - overlap - 1
 
 
 def _markdown_blocks(text: str) -> list[MarkdownBlock]:
@@ -348,8 +361,22 @@ class VectorStore:
         model: SentenceTransformer | None = None,
     ) -> None:
         self.config = config
-        self.client = client or QdrantClient(url=config.qdrant_url)
-        self.model = model or SentenceTransformer(config.embedding_model)
+        self._client = client
+        self._model = model
+
+    @property
+    def client(self) -> QdrantClient:
+        if self._client is None:
+            logger.info("Connecting to Qdrant at %s.", self.config.qdrant_url)
+            self._client = QdrantClient(url=self.config.qdrant_url)
+        return self._client
+
+    @property
+    def model(self) -> SentenceTransformer:
+        if self._model is None:
+            logger.info("Loading embedding model %s.", self.config.embedding_model)
+            self._model = SentenceTransformer(self.config.embedding_model)
+        return self._model
 
     @property
     def vector_size(self) -> int:
@@ -362,6 +389,11 @@ class VectorStore:
         return int(size)
 
     def ensure_collection(self, recreate: bool = False) -> None:
+        logger.info(
+            "Ensuring Qdrant collection %s (recreate=%s).",
+            self.config.collection_name,
+            recreate,
+        )
         collection_names = {c.name for c in self.client.get_collections().collections}
 
         if recreate and self.config.collection_name in collection_names:
@@ -391,6 +423,7 @@ class VectorStore:
     ) -> int:
         docs_path = docs_dir or self.config.docs_dir
         self.ensure_collection(recreate=recreate)
+        logger.info("Ingesting Markdown documents from %s.", docs_path)
 
         file_points = [
             (file_path, self._points_for_file(file_path))
@@ -409,6 +442,11 @@ class VectorStore:
                 wait=True,
             )
             inserted += len(points)
+        logger.info(
+            "Ingested %s chunks into %s.",
+            inserted,
+            self.config.collection_name,
+        )
         return inserted
 
     def search(
@@ -420,28 +458,37 @@ class VectorStore:
         limit = top_k or self.config.retrieve_top_k
         query_vector = self._embed_one(query)
         query_filter = self._metadata_filter(metadata_filter)
+        logger.info(
+            "Running vector search: top_k=%s metadata_filter_keys=%s.",
+            limit,
+            sorted((metadata_filter or {}).keys()),
+        )
 
-        if hasattr(self.client, "query_points"):
-            query_args = {
-                "collection_name": self.config.collection_name,
-                "query": query_vector,
-                "limit": limit,
-                "with_payload": True,
-            }
-            if query_filter is not None:
-                query_args["query_filter"] = query_filter
-            response = self.client.query_points(**query_args)
-            hits = response.points
-        else:
-            search_args = {
-                "collection_name": self.config.collection_name,
-                "query_vector": query_vector,
-                "limit": limit,
-                "with_payload": True,
-            }
-            if query_filter is not None:
-                search_args["query_filter"] = query_filter
-            hits = self.client.search(**search_args)
+        try:
+            if hasattr(self.client, "query_points"):
+                query_args = {
+                    "collection_name": self.config.collection_name,
+                    "query": query_vector,
+                    "limit": limit,
+                    "with_payload": True,
+                }
+                if query_filter is not None:
+                    query_args["query_filter"] = query_filter
+                response = self.client.query_points(**query_args)
+                hits = response.points
+            else:
+                search_args = {
+                    "collection_name": self.config.collection_name,
+                    "query_vector": query_vector,
+                    "limit": limit,
+                    "with_payload": True,
+                }
+                if query_filter is not None:
+                    search_args["query_filter"] = query_filter
+                hits = self.client.search(**search_args)
+        except Exception:
+            logger.exception("Qdrant vector search failed.")
+            raise
 
         results: list[SearchResult] = []
         for hit in hits:
@@ -550,6 +597,13 @@ class VectorStore:
     def _embed_one(self, text: str) -> list[float]:
         embedding = self.model.encode(text, normalize_embeddings=True)
         return embedding.tolist()
+
+    def encode(
+        self,
+        texts: str | Sequence[str],
+        normalize_embeddings: bool = True,
+    ) -> object:
+        return self.model.encode(texts, normalize_embeddings=normalize_embeddings)
 
     @staticmethod
     def _metadata_filter(
