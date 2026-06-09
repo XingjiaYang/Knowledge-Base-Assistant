@@ -31,11 +31,13 @@ nohup.out
 
 # Runtime data, caches, and local model artifacts
 qdrant_storage/
+postgres_data/
 models/
 model_cache/
 hf_cache/
 .huggingface/
 .cache/
+.uv-cache/
 data/raw/
 data/cache/
 data/uploads/

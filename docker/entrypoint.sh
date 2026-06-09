@@ -11,6 +11,9 @@ INGEST_ON_STARTUP="${INGEST_ON_STARTUP:-1}"
 RECREATE_COLLECTION="${RECREATE_COLLECTION:-0}"
 WAIT_FOR_LLM="${WAIT_FOR_LLM:-0}"
 SERVICE_TIMEOUT_SECONDS="${SERVICE_TIMEOUT_SECONDS:-1800}"
+AUTH_ENABLED="${AUTH_ENABLED:-0}"
+POSTGRES_HOST="${POSTGRES_HOST:-postgres}"
+POSTGRES_PORT="${POSTGRES_PORT:-5432}"
 
 is_true() {
   case "${1,,}" in
@@ -66,11 +69,54 @@ while True:
 PY
 }
 
+wait_tcp() {
+  local name="$1"
+  local host="$2"
+  local port="$3"
+  local timeout_seconds="$4"
+
+  python - "$name" "$host" "$port" "$timeout_seconds" <<'PY'
+import socket
+import sys
+import time
+
+name, host, port, timeout_seconds = sys.argv[1:5]
+deadline = time.monotonic() + float(timeout_seconds)
+last_error = None
+
+while True:
+    try:
+        with socket.create_connection((host, int(port)), timeout=5):
+            print(f"{name} is ready: {host}:{port}", flush=True)
+            sys.exit(0)
+    except OSError as exc:
+        last_error = exc
+
+    if time.monotonic() >= deadline:
+        print(
+            f"Timed out waiting for {name} at {host}:{port}. "
+            f"Last error: {last_error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
+
+    print(f"Waiting for {name} at {host}:{port}...", flush=True)
+    time.sleep(5)
+PY
+}
+
 QDRANT_READY_URL="${QDRANT_READY_URL:-${QDRANT_URL%/}/collections}"
 LLM_READY_PATH="${LLM_READY_PATH:-${LLM_HEALTH_PATH:-/models}}"
 LLM_READY_URL="${LLM_READY_URL:-${LLM_BASE_URL%/}${LLM_READY_PATH}}"
 
 wait_http "Qdrant" "$QDRANT_READY_URL" "$SERVICE_TIMEOUT_SECONDS"
+
+if is_true "$AUTH_ENABLED"; then
+  wait_tcp "PostgreSQL" "$POSTGRES_HOST" "$POSTGRES_PORT" "$SERVICE_TIMEOUT_SECONDS"
+else
+  echo "Skipping PostgreSQL readiness because AUTH_ENABLED=${AUTH_ENABLED}"
+fi
 
 if is_true "$INGEST_ON_STARTUP"; then
   ingest_args=()

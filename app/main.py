@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import logging
 from pathlib import Path
 from typing import Annotated, Literal
+from uuid import UUID
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -15,7 +16,14 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from app.config import settings
 from app.llm_client import LLMClient
 from app.rag import ChatMessage, RAGPipeline
-from app.security import is_authorized_api_request
+from app.security import bearer_token, is_authorized_api_request
+from app.session_store import (
+    ChatSessionRecord,
+    CurrentUser,
+    SessionStore,
+    StoredChatMessage,
+    UserRecord,
+)
 from app.vector_store import SearchResult, VectorStore
 
 
@@ -26,6 +34,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(_app: FastAPI):
     _app.state.vector_store = VectorStore(settings)
     _app.state.llm_client = LLMClient(settings)
+    _app.state.session_store = SessionStore(settings) if settings.auth_enabled else None
+    if _app.state.session_store is not None:
+        await asyncio.to_thread(_app.state.session_store.init_db)
     _app.state.rag_pipeline = RAGPipeline(
         settings,
         vector_store=_app.state.vector_store,
@@ -36,6 +47,8 @@ async def lifespan(_app: FastAPI):
     finally:
         _app.state.llm_client.close()
         _app.state.vector_store.close()
+        if _app.state.session_store is not None:
+            _app.state.session_store.close()
 
 
 app = FastAPI(
@@ -83,6 +96,7 @@ class RAGRequest(BaseModel):
         min_length=1,
         max_length=settings.api_question_max_chars,
     )
+    session_id: UUID | None = None
     top_k: int | None = Field(default=None, ge=1, le=settings.api_top_k_max)
     history: list[ChatMessageRequest] = Field(
         default_factory=list,
@@ -126,6 +140,7 @@ class ContextResponse(BaseModel):
 
 class RAGResponse(BaseModel):
     answer: str
+    session_id: str | None = None
     contexts: list[ContextResponse]
     conversation_summary: str
     compacted_history_messages: int
@@ -134,11 +149,181 @@ class RAGResponse(BaseModel):
     route_reason: str
 
 
-def require_api_auth(
+class UserResponse(BaseModel):
+    id: str
+    username: str
+    is_admin: bool
+
+    @classmethod
+    def from_user(cls, user: CurrentUser) -> "UserResponse":
+        return cls(
+            id=str(user.id),
+            username=user.username,
+            is_admin=user.is_admin,
+        )
+
+
+class AuthConfigResponse(BaseModel):
+    auth_enabled: bool
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=80)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class LoginResponse(BaseModel):
+    token: str
+    user: UserResponse
+
+
+class AdminUserResponse(BaseModel):
+    id: str
+    username: str
+    is_active: bool
+    is_admin: bool
+    created_at: str
+    updated_at: str
+    last_login_at: str | None
+    session_count: int
+    message_count: int
+
+    @classmethod
+    def from_user_record(cls, user: UserRecord) -> "AdminUserResponse":
+        return cls(
+            id=str(user.id),
+            username=user.username,
+            is_active=user.is_active,
+            is_admin=user.is_admin,
+            created_at=user.created_at.isoformat(),
+            updated_at=user.updated_at.isoformat(),
+            last_login_at=user.last_login_at.isoformat()
+            if user.last_login_at
+            else None,
+            session_count=user.session_count,
+            message_count=user.message_count,
+        )
+
+
+class AdminUserCreateRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=80)
+    password: str = Field(..., min_length=1, max_length=256)
+    is_admin: bool = False
+
+
+class AdminPasswordUpdateRequest(BaseModel):
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class AdminRoleUpdateRequest(BaseModel):
+    is_admin: bool
+
+
+class SessionSummaryResponse(BaseModel):
+    id: str
+    title: str
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_session(cls, session: ChatSessionRecord) -> "SessionSummaryResponse":
+        return cls(
+            id=str(session.id),
+            title=session.title,
+            created_at=session.created_at.isoformat(),
+            updated_at=session.updated_at.isoformat(),
+        )
+
+
+class StoredMessageResponse(BaseModel):
+    id: int
+    role: Literal["user", "assistant"]
+    content: str
+    contexts: list[ContextResponse]
+    used_rag: bool | None = None
+    route: str = ""
+    route_reason: str = ""
+    created_at: str
+
+    @classmethod
+    def from_message(cls, message: StoredChatMessage) -> "StoredMessageResponse":
+        return cls(
+            id=message.id,
+            role=message.role,
+            content=message.content,
+            contexts=[ContextResponse(**context) for context in message.contexts],
+            used_rag=message.used_rag,
+            route=message.route,
+            route_reason=message.route_reason,
+            created_at=message.created_at.isoformat(),
+        )
+
+
+class SessionDetailResponse(SessionSummaryResponse):
+    conversation_summary: str
+    compacted_message_count: int
+    messages: list[StoredMessageResponse]
+
+    @classmethod
+    def from_session_detail(
+        cls,
+        session: ChatSessionRecord,
+        messages: list[StoredChatMessage],
+    ) -> "SessionDetailResponse":
+        return cls(
+            id=str(session.id),
+            title=session.title,
+            created_at=session.created_at.isoformat(),
+            updated_at=session.updated_at.isoformat(),
+            conversation_summary=session.conversation_summary,
+            compacted_message_count=session.compacted_message_count,
+            messages=[
+                StoredMessageResponse.from_message(message)
+                for message in messages
+            ],
+        )
+
+
+def require_api_or_user_auth(
+    request: Request,
     authorization: Annotated[str | None, Header()] = None,
-) -> None:
+) -> CurrentUser | None:
+    if settings.auth_enabled:
+        token = bearer_token(authorization)
+        if token is None:
+            raise_unauthorized()
+        user = _session_store(request).get_user_by_token(token)
+        if user is None:
+            raise_unauthorized()
+        return user
+
     if is_authorized_api_request(settings, authorization):
-        return
+        return None
+    raise_unauthorized()
+
+
+def require_login_auth(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+) -> CurrentUser:
+    if not settings.auth_enabled:
+        raise HTTPException(status_code=404, detail="Account login is disabled.")
+
+    user = require_api_or_user_auth(request, authorization)
+    if user is None:
+        raise_unauthorized()
+    return user
+
+
+def require_admin_auth(
+    user: Annotated[CurrentUser, Depends(require_login_auth)],
+) -> CurrentUser:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return user
+
+
+def raise_unauthorized() -> None:
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Unauthorized",
@@ -156,7 +341,219 @@ async def health() -> dict[str, object]:
     return {"status": "ok"}
 
 
-@app.get("/health/details", dependencies=[Depends(require_api_auth)])
+@app.get("/auth/config", response_model=AuthConfigResponse)
+def auth_config() -> AuthConfigResponse:
+    return AuthConfigResponse(auth_enabled=settings.auth_enabled)
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+async def login(request: Request, login_request: LoginRequest) -> LoginResponse:
+    if not settings.auth_enabled:
+        raise HTTPException(status_code=404, detail="Account login is disabled.")
+
+    session_store = _session_store(request)
+    try:
+        user = await asyncio.to_thread(
+            session_store.authenticate_user,
+            login_request.username,
+            login_request.password,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = await asyncio.to_thread(
+        session_store.create_auth_session,
+        user.id,
+        request.headers.get("user-agent", ""),
+        request.client.host if request.client else "",
+    )
+    return LoginResponse(token=token, user=UserResponse.from_user(user))
+
+
+@app.get("/auth/me", response_model=UserResponse)
+def current_user(
+    user: Annotated[CurrentUser, Depends(require_login_auth)],
+) -> UserResponse:
+    return UserResponse.from_user(user)
+
+
+@app.post("/auth/logout")
+async def logout(
+    request: Request,
+    _user: Annotated[CurrentUser, Depends(require_login_auth)],
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    token = bearer_token(authorization)
+    if token:
+        await asyncio.to_thread(_session_store(request).delete_auth_session, token)
+    return {"status": "ok"}
+
+
+@app.get("/admin/users", response_model=list[AdminUserResponse])
+async def admin_list_users(
+    request: Request,
+    _admin: Annotated[CurrentUser, Depends(require_admin_auth)],
+) -> list[AdminUserResponse]:
+    users = await asyncio.to_thread(_session_store(request).list_users)
+    return [AdminUserResponse.from_user_record(user) for user in users]
+
+
+@app.post("/admin/users", response_model=AdminUserResponse)
+async def admin_create_user(
+    request: Request,
+    create_request: AdminUserCreateRequest,
+    _admin: Annotated[CurrentUser, Depends(require_admin_auth)],
+) -> AdminUserResponse:
+    try:
+        user = await asyncio.to_thread(
+            _session_store(request).create_user,
+            create_request.username,
+            create_request.password,
+            create_request.is_admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return AdminUserResponse.from_user_record(user)
+
+
+@app.post("/admin/users/{user_id}/password")
+async def admin_set_user_password(
+    user_id: UUID,
+    request: Request,
+    password_request: AdminPasswordUpdateRequest,
+    _admin: Annotated[CurrentUser, Depends(require_admin_auth)],
+) -> dict[str, object]:
+    try:
+        updated = await asyncio.to_thread(
+            _session_store(request).set_user_password,
+            user_id,
+            password_request.password,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"status": "ok"}
+
+
+@app.patch("/admin/users/{user_id}/role")
+async def admin_set_user_role(
+    user_id: UUID,
+    request: Request,
+    role_request: AdminRoleUpdateRequest,
+    _admin: Annotated[CurrentUser, Depends(require_admin_auth)],
+) -> dict[str, object]:
+    try:
+        updated = await asyncio.to_thread(
+            _session_store(request).set_user_admin,
+            user_id,
+            role_request.is_admin,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"status": "ok"}
+
+
+@app.delete("/admin/users/{user_id}/sessions")
+async def admin_clear_user_sessions(
+    user_id: UUID,
+    request: Request,
+    _admin: Annotated[CurrentUser, Depends(require_admin_auth)],
+) -> dict[str, object]:
+    deleted = await asyncio.to_thread(
+        _session_store(request).clear_user_sessions,
+        user_id,
+    )
+    return {"status": "ok", "deleted_sessions": deleted}
+
+
+@app.delete("/admin/users/{user_id}")
+async def admin_delete_user(
+    user_id: UUID,
+    request: Request,
+    admin: Annotated[CurrentUser, Depends(require_admin_auth)],
+) -> dict[str, object]:
+    if user_id == admin.id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account.")
+
+    try:
+        deleted = await asyncio.to_thread(_session_store(request).delete_user, user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return {"status": "ok"}
+
+
+@app.get("/sessions", response_model=list[SessionSummaryResponse])
+async def list_sessions(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_login_auth)],
+) -> list[SessionSummaryResponse]:
+    sessions = await asyncio.to_thread(
+        _session_store(request).list_chat_sessions,
+        user.id,
+    )
+    return [SessionSummaryResponse.from_session(session) for session in sessions]
+
+
+@app.post("/sessions", response_model=SessionDetailResponse)
+async def create_session(
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_login_auth)],
+) -> SessionDetailResponse:
+    session = await asyncio.to_thread(
+        _session_store(request).create_chat_session,
+        user.id,
+    )
+    return SessionDetailResponse.from_session_detail(session, [])
+
+
+@app.get("/sessions/{session_id}", response_model=SessionDetailResponse)
+async def get_session(
+    session_id: UUID,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_login_auth)],
+) -> SessionDetailResponse:
+    session_store = _session_store(request)
+    session = await asyncio.to_thread(
+        session_store.get_chat_session,
+        user.id,
+        session_id,
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    messages = await asyncio.to_thread(session_store.list_messages, session.id)
+    return SessionDetailResponse.from_session_detail(session, messages)
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(
+    session_id: UUID,
+    request: Request,
+    user: Annotated[CurrentUser, Depends(require_login_auth)],
+) -> dict[str, object]:
+    deleted = await asyncio.to_thread(
+        _session_store(request).delete_chat_session,
+        user.id,
+        session_id,
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return {"status": "ok"}
+
+
+@app.get("/health/details", dependencies=[Depends(require_api_or_user_auth)])
 async def health_details(request: Request) -> dict[str, object]:
     qdrant_ok, llm_ok = await asyncio.gather(
         asyncio.to_thread(_qdrant_health, request.app.state.vector_store),
@@ -176,26 +573,49 @@ async def health_details(request: Request) -> dict[str, object]:
         "history_recent_turns": settings.history_recent_turns,
         "api_top_k_max": settings.api_top_k_max,
         "intent_router": settings.intent_router_enabled,
+        "auth_enabled": settings.auth_enabled,
     }
 
 
 @app.post(
     "/rag",
     response_model=RAGResponse,
-    dependencies=[Depends(require_api_auth)],
 )
-async def rag(http_request: Request, rag_request: RAGRequest) -> RAGResponse:
-    history = [
-        ChatMessage(role=item.role, content=item.content)
-        for item in rag_request.history
-    ]
+async def rag(
+    http_request: Request,
+    rag_request: RAGRequest,
+    user: Annotated[CurrentUser | None, Depends(require_api_or_user_auth)],
+) -> RAGResponse:
+    session: ChatSessionRecord | None = None
+    if settings.auth_enabled:
+        if user is None:
+            raise_unauthorized()
+        session_store = _session_store(http_request)
+        session = await _get_or_create_chat_session(
+            session_store,
+            user,
+            rag_request.session_id,
+        )
+        history = await asyncio.to_thread(
+            session_store.prompt_history,
+            session.id,
+            session.compacted_message_count,
+        )
+        conversation_summary = session.conversation_summary
+    else:
+        history = [
+            ChatMessage(role=item.role, content=item.content)
+            for item in rag_request.history
+        ]
+        conversation_summary = rag_request.conversation_summary
+
     try:
         result = await asyncio.to_thread(
             http_request.app.state.rag_pipeline.answer,
             rag_request.question,
             top_k=rag_request.top_k,
             history=history,
-            conversation_summary=rag_request.conversation_summary,
+            conversation_summary=conversation_summary,
         )
     except UnexpectedResponse as exc:
         logger.exception("Vector store request failed during RAG.")
@@ -216,8 +636,35 @@ async def rag(http_request: Request, rag_request: RAGRequest) -> RAGResponse:
             detail=_error_detail("Internal server error.", exc),
         ) from exc
 
+    if settings.auth_enabled and session is not None:
+        session_store = _session_store(http_request)
+        await asyncio.to_thread(
+            session_store.append_message,
+            session.id,
+            "user",
+            rag_request.question,
+        )
+        await asyncio.to_thread(
+            session_store.append_message,
+            session.id,
+            "assistant",
+            result.answer,
+            result.contexts,
+            result.used_rag,
+            result.route,
+            result.route_reason,
+        )
+        session = await asyncio.to_thread(
+            session_store.update_chat_session_after_answer,
+            session.id,
+            result.conversation_summary,
+            result.compacted_history_messages,
+            rag_request.question,
+        )
+
     return RAGResponse(
         answer=result.answer,
+        session_id=str(session.id) if session else None,
         contexts=[
             ContextResponse.from_search_result(item) for item in result.contexts
         ],
@@ -236,6 +683,31 @@ def _qdrant_health(vector_store: VectorStore) -> bool:
         logger.exception("Qdrant health check failed.")
         return False
     return True
+
+
+async def _get_or_create_chat_session(
+    session_store: SessionStore,
+    user: CurrentUser,
+    session_id: UUID | None,
+) -> ChatSessionRecord:
+    if session_id is None:
+        return await asyncio.to_thread(session_store.create_chat_session, user.id)
+
+    session = await asyncio.to_thread(
+        session_store.get_chat_session,
+        user.id,
+        session_id,
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return session
+
+
+def _session_store(request: Request) -> SessionStore:
+    session_store = getattr(request.app.state, "session_store", None)
+    if session_store is None:
+        raise HTTPException(status_code=404, detail="Account login is disabled.")
+    return session_store
 
 
 def _error_detail(message: str, exc: Exception) -> str:

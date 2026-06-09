@@ -19,9 +19,11 @@ env/
 logs/
 
 qdrant_storage/
+postgres_data/
 models/
 model_cache/
 .cache/
+.uv-cache/
 hf_cache/
 data/raw/
 data/cache/

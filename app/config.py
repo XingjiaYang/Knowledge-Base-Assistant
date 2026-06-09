@@ -68,6 +68,29 @@ class Settings:
     api_history_max_messages: int = _env_int("API_HISTORY_MAX_MESSAGES", 120)
     api_auth_token: str = os.getenv("API_AUTH_TOKEN", "")
 
+    auth_enabled: bool = _env_bool("AUTH_ENABLED", False)
+    database_url: str = os.getenv(
+        "DATABASE_URL",
+        "postgresql://kba:kba_password@localhost:5432/kba",
+    )
+    database_connect_timeout_seconds: int = _env_int(
+        "DATABASE_CONNECT_TIMEOUT_SECONDS",
+        5,
+    )
+    auth_bootstrap_users: str = os.getenv("AUTH_BOOTSTRAP_USERS", "")
+    auth_default_admin_enabled: bool = _env_bool("AUTH_DEFAULT_ADMIN_ENABLED", True)
+    auth_default_admin_username: str = os.getenv(
+        "AUTH_DEFAULT_ADMIN_USERNAME",
+        "admin",
+    )
+    auth_default_admin_password: str = os.getenv(
+        "AUTH_DEFAULT_ADMIN_PASSWORD",
+        "1234",
+    )
+    auth_session_ttl_seconds: int = _env_int("AUTH_SESSION_TTL_SECONDS", 604800)
+    session_list_limit: int = _env_int("SESSION_LIST_LIMIT", 50)
+    session_title_max_chars: int = _env_int("SESSION_TITLE_MAX_CHARS", 80)
+
     history_recent_turns: int = _env_int("HISTORY_RECENT_TURNS", 16)
     history_compact_after_turns: int = _env_int("HISTORY_COMPACT_AFTER_TURNS", 40)
     history_max_messages: int = _env_int("HISTORY_MAX_MESSAGES", 120)
@@ -158,6 +181,21 @@ class Settings:
             raise ValueError(
                 "API_HISTORY_MAX_MESSAGES must be greater than or equal to 0."
             )
+        if self.database_connect_timeout_seconds <= 0:
+            raise ValueError(
+                "DATABASE_CONNECT_TIMEOUT_SECONDS must be greater than 0."
+            )
+        if self.auth_enabled and self.auth_default_admin_enabled:
+            if not self.auth_default_admin_username.strip():
+                raise ValueError("AUTH_DEFAULT_ADMIN_USERNAME must not be empty.")
+            if not self.auth_default_admin_password:
+                raise ValueError("AUTH_DEFAULT_ADMIN_PASSWORD must not be empty.")
+        if self.auth_session_ttl_seconds <= 0:
+            raise ValueError("AUTH_SESSION_TTL_SECONDS must be greater than 0.")
+        if self.session_list_limit <= 0:
+            raise ValueError("SESSION_LIST_LIMIT must be greater than 0.")
+        if self.session_title_max_chars <= 0:
+            raise ValueError("SESSION_TITLE_MAX_CHARS must be greater than 0.")
 
 
 settings = Settings()

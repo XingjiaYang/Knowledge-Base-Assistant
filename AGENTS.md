@@ -4,12 +4,12 @@
 
 This repository is Knowledge Base Assistant, a general-purpose RAG and direct-chat application built with FastAPI, Qdrant, SentenceTransformers, and a configurable LLM provider.
 
-- `app/`: application code. `main.py` exposes the FastAPI app, `static/` contains the web UI, `intent_router.py` decides whether retrieval is needed, `rag.py` coordinates retrieval and generation, `vector_store.py` manages Qdrant, `llm_client.py` calls the configured cloud or local LLM API, and `config.py` reads environment settings.
+- `app/`: application code. `main.py` exposes the FastAPI app, `static/` contains the web UI, `intent_router.py` decides whether retrieval is needed, `rag.py` coordinates retrieval and generation, `vector_store.py` manages Qdrant, `session_store.py` manages PostgreSQL-backed users and chat sessions, `llm_client.py` calls the configured cloud or local LLM API, and `config.py` reads environment settings.
 - `scripts/`: operational scripts for starting local services, ingesting Markdown, and testing retrieval.
 - `data/docs/`: replaceable source Markdown documents used for ingestion. The committed files are a database-focused sample corpus.
 - `docker/`, `Dockerfile`, `compose.yaml`: container entrypoint and Docker Compose deployment.
 - `configs/`, `benchmark/`: supporting configuration and evaluation assets when present.
-- Runtime state such as `qdrant_storage/`, `models/`, caches, logs, and `.env` must stay uncommitted.
+- Runtime state such as `postgres_data/`, `qdrant_storage/`, `models/`, caches, logs, and `.env` must stay uncommitted.
 
 ## Build, Test, and Development Commands
 
@@ -22,6 +22,7 @@ This repository is Knowledge Base Assistant, a general-purpose RAG and direct-ch
 - `python scripts/test_retrieve.py`: smoke-test vector retrieval.
 - `python scripts/test_chunking.py`: validate Markdown-aware chunk boundaries.
 - `python scripts/test_vector_store.py`: validate incremental document replacement.
+- `python scripts/test_session_store.py`: validate login/session helper behavior without a live PostgreSQL service.
 - `python scripts/test_intent_router.py`: smoke-test routing for RAG vs direct-chat questions.
 - `uvicorn app.main:app --host 0.0.0.0 --port 8080`: run the API manually.
 - `python -m compileall app scripts`: quick syntax check before pushing.
