@@ -14,8 +14,9 @@ This repository is Knowledge Base Assistant, a general-purpose RAG and direct-ch
 ## Build, Test, and Development Commands
 
 - `cp .env.example .env`: create local deployment settings.
-- `docker compose up --build`: build and start Qdrant, document ingest, and FastAPI using the configured LLM API.
+- `docker compose up --build`: build and start PostgreSQL, Qdrant, document ingest, and FastAPI using the configured LLM API.
 - `APP_PORT=9000 docker compose up --build`: run the frontend/API on a different host port.
+- `docker compose up -d --build --force-recreate`: recreate containers after changing `.env` values such as `AUTH_ENABLED`.
 - `docker compose down`: stop the stack.
 - `conda activate rag_llm && pip install -r requirements.txt`: set up manual local development.
 - `python scripts/ingest_docs.py --recreate`: rebuild the Qdrant collection from `data/docs/*.md`.
@@ -43,4 +44,4 @@ PRs should include a short summary, commands run, configuration changes, and any
 
 ## Security & Configuration Tips
 
-Do not commit `.env`, API keys, Hugging Face tokens, model weights, Qdrant storage, or cache directories. For restricted networks, configure runtime proxy values in `.env`; Docker daemon proxy settings only affect image pulls, not running containers.
+Do not commit `.env`, API keys, Hugging Face tokens, model weights, PostgreSQL data, Qdrant storage, or cache directories. PostgreSQL runs as the `postgres` Docker Compose service and persists in the `postgres_data` volume; no host PostgreSQL install is required. Account login is off by default with `AUTH_ENABLED=0`, so the frontend will not ask for credentials unless `.env` sets `AUTH_ENABLED=1` and the containers are recreated. For restricted networks, configure runtime proxy values in `.env`; Docker daemon proxy settings only affect image pulls, not running containers.
