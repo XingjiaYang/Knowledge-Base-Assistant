@@ -95,9 +95,21 @@ Create local settings:
 cp .env.example .env
 ```
 
-Set `LLM_API_KEY` and, if needed, `LLM_MODEL` in `.env`.
+Set `LLM_API_KEY` and, if needed, `LLM_MODEL` in `.env`. By default,
+account login is disabled (`AUTH_ENABLED=0`), so the browser opens directly to
+the chat UI.
 
-Start Qdrant and the API:
+To require sign-in and persist per-user chat sessions in PostgreSQL, set:
+
+```bash
+AUTH_ENABLED=1
+AUTH_DEFAULT_ADMIN_PASSWORD=change-this-password
+```
+
+The default administrator username is `admin`. PostgreSQL runs inside Docker
+Compose; you do not need to install PostgreSQL on the host.
+
+Start PostgreSQL, Qdrant, and the API:
 
 ```bash
 docker compose up --build
@@ -117,6 +129,13 @@ APP_PORT=9000 docker compose up --build
 
 Then open `http://localhost:9000`.
 
+After changing `.env` values such as `AUTH_ENABLED`, recreate the containers so
+the API sees the new environment:
+
+```bash
+docker compose up -d --build --force-recreate
+```
+
 Stop services:
 
 ```bash
@@ -133,8 +152,9 @@ docker compose down -v
 
 `compose.yaml` starts three services by default:
 
-- `postgres`: stores users, login tokens, and chat sessions in the
-  `postgres_data` Docker volume when account login is enabled.
+- `postgres`: runs PostgreSQL inside Docker and stores users, login tokens, and
+  chat sessions in the `postgres_data` Docker volume when account login is
+  enabled.
 - `qdrant`: stores vectors in the `qdrant_storage` Docker volume.
 - `api`: waits for Qdrant, waits for PostgreSQL when `AUTH_ENABLED=1`,
   optionally ingests Markdown under `data/docs/`, and starts FastAPI on
@@ -278,6 +298,15 @@ development. You can also add non-admin initial users through
 AUTH_ENABLED=1
 AUTH_BOOTSTRAP_USERS=analyst:change-me
 ```
+
+If the frontend does not show a sign-in form, confirm that the running Compose
+configuration has login enabled:
+
+```bash
+docker compose config | grep AUTH_ENABLED
+```
+
+Then recreate the containers after editing `.env`.
 
 Bootstrap users are inserted only when they do not already exist. Passwords are
 stored as PBKDF2-SHA256 hashes, login bearer tokens are stored as SHA-256
