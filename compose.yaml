@@ -1,4 +1,16 @@
 services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kba}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kba_password}
+      POSTGRES_DB: ${POSTGRES_DB:-kba}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+
   qdrant:
     image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.18.1}
     restart: unless-stopped
@@ -23,10 +35,10 @@ services:
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: ${DOCKER_NO_PROXY:-qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      NO_PROXY: ${DOCKER_NO_PROXY:-postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: ${DOCKER_NO_PROXY:-qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: ${DOCKER_NO_PROXY:-postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       VLLM_USE_FLASHINFER_SAMPLER: ${VLLM_USE_FLASHINFER_SAMPLER:-0}
     volumes:
       - huggingface_cache:/root/.cache/huggingface
@@ -55,6 +67,7 @@ services:
     restart: unless-stopped
     depends_on:
       - qdrant
+      - postgres
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -89,6 +102,18 @@ services:
       API_SUMMARY_MAX_CHARS: ${API_SUMMARY_MAX_CHARS:-12000}
       API_HISTORY_MAX_MESSAGES: ${API_HISTORY_MAX_MESSAGES:-120}
       API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
+      AUTH_ENABLED: ${AUTH_ENABLED:-0}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-kba}:${POSTGRES_PASSWORD:-kba_password}@postgres:5432/${POSTGRES_DB:-kba}
+      DATABASE_CONNECT_TIMEOUT_SECONDS: ${DATABASE_CONNECT_TIMEOUT_SECONDS:-5}
+      AUTH_DEFAULT_ADMIN_ENABLED: ${AUTH_DEFAULT_ADMIN_ENABLED:-1}
+      AUTH_DEFAULT_ADMIN_USERNAME: ${AUTH_DEFAULT_ADMIN_USERNAME:-admin}
+      AUTH_DEFAULT_ADMIN_PASSWORD: ${AUTH_DEFAULT_ADMIN_PASSWORD:-1234}
+      AUTH_BOOTSTRAP_USERS: ${AUTH_BOOTSTRAP_USERS:-}
+      AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-604800}
+      SESSION_LIST_LIMIT: ${SESSION_LIST_LIMIT:-50}
+      SESSION_TITLE_MAX_CHARS: ${SESSION_TITLE_MAX_CHARS:-80}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
       HISTORY_RECENT_TURNS: ${HISTORY_RECENT_TURNS:-16}
       HISTORY_COMPACT_AFTER_TURNS: ${HISTORY_COMPACT_AFTER_TURNS:-40}
       HISTORY_MAX_MESSAGES: ${HISTORY_MAX_MESSAGES:-120}
@@ -117,15 +142,16 @@ services:
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: ${DOCKER_NO_PROXY:-qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      NO_PROXY: ${DOCKER_NO_PROXY:-postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: ${DOCKER_NO_PROXY:-qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: ${DOCKER_NO_PROXY:-postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
     volumes:
       - ./data/docs:/app/data/docs:ro
       - huggingface_cache:/root/.cache/huggingface
       - ./models:/models:ro
 
 volumes:
+  postgres_data:
   qdrant_storage:
   huggingface_cache:

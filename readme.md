@@ -5,9 +5,10 @@ replaceable local Markdown knowledge base. It uses intent routing to choose
 between retrieval-augmented answers grounded in the indexed corpus and direct
 chat for requests that do not need retrieval.
 
-Qdrant provides vector search, SentenceTransformers generates embeddings, and
-FastAPI serves both the API and browser UI. Generation is provider-configurable:
-the default setup targets an OpenAI-compatible cloud API, Anthropic is supported,
+Qdrant provides vector search, PostgreSQL stores account-scoped chat sessions
+when login is enabled, SentenceTransformers generates embeddings, and FastAPI
+serves both the API and browser UI. Generation is provider-configurable: the
+default setup targets an OpenAI-compatible cloud API, Anthropic is supported,
 and a local vLLM service remains available as an optional Docker Compose profile.
 
 The repository ships with database-system notes as a sample corpus. The
@@ -16,10 +17,12 @@ files under `data/docs/` and rebuild the Qdrant collection to use another domain
 
 ## Highlights
 
-- Docker Compose deployment for Qdrant, document ingestion, and FastAPI.
+- Docker Compose deployment for PostgreSQL, Qdrant, document ingestion, and FastAPI.
 - Configurable cloud LLM providers with an optional local vLLM profile.
 - Replaceable Markdown corpus without domain-specific routing code.
 - Chat-style web UI at `/` with adjustable `top_k` retrieval.
+- Optional account login with PostgreSQL-backed chat sessions per user and an
+  admin UI for user/data management.
 - Intent routing avoids vector search for clear direct-chat questions.
 - Source references are shown when retrieval is used.
 - Conversation history is sent to the backend and older turns are compacted into
@@ -33,7 +36,8 @@ files under `data/docs/` and rebuild the Qdrant collection to use another domain
 ```text
 Browser UI
    |
-FastAPI /rag
+FastAPI /auth, /sessions, /rag
+   |-- PostgreSQL users, login tokens, chat sessions, messages, summaries
    |
 IntentRouter
    |-- keyword rules
@@ -51,6 +55,8 @@ Main modules:
 
 - `app/main.py`: FastAPI routes, health check, and static UI serving.
 - `app/static/index.html`: browser chat interface.
+- `app/session_store.py`: PostgreSQL-backed users, login tokens, chat sessions,
+  messages, and compacted conversation summaries.
 - `app/intent_router.py`: keyword, embedding, and LLM fallback routing.
 - `app/rag.py`: retrieval, prompt construction, and history compaction.
 - `app/vector_store.py`: Markdown chunking, embeddings, Qdrant collection
@@ -71,8 +77,8 @@ committed project should include:
 - Contributor/project docs such as `readme.md` and `AGENTS.md`.
 
 The repository should not include `.env`, model weights, Hugging Face caches,
-Qdrant storage, logs, virtual environments, or local editor files. These are
-covered by `.gitignore`.
+PostgreSQL data, Qdrant storage, logs, virtual environments, or local editor
+files. These are covered by `.gitignore`.
 
 ## Quick Start With Docker Compose
 
@@ -117,7 +123,7 @@ Stop services:
 docker compose down
 ```
 
-Reset persisted Qdrant data and Hugging Face cache volumes:
+Reset persisted PostgreSQL, Qdrant, and Hugging Face cache volumes:
 
 ```bash
 docker compose down -v
@@ -125,11 +131,14 @@ docker compose down -v
 
 ## Startup Behavior
 
-`compose.yaml` starts two services by default:
+`compose.yaml` starts three services by default:
 
+- `postgres`: stores users, login tokens, and chat sessions in the
+  `postgres_data` Docker volume when account login is enabled.
 - `qdrant`: stores vectors in the `qdrant_storage` Docker volume.
-- `api`: waits for Qdrant, optionally ingests Markdown under `data/docs/`, and starts
-  FastAPI on container port `8080`.
+- `api`: waits for Qdrant, waits for PostgreSQL when `AUTH_ENABLED=1`,
+  optionally ingests Markdown under `data/docs/`, and starts FastAPI on
+  container port `8080`.
 
 The `vllm` service is optional and only starts under the `local-llm` profile:
 
@@ -151,6 +160,7 @@ RECREATE_COLLECTION=0    # set to 1 to rebuild the collection during startup
 WAIT_FOR_LLM=0           # set to 1 when a local LLM service must be ready first
 APP_PORT=8080            # host port mapped to FastAPI/UI
 QDRANT_IMAGE=qdrant/qdrant:v1.18.1
+POSTGRES_IMAGE=postgres:17-alpine
 ```
 
 For fast restarts after the image has already been built:
@@ -187,6 +197,19 @@ API_QUESTION_MAX_CHARS=16000
 API_SUMMARY_MAX_CHARS=12000
 API_HISTORY_MAX_MESSAGES=120
 API_AUTH_TOKEN=
+
+AUTH_ENABLED=0
+POSTGRES_USER=kba
+POSTGRES_PASSWORD=kba_password
+POSTGRES_DB=kba
+DATABASE_CONNECT_TIMEOUT_SECONDS=5
+AUTH_DEFAULT_ADMIN_ENABLED=1
+AUTH_DEFAULT_ADMIN_USERNAME=admin
+AUTH_DEFAULT_ADMIN_PASSWORD=1234
+AUTH_BOOTSTRAP_USERS=
+AUTH_SESSION_TTL_SECONDS=604800
+SESSION_LIST_LIMIT=50
+SESSION_TITLE_MAX_CHARS=80
 
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 QDRANT_COLLECTION=tech_docs
@@ -233,10 +256,37 @@ return generic messages while details stay in server logs.
 Set `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector results
 before they enter the LLM prompt.
 
-Leave `API_AUTH_TOKEN` blank for local development. When set, `/health/details`
-and `/rag` require `Authorization: Bearer <token>`. The public `/health`
-endpoint only reports minimal liveness for probes. The browser UI prompts for
-the token on the first authenticated request and stores it in local storage.
+Leave `API_AUTH_TOKEN` blank for local development. When set and
+`AUTH_ENABLED=0`, `/health/details` and `/rag` require
+`Authorization: Bearer <token>`. The public `/health` endpoint only reports
+minimal liveness for probes. The browser UI prompts for the token on the first
+authenticated request and stores it in local storage.
+
+Set `AUTH_ENABLED=1` to use account login and PostgreSQL-backed sessions. By
+default, startup creates an administrator account if it does not already exist:
+
+```text
+username: admin
+password: 1234
+```
+
+Change `AUTH_DEFAULT_ADMIN_PASSWORD` before exposing the app beyond local
+development. You can also add non-admin initial users through
+`AUTH_BOOTSTRAP_USERS`, for example:
+
+```bash
+AUTH_ENABLED=1
+AUTH_BOOTSTRAP_USERS=analyst:change-me
+```
+
+Bootstrap users are inserted only when they do not already exist. Passwords are
+stored as PBKDF2-SHA256 hashes, login bearer tokens are stored as SHA-256
+hashes, and each user's chat sessions, messages, retrieved references, route
+metadata, and compacted summary are stored in PostgreSQL. When login is enabled,
+the browser UI shows a sign-in form and a saved session list; administrators see
+an Admin panel for creating users, deleting users, resetting passwords, toggling
+admin access, and clearing a user's chat data. `/rag` accepts a `session_id` and
+manages history server-side.
 
 ## Replace the Knowledge Base
 
@@ -268,7 +318,7 @@ For host-side Mihomo, enable Allow LAN / bind to `0.0.0.0`, then set:
 ```bash
 DOCKER_HTTP_PROXY=http://host.docker.internal:7890
 DOCKER_HTTPS_PROXY=http://host.docker.internal:7890
-DOCKER_NO_PROXY=qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+DOCKER_NO_PROXY=postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 ```
 
 Do not use `127.0.0.1` for the proxy host inside containers; it points to the
@@ -322,6 +372,33 @@ curl http://localhost:8080/rag \
     ],
     "conversation_summary": ""
   }'
+```
+
+With `AUTH_ENABLED=1`, log in first and use the returned bearer token:
+
+```bash
+TOKEN="$(
+  curl -s http://localhost:8080/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"username":"admin","password":"1234"}' \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
+)"
+
+SESSION_ID="$(
+  curl -s http://localhost:8080/sessions \
+    -H "Authorization: Bearer ${TOKEN}" \
+    -X POST \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'
+)"
+
+curl http://localhost:8080/rag \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -d "{
+    \"session_id\": \"${SESSION_ID}\",
+    \"question\": \"When should I choose DuckDB over ClickHouse?\",
+    \"top_k\": 4
+  }"
 ```
 
 Response fields:
