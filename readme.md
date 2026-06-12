@@ -1,15 +1,18 @@
 # Knowledge Base Assistant
 
+中文文档见 [readme.zh.md](readme.zh.md).
+
 Knowledge Base Assistant is a general-purpose chat application for exploring a
 replaceable local Markdown knowledge base. It uses intent routing to choose
 between retrieval-augmented answers grounded in the indexed corpus and direct
 chat for requests that do not need retrieval.
 
-Qdrant provides vector search, PostgreSQL stores account-scoped chat sessions
-when login is enabled, SentenceTransformers generates embeddings, and FastAPI
-serves both the API and browser UI. Generation is provider-configurable: the
-default setup targets an OpenAI-compatible cloud API, Anthropic is supported,
-and a local vLLM service remains available as an optional Docker Compose profile.
+Qdrant provides vector search, PostgreSQL stores required user accounts and
+account-scoped chat sessions, SentenceTransformers generates embeddings, and
+FastAPI serves both the API and browser UI. Generation is
+provider-configurable: the default setup targets an OpenAI-compatible cloud API,
+Anthropic is supported, and a local vLLM service remains available as an
+optional Docker Compose profile.
 
 The repository ships with database-system notes as a sample corpus. The
 application and intent router are not tied to that subject: replace the Markdown
@@ -21,11 +24,13 @@ files under `data/docs/` and rebuild the Qdrant collection to use another domain
 - Configurable cloud LLM providers with an optional local vLLM profile.
 - Replaceable Markdown corpus without domain-specific routing code.
 - Chat-style web UI at `/` with adjustable `top_k` retrieval.
-- Optional account login with PostgreSQL-backed chat sessions per user and an
+- Required account login with PostgreSQL-backed chat sessions per user and an
   admin UI for user/data management.
+- Admin CSV import for batch user creation with strict `email,passwd` format
+  validation.
 - Intent routing avoids vector search for clear direct-chat questions.
 - Source references are shown when retrieval is used.
-- Conversation history is sent to the backend and older turns are compacted into
+- Conversation history is stored server-side and older turns are compacted into
   a reusable summary.
 - Runtime configuration is environment-driven through `.env`.
 - Supports Hugging Face cache volumes, local model directories, mirrors, and
@@ -105,8 +110,9 @@ password: 123456
 ```
 
 Change `AUTH_DEFAULT_ADMIN_PASSWORD` before exposing the deployment beyond
-local development. PostgreSQL runs inside Docker Compose; you do not need to
-install PostgreSQL on the host.
+local development. If the PostgreSQL volume already contains an `admin` user,
+startup keeps that user's existing password. PostgreSQL runs inside Docker
+Compose; you do not need to install PostgreSQL on the host.
 
 Start PostgreSQL, Qdrant, and the API:
 
@@ -280,7 +286,8 @@ password: 123456
 ```
 
 Change `AUTH_DEFAULT_ADMIN_PASSWORD` before exposing the app beyond local
-development. You can also add non-admin initial users through
+development. Existing users are not overwritten on restart. You can also add
+non-admin initial users through
 `AUTH_BOOTSTRAP_USERS`, for example:
 
 ```bash
@@ -410,7 +417,15 @@ Response fields:
 
 ## Manual Development
 
-Set up Python dependencies:
+Set up Python dependencies with uv:
+
+```bash
+env UV_CACHE_DIR=.uv-cache uv venv --python 3.12 .venv
+source .venv/bin/activate
+uv pip install -r requirements.api.txt
+```
+
+Or use an existing Conda environment:
 
 ```bash
 conda activate rag_llm
