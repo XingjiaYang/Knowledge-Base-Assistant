@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import csv
+from io import StringIO
 import logging
 from pathlib import Path
 from typing import Annotated, Literal
@@ -15,8 +17,8 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.config import settings
 from app.llm_client import LLMClient
-from app.rag import ChatMessage, RAGPipeline
-from app.security import bearer_token, is_authorized_api_request
+from app.rag import RAGPipeline
+from app.security import bearer_token
 from app.session_store import (
     ChatSessionRecord,
     CurrentUser,
@@ -34,9 +36,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(_app: FastAPI):
     _app.state.vector_store = VectorStore(settings)
     _app.state.llm_client = LLMClient(settings)
-    _app.state.session_store = SessionStore(settings) if settings.auth_enabled else None
-    if _app.state.session_store is not None:
-        await asyncio.to_thread(_app.state.session_store.init_db)
+    _app.state.session_store = SessionStore(settings)
+    await asyncio.to_thread(_app.state.session_store.init_db)
     _app.state.rag_pipeline = RAGPipeline(
         settings,
         vector_store=_app.state.vector_store,
@@ -219,6 +220,15 @@ class AdminRoleUpdateRequest(BaseModel):
     is_admin: bool
 
 
+class AdminUsersCsvImportRequest(BaseModel):
+    csv_text: str = Field(..., min_length=1, max_length=1_000_000)
+
+
+class AdminUsersCsvImportResponse(BaseModel):
+    created: int
+    users: list[AdminUserResponse]
+
+
 class SessionSummaryResponse(BaseModel):
     id: str
     title: str
@@ -284,32 +294,14 @@ class SessionDetailResponse(SessionSummaryResponse):
         )
 
 
-def require_api_or_user_auth(
-    request: Request,
-    authorization: Annotated[str | None, Header()] = None,
-) -> CurrentUser | None:
-    if settings.auth_enabled:
-        token = bearer_token(authorization)
-        if token is None:
-            raise_unauthorized()
-        user = _session_store(request).get_user_by_token(token)
-        if user is None:
-            raise_unauthorized()
-        return user
-
-    if is_authorized_api_request(settings, authorization):
-        return None
-    raise_unauthorized()
-
-
 def require_login_auth(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
 ) -> CurrentUser:
-    if not settings.auth_enabled:
-        raise HTTPException(status_code=404, detail="Account login is disabled.")
-
-    user = require_api_or_user_auth(request, authorization)
+    token = bearer_token(authorization)
+    if token is None:
+        raise_unauthorized()
+    user = _session_store(request).get_user_by_token(token)
     if user is None:
         raise_unauthorized()
     return user
@@ -343,14 +335,11 @@ async def health() -> dict[str, object]:
 
 @app.get("/auth/config", response_model=AuthConfigResponse)
 def auth_config() -> AuthConfigResponse:
-    return AuthConfigResponse(auth_enabled=settings.auth_enabled)
+    return AuthConfigResponse(auth_enabled=True)
 
 
 @app.post("/auth/login", response_model=LoginResponse)
 async def login(request: Request, login_request: LoginRequest) -> LoginResponse:
-    if not settings.auth_enabled:
-        raise HTTPException(status_code=404, detail="Account login is disabled.")
-
     session_store = _session_store(request)
     try:
         user = await asyncio.to_thread(
@@ -421,6 +410,30 @@ async def admin_create_user(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return AdminUserResponse.from_user_record(user)
+
+
+@app.post("/admin/users/import-csv", response_model=AdminUsersCsvImportResponse)
+async def admin_import_users_csv(
+    request: Request,
+    import_request: AdminUsersCsvImportRequest,
+    _admin: Annotated[CurrentUser, Depends(require_admin_auth)],
+) -> AdminUsersCsvImportResponse:
+    try:
+        users = parse_user_csv(import_request.csv_text)
+        created_users = await asyncio.to_thread(
+            _session_store(request).create_users,
+            users,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return AdminUsersCsvImportResponse(
+        created=len(created_users),
+        users=[
+            AdminUserResponse.from_user_record(user)
+            for user in created_users
+        ],
+    )
 
 
 @app.post("/admin/users/{user_id}/password")
@@ -553,7 +566,7 @@ async def delete_session(
     return {"status": "ok"}
 
 
-@app.get("/health/details", dependencies=[Depends(require_api_or_user_auth)])
+@app.get("/health/details", dependencies=[Depends(require_login_auth)])
 async def health_details(request: Request) -> dict[str, object]:
     qdrant_ok, llm_ok = await asyncio.gather(
         asyncio.to_thread(_qdrant_health, request.app.state.vector_store),
@@ -573,7 +586,7 @@ async def health_details(request: Request) -> dict[str, object]:
         "history_recent_turns": settings.history_recent_turns,
         "api_top_k_max": settings.api_top_k_max,
         "intent_router": settings.intent_router_enabled,
-        "auth_enabled": settings.auth_enabled,
+        "auth_enabled": True,
     }
 
 
@@ -584,30 +597,20 @@ async def health_details(request: Request) -> dict[str, object]:
 async def rag(
     http_request: Request,
     rag_request: RAGRequest,
-    user: Annotated[CurrentUser | None, Depends(require_api_or_user_auth)],
+    user: Annotated[CurrentUser, Depends(require_login_auth)],
 ) -> RAGResponse:
-    session: ChatSessionRecord | None = None
-    if settings.auth_enabled:
-        if user is None:
-            raise_unauthorized()
-        session_store = _session_store(http_request)
-        session = await _get_or_create_chat_session(
-            session_store,
-            user,
-            rag_request.session_id,
-        )
-        history = await asyncio.to_thread(
-            session_store.prompt_history,
-            session.id,
-            session.compacted_message_count,
-        )
-        conversation_summary = session.conversation_summary
-    else:
-        history = [
-            ChatMessage(role=item.role, content=item.content)
-            for item in rag_request.history
-        ]
-        conversation_summary = rag_request.conversation_summary
+    session_store = _session_store(http_request)
+    session = await _get_or_create_chat_session(
+        session_store,
+        user,
+        rag_request.session_id,
+    )
+    history = await asyncio.to_thread(
+        session_store.prompt_history,
+        session.id,
+        session.compacted_message_count,
+    )
+    conversation_summary = session.conversation_summary
 
     try:
         result = await asyncio.to_thread(
@@ -636,35 +639,33 @@ async def rag(
             detail=_error_detail("Internal server error.", exc),
         ) from exc
 
-    if settings.auth_enabled and session is not None:
-        session_store = _session_store(http_request)
-        await asyncio.to_thread(
-            session_store.append_message,
-            session.id,
-            "user",
-            rag_request.question,
-        )
-        await asyncio.to_thread(
-            session_store.append_message,
-            session.id,
-            "assistant",
-            result.answer,
-            result.contexts,
-            result.used_rag,
-            result.route,
-            result.route_reason,
-        )
-        session = await asyncio.to_thread(
-            session_store.update_chat_session_after_answer,
-            session.id,
-            result.conversation_summary,
-            result.compacted_history_messages,
-            rag_request.question,
-        )
+    await asyncio.to_thread(
+        session_store.append_message,
+        session.id,
+        "user",
+        rag_request.question,
+    )
+    await asyncio.to_thread(
+        session_store.append_message,
+        session.id,
+        "assistant",
+        result.answer,
+        result.contexts,
+        result.used_rag,
+        result.route,
+        result.route_reason,
+    )
+    session = await asyncio.to_thread(
+        session_store.update_chat_session_after_answer,
+        session.id,
+        result.conversation_summary,
+        result.compacted_history_messages,
+        rag_request.question,
+    )
 
     return RAGResponse(
         answer=result.answer,
-        session_id=str(session.id) if session else None,
+        session_id=str(session.id),
         contexts=[
             ContextResponse.from_search_result(item) for item in result.contexts
         ],
@@ -706,8 +707,40 @@ async def _get_or_create_chat_session(
 def _session_store(request: Request) -> SessionStore:
     session_store = getattr(request.app.state, "session_store", None)
     if session_store is None:
-        raise HTTPException(status_code=404, detail="Account login is disabled.")
+        raise HTTPException(status_code=503, detail="Account storage is unavailable.")
     return session_store
+
+
+def parse_user_csv(csv_text: str) -> list[tuple[str, str]]:
+    reader = csv.reader(StringIO(csv_text), skipinitialspace=True)
+    try:
+        header = next(reader)
+    except StopIteration as exc:
+        raise ValueError("CSV must include a header row: email,passwd.") from exc
+
+    if header:
+        header[0] = header[0].lstrip("\ufeff")
+    if header != ["email", "passwd"]:
+        raise ValueError("CSV header must be exactly: email,passwd.")
+
+    users: list[tuple[str, str]] = []
+    for line_number, row in enumerate(reader, start=2):
+        if len(row) != 2:
+            raise ValueError(
+                f"CSV row {line_number} must contain exactly two columns."
+            )
+
+        email = row[0].strip()
+        password = row[1].strip()
+        if not email or not password:
+            raise ValueError(
+                f"CSV row {line_number} must include both email and passwd."
+            )
+        users.append((email, password))
+
+    if not users:
+        raise ValueError("CSV must include at least one user row.")
+    return users
 
 
 def _error_detail(message: str, exc: Exception) -> str:
