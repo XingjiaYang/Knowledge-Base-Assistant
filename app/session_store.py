@@ -367,6 +367,54 @@ class SessionStore:
                 raise ValueError("User already exists.")
         return user_record_from_row(row)
 
+    def create_users(
+        self,
+        users: list[tuple[str, str]],
+        is_admin: bool = False,
+    ) -> list[UserRecord]:
+        normalized_users: list[tuple[str, str]] = []
+        seen_usernames: set[str] = set()
+        for username, password in users:
+            normalized = normalize_username(username)
+            if not password:
+                raise ValueError("Password must not be empty.")
+            if normalized in seen_usernames:
+                raise ValueError(f"Duplicate user in CSV: {normalized}.")
+            seen_usernames.add(normalized)
+            normalized_users.append((normalized, password))
+
+        created: list[UserRecord] = []
+        with self._connect() as conn:
+            for username, password in normalized_users:
+                row = conn.execute(
+                    """
+                    INSERT INTO app_users (
+                        id,
+                        username,
+                        password_hash,
+                        is_active,
+                        is_admin
+                    )
+                    VALUES (%s, %s, %s, TRUE, %s)
+                    ON CONFLICT (username) DO NOTHING
+                    RETURNING id,
+                              username,
+                              is_active,
+                              is_admin,
+                              created_at,
+                              updated_at,
+                              last_login_at,
+                              0 AS session_count,
+                              0 AS message_count
+                    """,
+                    (uuid4(), username, hash_password(password), is_admin),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"User already exists: {username}.")
+                created.append(user_record_from_row(row))
+
+        return created
+
     def set_user_password(self, user_id: UUID, password: str) -> bool:
         if not password:
             raise ValueError("Password must not be empty.")

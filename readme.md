@@ -95,19 +95,18 @@ Create local settings:
 cp .env.example .env
 ```
 
-Set `LLM_API_KEY` and, if needed, `LLM_MODEL` in `.env`. By default,
-account login is disabled (`AUTH_ENABLED=0`), so the browser opens directly to
-the chat UI.
+Set `LLM_API_KEY` and, if needed, `LLM_MODEL` in `.env`. Account login is
+always required and chat sessions are persisted per user in PostgreSQL. The
+default administrator is created on startup:
 
-To require sign-in and persist per-user chat sessions in PostgreSQL, set:
-
-```bash
-AUTH_ENABLED=1
-AUTH_DEFAULT_ADMIN_PASSWORD=change-this-password
+```text
+username: admin
+password: 123456
 ```
 
-The default administrator username is `admin`. PostgreSQL runs inside Docker
-Compose; you do not need to install PostgreSQL on the host.
+Change `AUTH_DEFAULT_ADMIN_PASSWORD` before exposing the deployment beyond
+local development. PostgreSQL runs inside Docker Compose; you do not need to
+install PostgreSQL on the host.
 
 Start PostgreSQL, Qdrant, and the API:
 
@@ -129,8 +128,8 @@ APP_PORT=9000 docker compose up --build
 
 Then open `http://localhost:9000`.
 
-After changing `.env` values such as `AUTH_ENABLED`, recreate the containers so
-the API sees the new environment:
+After changing `.env` values, recreate the containers so the API sees the new
+environment:
 
 ```bash
 docker compose up -d --build --force-recreate
@@ -153,12 +152,10 @@ docker compose down -v
 `compose.yaml` starts three services by default:
 
 - `postgres`: runs PostgreSQL inside Docker and stores users, login tokens, and
-  chat sessions in the `postgres_data` Docker volume when account login is
-  enabled.
+  chat sessions in the `postgres_data` Docker volume.
 - `qdrant`: stores vectors in the `qdrant_storage` Docker volume.
-- `api`: waits for Qdrant, waits for PostgreSQL when `AUTH_ENABLED=1`,
-  optionally ingests Markdown under `data/docs/`, and starts FastAPI on
-  container port `8080`.
+- `api`: waits for Qdrant and PostgreSQL, optionally ingests Markdown under
+  `data/docs/`, and starts FastAPI on container port `8080`.
 
 The `vllm` service is optional and only starts under the `local-llm` profile:
 
@@ -216,16 +213,14 @@ API_MESSAGE_MAX_CHARS=16000
 API_QUESTION_MAX_CHARS=16000
 API_SUMMARY_MAX_CHARS=12000
 API_HISTORY_MAX_MESSAGES=120
-API_AUTH_TOKEN=
 
-AUTH_ENABLED=0
 POSTGRES_USER=kba
 POSTGRES_PASSWORD=kba_password
 POSTGRES_DB=kba
 DATABASE_CONNECT_TIMEOUT_SECONDS=5
 AUTH_DEFAULT_ADMIN_ENABLED=1
 AUTH_DEFAULT_ADMIN_USERNAME=admin
-AUTH_DEFAULT_ADMIN_PASSWORD=1234
+AUTH_DEFAULT_ADMIN_PASSWORD=123456
 AUTH_BOOTSTRAP_USERS=
 AUTH_SESSION_TTL_SECONDS=604800
 SESSION_LIST_LIMIT=50
@@ -276,18 +271,12 @@ return generic messages while details stay in server logs.
 Set `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector results
 before they enter the LLM prompt.
 
-Leave `API_AUTH_TOKEN` blank for local development. When set and
-`AUTH_ENABLED=0`, `/health/details` and `/rag` require
-`Authorization: Bearer <token>`. The public `/health` endpoint only reports
-minimal liveness for probes. The browser UI prompts for the token on the first
-authenticated request and stores it in local storage.
-
-Set `AUTH_ENABLED=1` to use account login and PostgreSQL-backed sessions. By
-default, startup creates an administrator account if it does not already exist:
+Account login and PostgreSQL-backed sessions are always enabled. By default,
+startup creates an administrator account if it does not already exist:
 
 ```text
 username: admin
-password: 1234
+password: 123456
 ```
 
 Change `AUTH_DEFAULT_ADMIN_PASSWORD` before exposing the app beyond local
@@ -295,27 +284,19 @@ development. You can also add non-admin initial users through
 `AUTH_BOOTSTRAP_USERS`, for example:
 
 ```bash
-AUTH_ENABLED=1
 AUTH_BOOTSTRAP_USERS=analyst:change-me
 ```
-
-If the frontend does not show a sign-in form, confirm that the running Compose
-configuration has login enabled:
-
-```bash
-docker compose config | grep AUTH_ENABLED
-```
-
-Then recreate the containers after editing `.env`.
 
 Bootstrap users are inserted only when they do not already exist. Passwords are
 stored as PBKDF2-SHA256 hashes, login bearer tokens are stored as SHA-256
 hashes, and each user's chat sessions, messages, retrieved references, route
-metadata, and compacted summary are stored in PostgreSQL. When login is enabled,
-the browser UI shows a sign-in form and a saved session list; administrators see
-an Admin panel for creating users, deleting users, resetting passwords, toggling
-admin access, and clearing a user's chat data. `/rag` accepts a `session_id` and
-manages history server-side.
+metadata, and compacted summary are stored in PostgreSQL. The browser opens to
+the sign-in form and only shows the RAG workspace after a valid login.
+Administrators see an Admin panel for creating users, importing users from CSV,
+deleting users, resetting passwords, toggling admin access, and clearing a
+user's chat data. CSV imports must contain exactly two columns named `email` and
+`passwd`; rows with missing values, wrong headers, or extra columns are
+rejected. `/rag` accepts a `session_id` and manages history server-side.
 
 ## Replace the Knowledge Base
 
@@ -379,40 +360,27 @@ Health check:
 curl http://localhost:8080/health
 ```
 
-With `API_AUTH_TOKEN` set:
-
-```bash
-curl http://localhost:8080/health/details \
-  -H "Authorization: Bearer ${API_AUTH_TOKEN}"
-```
-
-RAG request:
-
-```bash
-curl http://localhost:8080/rag \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer ${API_AUTH_TOKEN}" \
-  -d '{
-    "question": "When should I choose DuckDB over ClickHouse?",
-    "top_k": 4,
-    "history": [
-      {"role": "user", "content": "Compare embedded OLAP options."},
-      {"role": "assistant", "content": "DuckDB is embedded; ClickHouse is server-oriented."}
-    ],
-    "conversation_summary": ""
-  }'
-```
-
-With `AUTH_ENABLED=1`, log in first and use the returned bearer token:
+Log in first and use the returned bearer token:
 
 ```bash
 TOKEN="$(
   curl -s http://localhost:8080/auth/login \
     -H "Content-Type: application/json" \
-    -d '{"username":"admin","password":"1234"}' \
+    -d '{"username":"admin","password":"123456"}' \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'
 )"
+```
 
+Authenticated health details:
+
+```bash
+curl http://localhost:8080/health/details \
+  -H "Authorization: Bearer ${TOKEN}"
+```
+
+RAG request:
+
+```bash
 SESSION_ID="$(
   curl -s http://localhost:8080/sessions \
     -H "Authorization: Bearer ${TOKEN}" \

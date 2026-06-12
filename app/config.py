@@ -66,9 +66,7 @@ class Settings:
     api_question_max_chars: int = _env_int("API_QUESTION_MAX_CHARS", 16000)
     api_summary_max_chars: int = _env_int("API_SUMMARY_MAX_CHARS", 12000)
     api_history_max_messages: int = _env_int("API_HISTORY_MAX_MESSAGES", 120)
-    api_auth_token: str = os.getenv("API_AUTH_TOKEN", "")
-
-    auth_enabled: bool = _env_bool("AUTH_ENABLED", False)
+    auth_enabled: bool = True
     database_url: str = os.getenv(
         "DATABASE_URL",
         "postgresql://kba:kba_password@localhost:5432/kba",
@@ -85,7 +83,7 @@ class Settings:
     )
     auth_default_admin_password: str = os.getenv(
         "AUTH_DEFAULT_ADMIN_PASSWORD",
-        "1234",
+        "123456",
     )
     auth_session_ttl_seconds: int = _env_int("AUTH_SESSION_TTL_SECONDS", 604800)
     session_list_limit: int = _env_int("SESSION_LIST_LIMIT", 50)
@@ -138,6 +136,8 @@ class Settings:
     intent_embedding_margin: float = _env_float("INTENT_EMBEDDING_MARGIN", 0.06)
 
     def __post_init__(self) -> None:
+        if not self.auth_enabled:
+            object.__setattr__(self, "auth_enabled", True)
         if self.chunk_size <= 0:
             raise ValueError("CHUNK_SIZE must be greater than 0.")
         if self.chunk_overlap < 0:
@@ -185,7 +185,7 @@ class Settings:
             raise ValueError(
                 "DATABASE_CONNECT_TIMEOUT_SECONDS must be greater than 0."
             )
-        if self.auth_enabled and self.auth_default_admin_enabled:
+        if self.auth_default_admin_enabled:
             if not self.auth_default_admin_username.strip():
                 raise ValueError("AUTH_DEFAULT_ADMIN_USERNAME must not be empty.")
             if not self.auth_default_admin_password:

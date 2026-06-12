@@ -51,6 +51,29 @@
       cursor: pointer;
     }
 
+    [hidden] {
+      display: none !important;
+    }
+
+    .login-gate {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: var(--bg);
+    }
+
+    .login-card {
+      width: min(100%, 360px);
+      display: grid;
+      gap: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      padding: 18px;
+      box-shadow: var(--shadow);
+    }
+
     .app-shell {
       display: grid;
       grid-template-columns: 280px minmax(0, 1fr) 360px;
@@ -282,6 +305,27 @@
       display: grid;
       gap: 8px;
       margin-top: 10px;
+    }
+
+    .admin-csv {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+
+    .admin-help {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .admin-success {
+      min-height: 18px;
+      color: var(--accent);
+      font-size: 12px;
+      line-height: 1.4;
     }
 
     .checkbox-line {
@@ -703,7 +747,22 @@
   </style>
 </head>
 <body>
-  <main class="app-shell">
+  <main id="loginGate" class="login-gate">
+    <form id="loginForm" class="login-card">
+      <div class="field">
+        <label for="loginUsername">Account</label>
+        <input id="loginUsername" autocomplete="username" autofocus>
+      </div>
+      <div class="field">
+        <label for="loginPassword">Password</label>
+        <input id="loginPassword" type="password" autocomplete="current-password">
+      </div>
+      <button id="loginButton" class="login-button" type="submit">Sign In</button>
+      <div id="loginError" class="login-error"></div>
+    </form>
+  </main>
+
+  <main id="appShell" class="app-shell" hidden>
     <aside class="sidebar">
       <div class="brand">
         <h1>Knowledge Base Assistant</h1>
@@ -716,18 +775,6 @@
       </div>
 
       <div id="authPanel" class="auth-panel" hidden>
-        <form id="loginForm">
-          <div class="field">
-            <label for="loginUsername">Username</label>
-            <input id="loginUsername" autocomplete="username">
-          </div>
-          <div class="field">
-            <label for="loginPassword">Password</label>
-            <input id="loginPassword" type="password" autocomplete="current-password">
-          </div>
-          <button id="loginButton" class="login-button" type="submit">Sign In</button>
-          <div id="loginError" class="login-error"></div>
-        </form>
         <div id="userPanel" class="user-panel" hidden>
           <div id="userName" class="user-name"></div>
           <button id="logoutButton" class="secondary-button" type="button">Sign Out</button>
@@ -756,6 +803,17 @@
           </label>
           <button class="login-button" type="submit">Add User</button>
           <div id="adminError" class="admin-error"></div>
+        </form>
+        <form id="adminCsvForm" class="admin-csv">
+          <div class="meta-label">Upload CSV</div>
+          <div class="admin-help">
+            CSV format must be exactly two columns named email and passwd.
+            Example first row: email,passwd. Extra columns, missing values, and
+            wrong headers are rejected.
+          </div>
+          <input id="adminCsvFile" type="file" accept=".csv,text/csv">
+          <button id="adminCsvButton" class="secondary-button" type="submit">Upload CSV</button>
+          <div id="adminCsvStatus" class="admin-success"></div>
         </form>
         <div id="adminUserList" class="admin-list"></div>
       </div>
@@ -809,6 +867,8 @@
   </main>
 
   <script>
+    const loginGateEl = document.getElementById("loginGate");
+    const appShellEl = document.getElementById("appShell");
     const statusEl = document.getElementById("status");
     const statusTextEl = document.getElementById("statusText");
     const modelNameEl = document.getElementById("modelName");
@@ -842,6 +902,9 @@
     const adminNewPasswordEl = document.getElementById("adminNewPassword");
     const adminNewIsAdminEl = document.getElementById("adminNewIsAdmin");
     const adminErrorEl = document.getElementById("adminError");
+    const adminCsvFormEl = document.getElementById("adminCsvForm");
+    const adminCsvFileEl = document.getElementById("adminCsvFile");
+    const adminCsvStatusEl = document.getElementById("adminCsvStatus");
     const adminUserListEl = document.getElementById("adminUserList");
 
     const state = {
@@ -849,14 +912,12 @@
       conversationSummary: "",
       summarizedMessageCount: 0,
       busy: false,
-      authEnabled: false,
       authToken: "",
       currentUser: null,
       sessions: [],
       activeSessionId: "",
       adminUsers: []
     };
-    const apiTokenStorageKey = "knowledgeBaseAssistantApiToken";
     const authTokenStorageKey = "knowledgeBaseAssistantAuthToken";
 
     function setStatus(text, className) {
@@ -865,9 +926,7 @@
     }
 
     function authHeaders(headers = {}) {
-      const token = state.authEnabled
-        ? state.authToken || localStorage.getItem(authTokenStorageKey)
-        : localStorage.getItem(apiTokenStorageKey);
+      const token = state.authToken || localStorage.getItem(authTokenStorageKey);
       if (!token) return headers;
       return {...headers, Authorization: `Bearer ${token}`};
     }
@@ -880,19 +939,7 @@
 
       let response = await request();
       if (response.status !== 401) return response;
-      if (state.authEnabled) {
-        signOutLocal("Session expired. Sign in again.");
-        return response;
-      }
-
-      const token = window.prompt("API token required");
-      if (!token) return response;
-
-      localStorage.setItem(apiTokenStorageKey, token.trim());
-      response = await request();
-      if (response.status === 401) {
-        localStorage.removeItem(apiTokenStorageKey);
-      }
+      signOutLocal("Session expired. Sign in again.");
       return response;
     }
 
@@ -904,7 +951,7 @@
           return;
         }
 
-        if (state.authEnabled && !state.currentUser) {
+        if (!state.currentUser) {
           setStatus("Login required", "bad");
           return;
         }
@@ -934,19 +981,21 @@
     }
 
     function updateAuthPanels() {
-      authPanelEl.hidden = !state.authEnabled;
-      sessionsPanelEl.hidden = !state.authEnabled || !state.currentUser;
-      adminPanelEl.hidden =
-        !state.authEnabled || !state.currentUser || !state.currentUser.is_admin;
-      loginFormEl.hidden = !state.authEnabled || Boolean(state.currentUser);
-      userPanelEl.hidden = !state.authEnabled || !state.currentUser;
-      composerEl.hidden = state.authEnabled && !state.currentUser;
-      clearButton.disabled = state.authEnabled && !state.currentUser;
+      const signedIn = Boolean(state.currentUser);
+      loginGateEl.hidden = signedIn;
+      appShellEl.hidden = !signedIn;
+      authPanelEl.hidden = !signedIn;
+      sessionsPanelEl.hidden = !signedIn;
+      adminPanelEl.hidden = !signedIn || !state.currentUser.is_admin;
+      userPanelEl.hidden = !signedIn;
+      composerEl.hidden = !signedIn;
+      clearButton.disabled = !signedIn;
 
       if (state.currentUser) {
         userNameEl.textContent = state.currentUser.username;
       } else {
         userNameEl.textContent = "";
+        loginUsernameEl.focus();
       }
     }
 
@@ -968,24 +1017,7 @@
       renderMessages();
       renderReferences([]);
       updateAuthPanels();
-      if (state.authEnabled) setStatus("Login required", "bad");
-    }
-
-    async function loadAuthConfig() {
-      try {
-        const response = await fetch("/auth/config");
-        const data = response.ok ? await response.json() : {};
-        state.authEnabled = Boolean(data.auth_enabled);
-      } catch {
-        state.authEnabled = false;
-      }
-
-      updateAuthPanels();
-      if (state.authEnabled) {
-        await restoreAuthSession();
-      } else {
-        await checkHealth();
-      }
+      setStatus("Login required", "bad");
     }
 
     async function restoreAuthSession() {
@@ -1049,7 +1081,7 @@
     }
 
     async function loadSessions(selectFirst = false) {
-      if (!state.authEnabled || !state.currentUser) return;
+      if (!state.currentUser) return;
 
       const response = await fetchWithAuth("/sessions");
       if (!response.ok) {
@@ -1180,6 +1212,27 @@
       adminNewUsernameEl.value = "";
       adminNewPasswordEl.value = "";
       adminNewIsAdminEl.checked = false;
+      await loadAdminUsers();
+    }
+
+    async function importAdminUsersCsv(file) {
+      if (!file) {
+        throw new Error("Choose a CSV file first.");
+      }
+
+      const csvText = await file.text();
+      const response = await fetchWithAuth("/admin/users/import-csv", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({csv_text: csvText})
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.detail || "CSV import failed.");
+      }
+
+      adminCsvFileEl.value = "";
+      adminCsvStatusEl.textContent = `Created ${data.created || 0} users.`;
       await loadAdminUsers();
     }
 
@@ -1577,20 +1630,10 @@
     }
 
     async function ask(question) {
-      if (state.authEnabled && !state.activeSessionId) {
+      if (!state.activeSessionId) {
         await createNewSession();
         if (!state.activeSessionId) return;
       }
-
-      const historyForRequest = state.authEnabled
-        ? []
-        : state.messages
-          .slice(state.summarizedMessageCount)
-          .filter((message) => !message.loading && !message.error)
-          .map((message) => ({
-            role: message.role,
-            content: message.content
-          }));
 
       const userMessage = {role: "user", content: question};
       const assistantMessage = {
@@ -1614,10 +1657,8 @@
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({
             question,
-            session_id: state.authEnabled ? state.activeSessionId : null,
-            top_k: topKEl.value ? Number(topKEl.value) : null,
-            history: historyForRequest,
-            conversation_summary: state.conversationSummary
+            session_id: state.activeSessionId,
+            top_k: topKEl.value ? Number(topKEl.value) : null
           })
         });
 
@@ -1642,9 +1683,7 @@
         latestRouteEl.textContent =
           `${assistantMessage.usedRag ? "RAG" : "Direct"} · ${assistantMessage.route || "unknown"}`;
         renderReferences(assistantMessage.contexts, assistantMessage.usedRag);
-        if (state.authEnabled) {
-          await loadSessions(false);
-        }
+        await loadSessions(false);
       } catch (error) {
         assistantMessage.content = error.message;
         assistantMessage.loading = false;
@@ -1709,29 +1748,29 @@
       }
     });
 
-    clearButton.addEventListener("click", async () => {
-      if (state.authEnabled) {
-        if (state.activeSessionId) {
-          await fetchWithAuth(`/sessions/${state.activeSessionId}`, {
-            method: "DELETE"
-          });
-        }
-        await createNewSession();
-        return;
-      }
+    adminCsvFormEl.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      adminErrorEl.textContent = "";
+      adminCsvStatusEl.textContent = "";
 
-      state.messages = [];
-      state.conversationSummary = "";
-      state.summarizedMessageCount = 0;
-      compactChipEl.hidden = true;
-      latestRouteEl.textContent = "None";
-      renderMessages();
-      renderReferences([]);
-      promptEl.focus();
+      try {
+        await importAdminUsersCsv(adminCsvFileEl.files[0]);
+      } catch (error) {
+        adminErrorEl.textContent = error.message;
+      }
+    });
+
+    clearButton.addEventListener("click", async () => {
+      if (state.activeSessionId) {
+        await fetchWithAuth(`/sessions/${state.activeSessionId}`, {
+          method: "DELETE"
+        });
+      }
+      await createNewSession();
     });
 
     renderMessages();
-    loadAuthConfig();
+    restoreAuthSession();
   </script>
 </body>
 </html>
