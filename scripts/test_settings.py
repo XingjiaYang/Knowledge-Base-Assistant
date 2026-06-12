@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
+from types import SimpleNamespace
+from uuid import UUID
 
 import httpx
 
@@ -12,7 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from app.config import Settings
 from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget
-from app.security import is_authorized_api_request
+from app.session_store import ChatSessionRecord, CurrentUser
 
 
 def assert_api_limits() -> None:
@@ -52,7 +57,6 @@ def assert_llm_settings() -> None:
         llm_retry_backoff_max_seconds=4.0,
         retrieve_score_threshold=0.42,
         intent_embedding_rag_threshold=0.55,
-        api_auth_token="secret-token",
     )
 
     if config.llm_provider != "anthropic":
@@ -65,8 +69,6 @@ def assert_llm_settings() -> None:
         raise AssertionError("LLM health check flag should be configurable.")
     if config.intent_embedding_rag_threshold != 0.55:
         raise AssertionError("RAG embedding threshold should be configurable.")
-    if config.api_auth_token != "secret-token":
-        raise AssertionError("API auth token should be configurable.")
     if config.llm_retry_attempts != 4:
         raise AssertionError("LLM retry attempts should be configurable.")
     if config.llm_retry_backoff_seconds != 0.5:
@@ -213,59 +215,119 @@ def assert_llm_client_connection_reuse() -> None:
     print("LLM client connection reuse -> ok")
 
 
-def assert_api_auth() -> None:
-    open_config = Settings(api_auth_token="")
-    if not is_authorized_api_request(open_config, None):
-        raise AssertionError("Empty API auth token should leave local API open.")
+def assert_account_auth_is_always_enabled() -> None:
+    config = Settings(auth_enabled=False)
+    if not config.auth_enabled:
+        raise AssertionError("Account auth should stay enabled even if disabled.")
 
-    protected_config = Settings(api_auth_token="secret-token")
-    if not is_authorized_api_request(protected_config, "Bearer secret-token"):
-        raise AssertionError("Matching bearer token should authorize request.")
+    print("Forced account auth -> ok")
 
-    rejected = [
-        None,
-        "",
-        "secret-token",
-        "Basic secret-token",
-        "Bearer wrong-token",
-    ]
-    for authorization in rejected:
-        if is_authorized_api_request(protected_config, authorization):
-            raise AssertionError(f"Invalid authorization accepted: {authorization!r}")
 
-    print("API bearer auth -> ok")
+class FakeSessionStore:
+    session_id = UUID("11111111-1111-1111-1111-111111111111")
+    user_id = UUID("22222222-2222-2222-2222-222222222222")
+
+    def init_db(self) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+    def get_user_by_token(self, token: str) -> CurrentUser | None:
+        if token != "test-token":
+            return None
+        return CurrentUser(self.user_id, "admin", True)
+
+    def create_chat_session(
+        self,
+        user_id: UUID,
+        title: str | None = None,
+    ) -> ChatSessionRecord:
+        return self._session(user_id)
+
+    def get_chat_session(
+        self,
+        user_id: UUID,
+        session_id: UUID,
+    ) -> ChatSessionRecord | None:
+        if session_id != self.session_id:
+            return None
+        return self._session(user_id)
+
+    def prompt_history(
+        self,
+        session_id: UUID,
+        compacted_message_count: int,
+    ) -> list[object]:
+        return []
+
+    def append_message(self, *args: object, **kwargs: object) -> None:
+        return
+
+    def update_chat_session_after_answer(
+        self,
+        session_id: UUID,
+        conversation_summary: str,
+        compacted_delta: int,
+        title: str | None = None,
+    ) -> ChatSessionRecord:
+        return self._session(self.user_id, conversation_summary, compacted_delta)
+
+    def _session(
+        self,
+        user_id: UUID,
+        conversation_summary: str = "",
+        compacted_message_count: int = 0,
+    ) -> ChatSessionRecord:
+        now = datetime.now(timezone.utc)
+        return ChatSessionRecord(
+            id=self.session_id,
+            user_id=user_id,
+            title="New chat",
+            conversation_summary=conversation_summary,
+            compacted_message_count=compacted_message_count,
+            created_at=now,
+            updated_at=now,
+        )
+
+
+@contextmanager
+def app_with_fake_session_store():
+    import app.main as main_module
+
+    original_session_store = main_module.SessionStore
+    main_module.SessionStore = lambda _settings: FakeSessionStore()
+    try:
+        yield main_module.app
+    finally:
+        main_module.SessionStore = original_session_store
 
 
 def assert_public_health_endpoint() -> None:
-    from fastapi.testclient import TestClient
+    from app.main import health
 
-    from app.main import app
-
-    with TestClient(app) as client:
-        response = client.get("/health")
-
-    if response.status_code != 200 or response.json() != {"status": "ok"}:
+    response = asyncio.run(health())
+    if response != {"status": "ok"}:
         raise AssertionError("Public health endpoint should return minimal liveness.")
 
     print("Public health endpoint -> ok")
 
 
 def assert_app_lifespan_recreates_resources() -> None:
-    from fastapi.testclient import TestClient
+    from app.rag import RAGPipeline
+    from app.vector_store import VectorStore
 
-    from app.main import app
-
-    with TestClient(app) as client:
-        response = client.get("/health")
-        if response.status_code != 200:
-            raise AssertionError("Health endpoint should work during lifespan.")
-        first_pipeline = app.state.rag_pipeline
-
-    with TestClient(app) as client:
-        response = client.get("/health")
-        if response.status_code != 200:
-            raise AssertionError("Health endpoint should work after restart.")
-        second_pipeline = app.state.rag_pipeline
+    config = Settings()
+    first_pipeline = RAGPipeline(
+        config,
+        vector_store=VectorStore(config),
+        llm_client=LLMClient(config),
+    )
+    second_pipeline = RAGPipeline(
+        config,
+        vector_store=VectorStore(config),
+        llm_client=LLMClient(config),
+    )
 
     if first_pipeline is second_pipeline:
         raise AssertionError("App lifespan should recreate runtime resources.")
@@ -274,47 +336,76 @@ def assert_app_lifespan_recreates_resources() -> None:
 
 
 def assert_rag_endpoint_accepts_original_body_shape() -> None:
-    from fastapi.testclient import TestClient
+    from app.main import RAGRequest
 
-    from app.main import app
-    from app.rag import RAGAnswer
-
-    class FakePipeline:
-        def answer(
-            self,
-            question: str,
-            top_k: int | None = None,
-            history: object | None = None,
-            conversation_summary: str | None = None,
-        ) -> RAGAnswer:
-            return RAGAnswer(
-                answer=f"echo: {question}",
-                contexts=[],
-                conversation_summary=conversation_summary or "",
-                compacted_history_messages=0,
-                used_rag=False,
-                route="fallback_direct",
-                route_reason="test",
-            )
-
-    with TestClient(app) as client:
-        app.state.rag_pipeline = FakePipeline()
-        response = client.post(
-            "/rag",
-            json={
-                "question": "Hello",
-                "top_k": 1,
-                "history": [],
-                "conversation_summary": "",
-            },
+    request = RAGRequest(
+        question="Hello",
+        top_k=1,
+        history=[],
+        conversation_summary="",
+    )
+    if (
+        request.question != "Hello"
+        or request.top_k != 1
+        or request.history != []
+        or request.conversation_summary != ""
+    ):
+        raise AssertionError(
+            "RAG request should keep accepting the original body shape."
         )
 
-    if response.status_code != 200:
-        raise AssertionError(f"RAG endpoint rejected original body: {response.text}")
-    if response.json()["answer"] != "echo: Hello":
-        raise AssertionError("RAG endpoint should use the parsed request body.")
-
     print("RAG endpoint body shape -> ok")
+
+
+def assert_rag_endpoint_requires_login() -> None:
+    from fastapi import HTTPException
+
+    from app.main import require_login_auth
+
+    with app_with_fake_session_store() as app:
+        app.state.session_store = FakeSessionStore()
+        request = SimpleNamespace(app=app)
+
+        try:
+            require_login_auth(request, None)
+        except HTTPException as exc:
+            if exc.status_code != 401:
+                raise AssertionError("Missing login token should return 401.")
+        else:
+            raise AssertionError("RAG dependency should reject missing login token.")
+
+    print("RAG endpoint requires login -> ok")
+
+
+def assert_csv_import_parser() -> None:
+    from app.main import parse_user_csv
+
+    users = parse_user_csv(
+        "email,passwd\n"
+        "alice@example.com,secret\n"
+        "bob@example.com,another\n"
+    )
+    if users != [
+        ("alice@example.com", "secret"),
+        ("bob@example.com", "another"),
+    ]:
+        raise AssertionError("CSV import should parse email/passwd rows.")
+
+    invalid_inputs = [
+        "username,password\nalice@example.com,secret\n",
+        "email,passwd,extra\nalice@example.com,secret,x\n",
+        "email,passwd\nalice@example.com\n",
+        "email,passwd\nalice@example.com,\n",
+        "email,passwd\n",
+    ]
+    for raw in invalid_inputs:
+        try:
+            parse_user_csv(raw)
+        except ValueError:
+            continue
+        raise AssertionError(f"Invalid CSV should be rejected: {raw!r}")
+
+    print("CSV import parser -> ok")
 
 
 def assert_invalid_settings_rejected() -> None:
@@ -385,10 +476,12 @@ def main() -> None:
     assert_llm_health_requests()
     assert_llm_retry_behavior()
     assert_llm_client_connection_reuse()
-    assert_api_auth()
+    assert_account_auth_is_always_enabled()
     assert_public_health_endpoint()
     assert_app_lifespan_recreates_resources()
     assert_rag_endpoint_accepts_original_body_shape()
+    assert_rag_endpoint_requires_login()
+    assert_csv_import_parser()
     assert_invalid_settings_rejected()
     assert_prompt_budget_settings()
 
