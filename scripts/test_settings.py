@@ -377,6 +377,34 @@ def assert_rag_endpoint_requires_login() -> None:
     print("RAG endpoint requires login -> ok")
 
 
+def assert_password_change_gate_blocks_app_features() -> None:
+    from fastapi import HTTPException
+
+    from app.main import UserResponse, require_password_ready_user
+
+    locked_user = CurrentUser(
+        FakeSessionStore.user_id,
+        "new.user",
+        False,
+        True,
+    )
+    try:
+        require_password_ready_user(locked_user)
+    except HTTPException as exc:
+        if exc.status_code != 403:
+            raise AssertionError("Password-change gate should return 403.")
+    else:
+        raise AssertionError("Password-change gate should block locked users.")
+
+    ready_user = CurrentUser(FakeSessionStore.user_id, "ready.user", False, False)
+    if require_password_ready_user(ready_user) is not ready_user:
+        raise AssertionError("Password-ready users should pass through.")
+    if not UserResponse.from_user(locked_user).must_change_password:
+        raise AssertionError("User response should expose password-change status.")
+
+    print("Password-change gate -> ok")
+
+
 def assert_csv_import_parser() -> None:
     from app.main import parse_user_csv
 
@@ -481,6 +509,7 @@ def main() -> None:
     assert_app_lifespan_recreates_resources()
     assert_rag_endpoint_accepts_original_body_shape()
     assert_rag_endpoint_requires_login()
+    assert_password_change_gate_blocks_app_features()
     assert_csv_import_parser()
     assert_invalid_settings_rejected()
     assert_prompt_budget_settings()
