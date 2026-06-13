@@ -74,6 +74,25 @@
       box-shadow: var(--shadow);
     }
 
+    .gate-title {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+    }
+
+    .gate-help {
+      margin: 7px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .password-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
     .app-shell {
       display: grid;
       grid-template-columns: 280px minmax(0, 1fr) 360px;
@@ -216,8 +235,7 @@
     }
 
     .auth-panel,
-    .sessions-panel,
-    .admin-panel {
+    .sessions-panel {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--surface);
@@ -269,6 +287,21 @@
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+
+    .user-panel {
+      display: grid;
+      align-items: start;
+      gap: 10px;
+    }
+
+    .user-actions {
+      display: grid;
+      gap: 8px;
+    }
+
+    .user-actions .secondary-button {
+      width: 100%;
     }
 
     .session-list {
@@ -392,6 +425,62 @@
     .danger-button {
       border-color: #f3b4ad;
       color: var(--danger);
+    }
+
+    .admin-dashboard {
+      min-height: 100vh;
+      background: var(--bg);
+    }
+
+    .dashboard-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+      padding: 20px 28px;
+    }
+
+    .dashboard-header h1 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+    }
+
+    .dashboard-header p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .dashboard-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .dashboard-content {
+      display: grid;
+      grid-template-columns: minmax(260px, 360px) minmax(260px, 360px) minmax(0, 1fr);
+      gap: 16px;
+      padding: 20px 28px 28px;
+    }
+
+    .dashboard-section {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      padding: 14px;
+    }
+
+    .admin-users-section {
+      min-width: 0;
+    }
+
+    .admin-users-section .admin-list {
+      max-height: calc(100vh - 170px);
     }
 
     .chat-column {
@@ -703,6 +792,14 @@
         grid-template-columns: 240px minmax(0, 1fr);
       }
 
+      .dashboard-content {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .admin-users-section {
+        grid-column: 1 / -1;
+      }
+
       .refs-panel {
         display: none;
       }
@@ -711,6 +808,21 @@
     @media (max-width: 760px) {
       .app-shell {
         grid-template-columns: 1fr;
+      }
+
+      .dashboard-header {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 16px;
+      }
+
+      .dashboard-content {
+        grid-template-columns: 1fr;
+        padding: 16px;
+      }
+
+      .admin-users-section {
+        grid-column: auto;
       }
 
       .sidebar {
@@ -762,6 +874,37 @@
     </form>
   </main>
 
+  <main id="passwordGate" class="login-gate" hidden>
+    <form id="passwordChangeForm" class="login-card">
+      <div>
+        <h1 id="passwordChangeTitle" class="gate-title">Change Password</h1>
+        <p id="passwordChangeHelp" class="gate-help">
+          Update your password before continuing.
+        </p>
+      </div>
+      <div class="field">
+        <label for="passwordCurrent">Current Password</label>
+        <input id="passwordCurrent" type="password" autocomplete="current-password">
+      </div>
+      <div class="field">
+        <label for="passwordNew">New Password</label>
+        <input id="passwordNew" type="password" autocomplete="new-password">
+      </div>
+      <button id="passwordChangeButton" class="login-button" type="submit">
+        Update Password
+      </button>
+      <div class="password-actions">
+        <button id="passwordCancelButton" class="secondary-button" type="button">
+          Cancel
+        </button>
+        <button id="passwordLogoutButton" class="secondary-button" type="button">
+          Sign Out
+        </button>
+      </div>
+      <div id="passwordChangeError" class="login-error"></div>
+    </form>
+  </main>
+
   <main id="appShell" class="app-shell" hidden>
     <aside class="sidebar">
       <div class="brand">
@@ -776,8 +919,19 @@
 
       <div id="authPanel" class="auth-panel" hidden>
         <div id="userPanel" class="user-panel" hidden>
-          <div id="userName" class="user-name"></div>
-          <button id="logoutButton" class="secondary-button" type="button">Sign Out</button>
+          <div>
+            <div id="userName" class="user-name"></div>
+            <div id="userRole" class="admin-user-meta"></div>
+          </div>
+          <div class="user-actions">
+            <button id="changePasswordButton" class="secondary-button" type="button">
+              Change Password
+            </button>
+            <button id="adminDashboardButton" class="secondary-button" type="button" hidden>
+              Admin Dashboard
+            </button>
+            <button id="logoutButton" class="secondary-button" type="button">Sign Out</button>
+          </div>
         </div>
       </div>
 
@@ -787,35 +941,6 @@
           <button id="newSessionButton" class="secondary-button" type="button">New</button>
         </div>
         <div id="sessionList" class="session-list"></div>
-      </div>
-
-      <div id="adminPanel" class="admin-panel" hidden>
-        <div class="admin-toolbar">
-          <div class="meta-label">Admin</div>
-          <button id="adminRefreshButton" class="secondary-button" type="button">Refresh</button>
-        </div>
-        <form id="adminCreateForm" class="admin-create">
-          <input id="adminNewUsername" placeholder="Username" autocomplete="off">
-          <input id="adminNewPassword" type="password" placeholder="Password" autocomplete="new-password">
-          <label class="checkbox-line">
-            <input id="adminNewIsAdmin" type="checkbox">
-            Admin
-          </label>
-          <button class="login-button" type="submit">Add User</button>
-          <div id="adminError" class="admin-error"></div>
-        </form>
-        <form id="adminCsvForm" class="admin-csv">
-          <div class="meta-label">Upload CSV</div>
-          <div class="admin-help">
-            CSV format must be exactly two columns named email and passwd.
-            Example first row: email,passwd. Extra columns, missing values, and
-            wrong headers are rejected.
-          </div>
-          <input id="adminCsvFile" type="file" accept=".csv,text/csv">
-          <button id="adminCsvButton" class="secondary-button" type="submit">Upload CSV</button>
-          <div id="adminCsvStatus" class="admin-success"></div>
-        </form>
-        <div id="adminUserList" class="admin-list"></div>
       </div>
 
       <div class="field">
@@ -866,9 +991,73 @@
     </aside>
   </main>
 
+  <main id="adminDashboard" class="admin-dashboard" hidden>
+    <header class="dashboard-header">
+      <div>
+        <h1>Admin Dashboard</h1>
+        <p>Account management</p>
+      </div>
+      <div class="dashboard-actions">
+        <button id="adminChangePasswordButton" class="secondary-button" type="button">
+          Change Password
+        </button>
+        <button id="backToChatButton" class="secondary-button" type="button">
+          Back to Chat
+        </button>
+        <button id="adminLogoutButton" class="secondary-button" type="button">
+          Sign Out
+        </button>
+      </div>
+    </header>
+
+    <section class="dashboard-content">
+      <section class="dashboard-section">
+        <div class="meta-label">Add User</div>
+        <form id="adminCreateForm" class="admin-create">
+          <input id="adminNewUsername" placeholder="Username" autocomplete="off">
+          <input id="adminNewPassword" type="password" placeholder="Password" autocomplete="new-password">
+          <label class="checkbox-line">
+            <input id="adminNewIsAdmin" type="checkbox">
+            Admin
+          </label>
+          <button class="login-button" type="submit">Add User</button>
+        </form>
+      </section>
+
+      <section class="dashboard-section">
+        <div class="meta-label">Upload CSV</div>
+        <form id="adminCsvForm" class="admin-csv">
+          <div class="admin-help">
+            CSV format must be exactly two columns named email and passwd.
+            Example first row: email,passwd. Extra columns, missing values, and
+            wrong headers are rejected.
+          </div>
+          <input id="adminCsvFile" type="file" accept=".csv,text/csv">
+          <button id="adminCsvButton" class="secondary-button" type="submit">Upload CSV</button>
+          <div id="adminCsvStatus" class="admin-success"></div>
+        </form>
+      </section>
+
+      <section class="dashboard-section admin-users-section">
+        <div class="admin-toolbar">
+          <div>
+            <div class="meta-label">Users</div>
+            <div id="adminError" class="admin-error"></div>
+          </div>
+          <button id="adminRefreshButton" class="secondary-button" type="button">
+            Refresh
+          </button>
+        </div>
+        <div id="adminUserList" class="admin-list"></div>
+      </section>
+    </section>
+  </main>
+
   <script>
     const loginGateEl = document.getElementById("loginGate");
+    const passwordGateEl = document.getElementById("passwordGate");
     const appShellEl = document.getElementById("appShell");
+    const adminDashboardEl = document.getElementById("adminDashboard");
     const statusEl = document.getElementById("status");
     const statusTextEl = document.getElementById("statusText");
     const modelNameEl = document.getElementById("modelName");
@@ -889,13 +1078,27 @@
     const loginPasswordEl = document.getElementById("loginPassword");
     const loginButtonEl = document.getElementById("loginButton");
     const loginErrorEl = document.getElementById("loginError");
+    const passwordChangeFormEl = document.getElementById("passwordChangeForm");
+    const passwordChangeTitleEl = document.getElementById("passwordChangeTitle");
+    const passwordChangeHelpEl = document.getElementById("passwordChangeHelp");
+    const passwordCurrentEl = document.getElementById("passwordCurrent");
+    const passwordNewEl = document.getElementById("passwordNew");
+    const passwordChangeButtonEl = document.getElementById("passwordChangeButton");
+    const passwordCancelButtonEl = document.getElementById("passwordCancelButton");
+    const passwordLogoutButtonEl = document.getElementById("passwordLogoutButton");
+    const passwordChangeErrorEl = document.getElementById("passwordChangeError");
     const userPanelEl = document.getElementById("userPanel");
     const userNameEl = document.getElementById("userName");
+    const userRoleEl = document.getElementById("userRole");
+    const changePasswordButtonEl = document.getElementById("changePasswordButton");
+    const adminDashboardButtonEl = document.getElementById("adminDashboardButton");
     const logoutButtonEl = document.getElementById("logoutButton");
     const sessionsPanelEl = document.getElementById("sessionsPanel");
     const sessionListEl = document.getElementById("sessionList");
     const newSessionButtonEl = document.getElementById("newSessionButton");
-    const adminPanelEl = document.getElementById("adminPanel");
+    const adminChangePasswordButtonEl = document.getElementById("adminChangePasswordButton");
+    const backToChatButtonEl = document.getElementById("backToChatButton");
+    const adminLogoutButtonEl = document.getElementById("adminLogoutButton");
     const adminRefreshButtonEl = document.getElementById("adminRefreshButton");
     const adminCreateFormEl = document.getElementById("adminCreateForm");
     const adminNewUsernameEl = document.getElementById("adminNewUsername");
@@ -916,7 +1119,9 @@
       currentUser: null,
       sessions: [],
       activeSessionId: "",
-      adminUsers: []
+      adminUsers: [],
+      currentView: "chat",
+      passwordChangeOpen: false
     };
     const authTokenStorageKey = "knowledgeBaseAssistantAuthToken";
 
@@ -938,6 +1143,19 @@
       });
 
       let response = await request();
+      if (response.status === 403) {
+        const data = await response.clone().json().catch(() => ({}));
+        if (data.detail === "Password change required.") {
+          state.currentUser = {
+            ...state.currentUser,
+            must_change_password: true
+          };
+          state.passwordChangeOpen = false;
+          updateAuthPanels();
+          setStatus("Password change required", "bad");
+        }
+        return response;
+      }
       if (response.status !== 401) return response;
       signOutLocal("Session expired. Sign in again.");
       return response;
@@ -961,6 +1179,9 @@
           setStatus("Auth required", "bad");
           return;
         }
+        if (response.status === 403) {
+          return;
+        }
         const data = await response.json();
         const ready = Boolean(data.qdrant && data.llm);
         setStatus(ready ? "Ready" : "Degraded", ready ? "ok" : "bad");
@@ -982,19 +1203,42 @@
 
     function updateAuthPanels() {
       const signedIn = Boolean(state.currentUser);
+      const mustChangePassword = Boolean(state.currentUser?.must_change_password);
+      const showPasswordGate = signedIn && (
+        mustChangePassword || state.passwordChangeOpen
+      );
+      const showAdmin = signedIn
+        && !showPasswordGate
+        && state.currentUser.is_admin
+        && state.currentView === "admin";
+
       loginGateEl.hidden = signedIn;
-      appShellEl.hidden = !signedIn;
+      passwordGateEl.hidden = !showPasswordGate;
+      appShellEl.hidden = !signedIn || showPasswordGate || showAdmin;
+      adminDashboardEl.hidden = !showAdmin;
       authPanelEl.hidden = !signedIn;
       sessionsPanelEl.hidden = !signedIn;
-      adminPanelEl.hidden = !signedIn || !state.currentUser.is_admin;
       userPanelEl.hidden = !signedIn;
       composerEl.hidden = !signedIn;
       clearButton.disabled = !signedIn;
+      adminDashboardButtonEl.hidden = !signedIn || !state.currentUser.is_admin;
+      passwordCancelButtonEl.hidden = mustChangePassword;
+      passwordChangeTitleEl.textContent = mustChangePassword
+        ? "Change Password Required"
+        : "Change Password";
+      passwordChangeHelpEl.textContent = mustChangePassword
+        ? "This account is using an initial or reset password. Update it before using the system."
+        : "Update your account password.";
 
       if (state.currentUser) {
         userNameEl.textContent = state.currentUser.username;
+        userRoleEl.textContent = state.currentUser.is_admin ? "Administrator" : "User";
+        if (showPasswordGate) {
+          passwordCurrentEl.focus();
+        }
       } else {
         userNameEl.textContent = "";
+        userRoleEl.textContent = "";
         loginUsernameEl.focus();
       }
     }
@@ -1008,8 +1252,13 @@
       state.messages = [];
       state.conversationSummary = "";
       state.summarizedMessageCount = 0;
+      state.currentView = "chat";
+      state.passwordChangeOpen = false;
       localStorage.removeItem(authTokenStorageKey);
       loginErrorEl.textContent = message;
+      passwordChangeErrorEl.textContent = "";
+      passwordCurrentEl.value = "";
+      passwordNewEl.value = "";
       latestRouteEl.textContent = "None";
       compactChipEl.hidden = true;
       renderSessions();
@@ -1034,11 +1283,13 @@
       }
 
       state.currentUser = await response.json();
+      state.currentView = "chat";
       updateAuthPanels();
-      await loadSessions(true);
-      if (state.currentUser.is_admin) {
-        await loadAdminUsers();
+      if (state.currentUser.must_change_password) {
+        setStatus("Password change required", "bad");
+        return;
       }
+      await loadSessions(true);
       await checkHealth();
     }
 
@@ -1058,13 +1309,16 @@
 
         state.authToken = data.token;
         state.currentUser = data.user;
+        state.currentView = "chat";
+        state.passwordChangeOpen = false;
         localStorage.setItem(authTokenStorageKey, data.token);
         loginPasswordEl.value = "";
         updateAuthPanels();
-        await loadSessions(true);
-        if (state.currentUser.is_admin) {
-          await loadAdminUsers();
+        if (state.currentUser.must_change_password) {
+          setStatus("Password change required", "bad");
+          return;
         }
+        await loadSessions(true);
         await checkHealth();
       } catch (error) {
         loginErrorEl.textContent = error.message;
@@ -1080,11 +1334,78 @@
       signOutLocal("");
     }
 
+    async function showAdminDashboard() {
+      if (!state.currentUser?.is_admin) return;
+      state.currentView = "admin";
+      updateAuthPanels();
+      await loadAdminUsers();
+    }
+
+    function showChat() {
+      state.currentView = "chat";
+      updateAuthPanels();
+      promptEl.focus();
+    }
+
+    function openPasswordChange() {
+      state.passwordChangeOpen = true;
+      passwordChangeErrorEl.textContent = "";
+      passwordCurrentEl.value = "";
+      passwordNewEl.value = "";
+      updateAuthPanels();
+    }
+
+    function closePasswordChange() {
+      if (state.currentUser?.must_change_password) return;
+      state.passwordChangeOpen = false;
+      passwordChangeErrorEl.textContent = "";
+      passwordCurrentEl.value = "";
+      passwordNewEl.value = "";
+      updateAuthPanels();
+    }
+
+    async function changePassword(currentPassword, newPassword) {
+      passwordChangeButtonEl.disabled = true;
+      passwordChangeErrorEl.textContent = "";
+
+      try {
+        const response = await fetchWithAuth("/auth/password", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            current_password: currentPassword,
+            new_password: newPassword
+          })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.detail || "Unable to change password.");
+        }
+
+        state.currentUser = data;
+        state.passwordChangeOpen = false;
+        passwordCurrentEl.value = "";
+        passwordNewEl.value = "";
+        updateAuthPanels();
+        if (state.currentView === "admin") {
+          await loadAdminUsers();
+        } else {
+          await loadSessions(true);
+        }
+        await checkHealth();
+      } catch (error) {
+        passwordChangeErrorEl.textContent = error.message;
+      } finally {
+        passwordChangeButtonEl.disabled = false;
+      }
+    }
+
     async function loadSessions(selectFirst = false) {
       if (!state.currentUser) return;
 
       const response = await fetchWithAuth("/sessions");
       if (!response.ok) {
+        if (response.status === 403) return;
         signOutLocal("Unable to load sessions.");
         return;
       }
@@ -1108,6 +1429,7 @@
     async function createNewSession() {
       const response = await fetchWithAuth("/sessions", {method: "POST"});
       if (!response.ok) {
+        if (response.status === 403) return;
         signOutLocal("Unable to create a session.");
         return;
       }
@@ -1125,6 +1447,7 @@
 
       const response = await fetchWithAuth(`/sessions/${sessionId}`);
       if (!response.ok) {
+        if (response.status === 403) return;
         await loadSessions(true);
         return;
       }
@@ -1263,6 +1586,8 @@
         throw new Error(data.detail || "Unable to reset password.");
       }
       adminErrorEl.textContent = "";
+      adminCsvStatusEl.textContent = "Password reset. User must change it at next login.";
+      await loadAdminUsers();
     }
 
     async function clearAdminUserData(userId, username) {
@@ -1317,8 +1642,14 @@
         name.textContent = user.username;
         const meta = document.createElement("div");
         meta.className = "admin-user-meta";
-        meta.textContent =
-          `${user.session_count || 0} sessions · ${user.message_count || 0} messages`;
+        const metaItems = [
+          `${user.session_count || 0} sessions`,
+          `${user.message_count || 0} messages`
+        ];
+        if (user.must_change_password) {
+          metaItems.push("password change required");
+        }
+        meta.textContent = metaItems.join(" · ");
         identity.appendChild(name);
         identity.appendChild(meta);
 
@@ -1721,6 +2052,46 @@
 
     logoutButtonEl.addEventListener("click", () => {
       logout();
+    });
+
+    adminLogoutButtonEl.addEventListener("click", () => {
+      logout();
+    });
+
+    passwordLogoutButtonEl.addEventListener("click", () => {
+      logout();
+    });
+
+    changePasswordButtonEl.addEventListener("click", () => {
+      openPasswordChange();
+    });
+
+    passwordCancelButtonEl.addEventListener("click", () => {
+      closePasswordChange();
+    });
+
+    passwordChangeFormEl.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const currentPassword = passwordCurrentEl.value;
+      const newPassword = passwordNewEl.value;
+      if (!currentPassword || !newPassword) {
+        passwordChangeErrorEl.textContent =
+          "Current password and new password are required.";
+        return;
+      }
+      changePassword(currentPassword, newPassword);
+    });
+
+    adminDashboardButtonEl.addEventListener("click", () => {
+      showAdminDashboard();
+    });
+
+    adminChangePasswordButtonEl.addEventListener("click", () => {
+      openPasswordChange();
+    });
+
+    backToChatButtonEl.addEventListener("click", () => {
+      showChat();
     });
 
     newSessionButtonEl.addEventListener("click", () => {

@@ -154,6 +154,7 @@ class UserResponse(BaseModel):
     id: str
     username: str
     is_admin: bool
+    must_change_password: bool
 
     @classmethod
     def from_user(cls, user: CurrentUser) -> "UserResponse":
@@ -161,6 +162,7 @@ class UserResponse(BaseModel):
             id=str(user.id),
             username=user.username,
             is_admin=user.is_admin,
+            must_change_password=user.must_change_password,
         )
 
 
@@ -173,6 +175,11 @@ class LoginRequest(BaseModel):
     password: str = Field(..., min_length=1, max_length=256)
 
 
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=256)
+    new_password: str = Field(..., min_length=1, max_length=256)
+
+
 class LoginResponse(BaseModel):
     token: str
     user: UserResponse
@@ -183,6 +190,7 @@ class AdminUserResponse(BaseModel):
     username: str
     is_active: bool
     is_admin: bool
+    must_change_password: bool
     created_at: str
     updated_at: str
     last_login_at: str | None
@@ -196,6 +204,7 @@ class AdminUserResponse(BaseModel):
             username=user.username,
             is_active=user.is_active,
             is_admin=user.is_admin,
+            must_change_password=user.must_change_password,
             created_at=user.created_at.isoformat(),
             updated_at=user.updated_at.isoformat(),
             last_login_at=user.last_login_at.isoformat()
@@ -307,8 +316,16 @@ def require_login_auth(
     return user
 
 
-def require_admin_auth(
+def require_password_ready_user(
     user: Annotated[CurrentUser, Depends(require_login_auth)],
+) -> CurrentUser:
+    if user.must_change_password:
+        raise HTTPException(status_code=403, detail="Password change required.")
+    return user
+
+
+def require_admin_auth(
+    user: Annotated[CurrentUser, Depends(require_password_ready_user)],
 ) -> CurrentUser:
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required.")
@@ -383,6 +400,33 @@ async def logout(
     if token:
         await asyncio.to_thread(_session_store(request).delete_auth_session, token)
     return {"status": "ok"}
+
+
+@app.post("/auth/password", response_model=UserResponse)
+async def change_password(
+    request: Request,
+    password_request: PasswordChangeRequest,
+    user: Annotated[CurrentUser, Depends(require_login_auth)],
+) -> UserResponse:
+    try:
+        updated = await asyncio.to_thread(
+            _session_store(request).change_user_password,
+            user.id,
+            password_request.current_password,
+            password_request.new_password,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return UserResponse.from_user(
+        CurrentUser(
+            id=user.id,
+            username=user.username,
+            is_admin=user.is_admin,
+            must_change_password=False,
+        )
+    )
 
 
 @app.get("/admin/users", response_model=list[AdminUserResponse])
@@ -510,7 +554,7 @@ async def admin_delete_user(
 @app.get("/sessions", response_model=list[SessionSummaryResponse])
 async def list_sessions(
     request: Request,
-    user: Annotated[CurrentUser, Depends(require_login_auth)],
+    user: Annotated[CurrentUser, Depends(require_password_ready_user)],
 ) -> list[SessionSummaryResponse]:
     sessions = await asyncio.to_thread(
         _session_store(request).list_chat_sessions,
@@ -522,7 +566,7 @@ async def list_sessions(
 @app.post("/sessions", response_model=SessionDetailResponse)
 async def create_session(
     request: Request,
-    user: Annotated[CurrentUser, Depends(require_login_auth)],
+    user: Annotated[CurrentUser, Depends(require_password_ready_user)],
 ) -> SessionDetailResponse:
     session = await asyncio.to_thread(
         _session_store(request).create_chat_session,
@@ -535,7 +579,7 @@ async def create_session(
 async def get_session(
     session_id: UUID,
     request: Request,
-    user: Annotated[CurrentUser, Depends(require_login_auth)],
+    user: Annotated[CurrentUser, Depends(require_password_ready_user)],
 ) -> SessionDetailResponse:
     session_store = _session_store(request)
     session = await asyncio.to_thread(
@@ -554,7 +598,7 @@ async def get_session(
 async def delete_session(
     session_id: UUID,
     request: Request,
-    user: Annotated[CurrentUser, Depends(require_login_auth)],
+    user: Annotated[CurrentUser, Depends(require_password_ready_user)],
 ) -> dict[str, object]:
     deleted = await asyncio.to_thread(
         _session_store(request).delete_chat_session,
@@ -566,7 +610,7 @@ async def delete_session(
     return {"status": "ok"}
 
 
-@app.get("/health/details", dependencies=[Depends(require_login_auth)])
+@app.get("/health/details", dependencies=[Depends(require_password_ready_user)])
 async def health_details(request: Request) -> dict[str, object]:
     qdrant_ok, llm_ok = await asyncio.gather(
         asyncio.to_thread(_qdrant_health, request.app.state.vector_store),
@@ -597,7 +641,7 @@ async def health_details(request: Request) -> dict[str, object]:
 async def rag(
     http_request: Request,
     rag_request: RAGRequest,
-    user: Annotated[CurrentUser, Depends(require_login_auth)],
+    user: Annotated[CurrentUser, Depends(require_password_ready_user)],
 ) -> RAGResponse:
     session_store = _session_store(http_request)
     session = await _get_or_create_chat_session(
