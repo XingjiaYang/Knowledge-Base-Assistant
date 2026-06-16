@@ -14,15 +14,20 @@ provider-configurable: the default setup targets an OpenAI-compatible cloud API,
 Anthropic is supported, and a local vLLM service remains available as an
 optional Docker Compose profile.
 
-The repository ships with database-system notes as a sample corpus. The
-application and intent router are not tied to that subject: replace the Markdown
-files under `data/docs/` and rebuild the Qdrant collection to use another domain.
+The repository currently ships with a synthetic restaurant/business case corpus
+about 家是本, 朱剑秋, the Yongge livestream incident, menu pricing, customer
+reviews, social-media reactions, and financial simulation. The corpus is
+intentionally niche so retrieval grounding matters more than pretrained model
+memory. The intent router keeps its embedding layer domain-general, while the
+keyword layer and LLM fallback prompt include lightweight corpus-specific
+boundaries that should be updated when `data/docs/` is replaced.
 
 ## Highlights
 
 - Docker Compose deployment for PostgreSQL, Qdrant, document ingestion, and FastAPI.
 - Configurable cloud LLM providers with an optional local vLLM profile.
-- Replaceable Markdown corpus without domain-specific routing code.
+- Replaceable Markdown corpus with isolated keyword hints for the bundled
+  domain.
 - Chat-style web UI at `/` with adjustable recall and reranked context counts.
 - Required account login with PostgreSQL-backed chat sessions per user and an
   admin UI for user/data management.
@@ -330,15 +335,20 @@ rejected. `/rag` accepts a `session_id` and manages history server-side.
 
 The Markdown files under `data/docs/` provide the runtime domain content.
 Ingestion scans that tree recursively, so nested topic folders are supported.
-The committed files cover database systems as an example, but the retrieval
-pipeline and intent router use general knowledge-base question patterns rather
-than database keywords.
+The committed files cover a generated restaurant/business case corpus about
+家是本 and 朱剑秋. Because these topics are unlikely to be memorized well by
+general models, they are a better fit for RAG evaluation than common SQL or
+database-system facts.
 
 To use another subject:
 
 1. Replace or edit the Markdown files under `data/docs/`.
 2. Rebuild the Qdrant collection with `python scripts/ingest_docs.py --recreate`.
-3. Ask questions about the new corpus through the same UI or `/rag` API.
+3. Update the corpus keyword hints in `app/intent_router.py`
+   (`DOMAIN_RAG_PHRASES` and `DOMAIN_RAG_PATTERNS`) and the LLM fallback
+   corpus description if first-pass and fallback intent routing should
+   recognize the new topic.
+4. Ask questions about the new corpus through the same UI or `/rag` API.
 
 ## Restricted Network Setup
 
@@ -535,10 +545,15 @@ python -m compileall app scripts
 ## Document Corpus
 
 Markdown files in `data/docs/` are the RAG source of truth. The bundled sample
-files cover PostgreSQL, MySQL/InnoDB, SQLite, DuckDB, RocksDB, LMDB, ClickHouse,
-Druid, Pinot, Snowflake, BigQuery, MongoDB, Cassandra, ScyllaDB, Redis,
-Elasticsearch, Neo4j, TimescaleDB, InfluxDB, Qdrant, Milvus, Weaviate, pgvector,
-Chroma, FAISS, CockroachDB, YugabyteDB, TiDB, and a database selection guide.
+files cover a generated Chinese restaurant/business case: company overview,
+FAQ, menu and pricing, customer reviews, Bilibili comments, social-media
+archives, financial simulation, a timeline, a profile of 朱剑秋, the Yongge
+livestream incident, and a song document. Retrieval uses vector recall plus
+optional reranking; no BM25 keyword index is currently included.
+
+The keyword intent layer contains domain hints for this bundled corpus in
+`app/intent_router.py`. Those hints only decide whether to use RAG; they do not
+rank documents. Replace them when swapping in a different corpus.
 
 Chunking is Markdown-aware and metadata-driven: Markdown blocks are parsed,
 headings are stored as `h1`/`h2`/`h3` payload metadata, and text, code, and

@@ -84,6 +84,58 @@ class IntentRouter:
         "别查",
     )
 
+    DOMAIN_RAG_PHRASES = (
+        "家是本",
+        "家是本餐饮",
+        "家是本之歌",
+        "家是本，本是家",
+        "朱剑秋",
+        "朱老板",
+        "勇哥连线",
+        "勇哥",
+        "老妈蹄花",
+        "葱油饼",
+        "三年千店",
+        "千店扩张",
+        "1000家",
+        "豆包ai",
+        "豆包视频",
+        "b站评论",
+        "b站账号",
+        "b站弹幕",
+        "哔哩哔哩评论",
+        "哔哩哔哩账号",
+        "哔哩哔哩弹幕",
+        "bilibili comments",
+        "jiashiben",
+        "jia shi ben",
+        "zhu jianqiu",
+        "yongge",
+        "yong ge",
+        "laoma tihua",
+        "cong you bing",
+    )
+
+    DOMAIN_RAG_PATTERNS = (
+        (
+            r"(家是本|朱剑秋|朱老板|勇哥).{0,40}"
+            r"(菜单|定价|价格|财务|营业额|亏损|盈利|客流|租金|选址|春熙路|"
+            r"口号|家文化|商标|品牌|妻子|老婆|评论|差评|弹幕|黑粉|引流|"
+            r"豆包|ai|视频|连线|千店|1000家|扩张)"
+        ),
+        (
+            r"(菜单|定价|价格|财务|营业额|亏损|盈利|客流|租金|选址|春熙路|"
+            r"口号|家文化|商标|品牌|妻子|老婆|评论|差评|弹幕|黑粉|引流|"
+            r"豆包|ai|视频|连线|千店|1000家|扩张).{0,40}"
+            r"(家是本|朱剑秋|朱老板|勇哥)"
+        ),
+        (
+            r"(jiashiben|jia shi ben|zhu jianqiu|yongge|yong ge).{0,80}"
+            r"(menu|price|pricing|finance|revenue|rent|comments|reviews|"
+            r"bilibili|doubao|live|incident|expansion|1000 stores)"
+        ),
+    )
+
     DIRECT_TASK_PATTERNS = (
         (
             r"\b(write|draft|compose|create|generate)\b.{0,80}"
@@ -192,6 +244,13 @@ class IntentRouter:
                 "Question is a clear direct-chat task.",
             )
 
+        if self._matches_domain_rag(text):
+            return IntentDecision(
+                True,
+                "keyword_rag",
+                "Question mentions entities or topics from the local corpus.",
+            )
+
         return None
 
     def _route_with_embeddings(
@@ -268,12 +327,17 @@ class IntentRouter:
         ) or "None"
         prompt = (
             "This application has a replaceable local Markdown knowledge base. "
-            "Its subject can vary. Use retrieval for factual, explanatory, "
-            "comparison, procedural, troubleshooting, or follow-up questions "
-            "that may benefit from indexed documents. Use direct chat for "
-            "greetings, casual conversation, creative writing, translation, or "
-            "requests that explicitly do not need documents. Do not assume a "
-            "specific knowledge domain.\n\n"
+            "The currently indexed corpus is a synthetic Chinese restaurant "
+            "and business case about 家是本, 朱剑秋, 勇哥连线, menu pricing, "
+            "customer reviews, Bilibili/social-media reactions, financial "
+            "simulation, and the related timeline. Use retrieval only when "
+            "the current question is about that local corpus, asks for local "
+            "document evidence, asks for citations/references, or is a "
+            "follow-up whose recent conversation clearly stays on that corpus. "
+            "Use direct chat for unrelated general knowledge, programming, "
+            "SQL/database questions, greetings, casual conversation, creative "
+            "writing, translation, or requests that explicitly do not need "
+            "documents.\n\n"
             f"Compact memory:\n{summary_text}\n\n"
             f"Recent conversation:\n{history_text or 'None'}\n\n"
             f"Current question:\n{question}\n\n"
@@ -404,6 +468,14 @@ class IntentRouter:
         return any(
             re.search(pattern, text, flags=re.IGNORECASE)
             for pattern in self.DIRECT_TASK_PATTERNS
+        )
+
+    def _matches_domain_rag(self, text: str) -> bool:
+        if self._contains_any(text, self.DOMAIN_RAG_PHRASES):
+            return True
+        return any(
+            re.search(pattern, text, flags=re.IGNORECASE)
+            for pattern in self.DOMAIN_RAG_PATTERNS
         )
 
     def _first_match(self, text: str, patterns: Sequence[str]) -> str | None:
