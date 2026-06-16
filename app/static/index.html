@@ -3,2177 +3,261 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>Knowledge Base Assistant</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f4f5f1;
-      --surface: #ffffff;
-      --surface-soft: #f9faf6;
-      --text: #172026;
-      --muted: #68737d;
-      --line: #d9dfd5;
-      --accent: #0f766e;
-      --accent-strong: #115e59;
-      --coral: #c2410c;
-      --amber: #b7791f;
-      --danger: #b42318;
-      --code: #eef2ec;
-      --shadow: 0 18px 40px rgba(24, 36, 30, 0.08);
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    html,
-    body {
-      height: 100%;
-    }
-
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-family:
-        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-        "Segoe UI", sans-serif;
-    }
-
-    button,
-    textarea,
-    input {
-      font: inherit;
-    }
-
-    button {
-      border: 0;
-      cursor: pointer;
-    }
-
-    [hidden] {
-      display: none !important;
-    }
-
-    .login-gate {
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 24px;
-      background: var(--bg);
-    }
-
-    .login-card {
-      width: min(100%, 360px);
-      display: grid;
-      gap: 14px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      padding: 18px;
-      box-shadow: var(--shadow);
-    }
-
-    .gate-title {
-      margin: 0;
-      font-size: 22px;
-      line-height: 1.2;
-    }
-
-    .gate-help {
-      margin: 7px 0 0;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-    }
-
-    .password-actions {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-
-    .app-shell {
-      display: grid;
-      grid-template-columns: 280px minmax(0, 1fr) 360px;
-      min-height: 100vh;
-    }
-
-    .sidebar,
-    .refs-panel {
-      background: var(--surface-soft);
-      border-color: var(--line);
-      padding: 20px;
-    }
-
-    .sidebar {
-      border-right: 1px solid var(--line);
-    }
-
-    .refs-panel {
-      border-left: 1px solid var(--line);
-      overflow-y: auto;
-    }
-
-    .brand {
-      margin-bottom: 22px;
-    }
-
-    .brand h1 {
-      margin: 0;
-      font-size: 23px;
-      line-height: 1.15;
-    }
-
-    .brand p {
-      margin: 7px 0 0;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-    }
-
-    .status {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      padding: 10px 12px;
-      margin-bottom: 16px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .status-dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 999px;
-      background: var(--amber);
-    }
-
-    .status.ok .status-dot {
-      background: var(--accent);
-    }
-
-    .status.bad .status-dot {
-      background: var(--danger);
-    }
-
-    .field {
-      display: grid;
-      gap: 7px;
-      margin-bottom: 16px;
-    }
-
-    label,
-    .meta-label {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-    }
-
-    input {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      color: var(--text);
-      padding: 10px 11px;
-      outline: none;
-    }
-
-    input:focus,
-    textarea:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.14);
-    }
-
-    .meta-stack {
-      display: grid;
-      gap: 8px;
-      margin-top: 20px;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-    }
-
-    .meta-item {
-      overflow-wrap: anywhere;
-    }
-
-    .clear-button {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      color: var(--text);
-      padding: 10px 12px;
-      font-weight: 700;
-    }
-
-    .clear-button:hover {
-      border-color: #c7d0c5;
-      background: #fbfcfa;
-    }
-
-    .secondary-button {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      color: var(--text);
-      padding: 9px 11px;
-      font-size: 13px;
-      font-weight: 800;
-    }
-
-    .secondary-button:hover {
-      border-color: #c7d0c5;
-      background: #fbfcfa;
-    }
-
-    .auth-panel,
-    .sessions-panel {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      padding: 12px;
-      margin-bottom: 16px;
-    }
-
-    .auth-panel .field {
-      margin-bottom: 10px;
-    }
-
-    .login-actions,
-    .user-panel,
-    .session-toolbar,
-    .admin-toolbar,
-    .admin-actions {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-    }
-
-    .login-button {
-      width: 100%;
-      border-radius: 8px;
-      background: var(--accent);
-      color: white;
-      padding: 10px 12px;
-      font-size: 13px;
-      font-weight: 800;
-    }
-
-    .login-button:hover {
-      background: var(--accent-strong);
-    }
-
-    .login-error {
-      min-height: 18px;
-      color: var(--danger);
-      font-size: 12px;
-      line-height: 1.4;
-    }
-
-    .user-name {
-      min-width: 0;
-      color: var(--text);
-      font-size: 13px;
-      font-weight: 800;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .user-panel {
-      display: grid;
-      align-items: start;
-      gap: 10px;
-    }
-
-    .user-actions {
-      display: grid;
-      gap: 8px;
-    }
-
-    .user-actions .secondary-button {
-      width: 100%;
-    }
-
-    .session-list {
-      display: grid;
-      gap: 7px;
-      margin-top: 10px;
-      max-height: 220px;
-      overflow-y: auto;
-    }
-
-    .session-button {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface-soft);
-      color: var(--text);
-      padding: 9px 10px;
-      text-align: left;
-      font-size: 13px;
-      line-height: 1.3;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .session-button.active {
-      border-color: #8bc6bd;
-      background: #eaf8f5;
-      color: #0f4f4a;
-      font-weight: 800;
-    }
-
-    .admin-create {
-      display: grid;
-      gap: 8px;
-      margin-top: 10px;
-    }
-
-    .admin-csv {
-      display: grid;
-      gap: 8px;
-      margin-top: 12px;
-      border-top: 1px solid var(--line);
-      padding-top: 12px;
-    }
-
-    .admin-help {
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.45;
-    }
-
-    .admin-success {
-      min-height: 18px;
-      color: var(--accent);
-      font-size: 12px;
-      line-height: 1.4;
-    }
-
-    .checkbox-line {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 13px;
-      font-weight: 700;
-    }
-
-    .checkbox-line input {
-      width: auto;
-    }
-
-    .admin-error {
-      min-height: 18px;
-      color: var(--danger);
-      font-size: 12px;
-      line-height: 1.4;
-    }
-
-    .admin-list {
-      display: grid;
-      gap: 9px;
-      margin-top: 12px;
-      max-height: 280px;
-      overflow-y: auto;
-    }
-
-    .admin-user {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface-soft);
-      padding: 10px;
-    }
-
-    .admin-user-main {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 8px;
-      margin-bottom: 8px;
-    }
-
-    .admin-user-name {
-      min-width: 0;
-      font-size: 13px;
-      font-weight: 800;
-      overflow-wrap: anywhere;
-    }
-
-    .admin-user-meta {
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.4;
-    }
-
-    .admin-actions {
-      justify-content: flex-start;
-      flex-wrap: wrap;
-    }
-
-    .danger-button {
-      border-color: #f3b4ad;
-      color: var(--danger);
-    }
-
-    .admin-dashboard {
-      min-height: 100vh;
-      background: var(--bg);
-    }
-
-    .dashboard-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-      border-bottom: 1px solid var(--line);
-      background: var(--surface);
-      padding: 20px 28px;
-    }
-
-    .dashboard-header h1 {
-      margin: 0;
-      font-size: 22px;
-      line-height: 1.2;
-    }
-
-    .dashboard-header p {
-      margin: 6px 0 0;
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .dashboard-actions {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-
-    .dashboard-content {
-      display: grid;
-      grid-template-columns: minmax(260px, 360px) minmax(260px, 360px) minmax(0, 1fr);
-      gap: 16px;
-      padding: 20px 28px 28px;
-    }
-
-    .dashboard-section {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      padding: 14px;
-    }
-
-    .admin-users-section {
-      min-width: 0;
-    }
-
-    .admin-users-section .admin-list {
-      max-height: calc(100vh - 170px);
-    }
-
-    .chat-column {
-      display: grid;
-      grid-template-rows: auto minmax(0, 1fr) auto;
-      min-width: 0;
-      min-height: 100vh;
-      background: #fbfcf8;
-    }
-
-    .chat-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-      border-bottom: 1px solid var(--line);
-      padding: 18px 24px;
-      background: rgba(255, 255, 255, 0.72);
-      backdrop-filter: blur(12px);
-    }
-
-    .chat-title {
-      min-width: 0;
-    }
-
-    .chat-title h2 {
-      margin: 0;
-      font-size: 18px;
-    }
-
-    .chat-title span {
-      display: block;
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 13px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .compact-chip {
-      border: 1px solid #d5c6aa;
-      border-radius: 999px;
-      background: #fff8ed;
-      color: #7c4a03;
-      padding: 7px 10px;
-      font-size: 12px;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-
-    .chat-log {
-      overflow-y: auto;
-      padding: 24px;
-    }
-
-    .empty-state {
-      max-width: 680px;
-      margin: 10vh auto 0;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      box-shadow: var(--shadow);
-      padding: 22px;
-    }
-
-    .empty-state h2 {
-      margin: 0;
-      font-size: 24px;
-    }
-
-    .empty-state p {
-      margin: 10px 0 0;
-      color: var(--muted);
-      line-height: 1.55;
-    }
-
-    .message {
-      display: grid;
-      gap: 8px;
-      max-width: 860px;
-      margin: 0 auto 18px;
-    }
-
-    .message.user {
-      justify-items: end;
-    }
-
-    .message.assistant {
-      justify-items: start;
-    }
-
-    .role {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-    }
-
-    .message-route {
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.4;
-      width: min(760px, 100%);
-      overflow-wrap: anywhere;
-    }
-
-    .route-pill {
-      display: inline-block;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: var(--surface-soft);
-      color: var(--muted);
-      padding: 3px 8px;
-      font-weight: 800;
-    }
-
-    .bubble {
-      max-width: min(760px, 100%);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 13px 15px;
-      white-space: pre-wrap;
-      line-height: 1.62;
-      overflow-wrap: anywhere;
-    }
-
-    .user .bubble {
-      border-color: #a8d5cb;
-      background: #eaf8f5;
-    }
-
-    .assistant .bubble {
-      background: var(--surface);
-      box-shadow: 0 8px 24px rgba(24, 36, 30, 0.05);
-    }
-
-    .bubble.loading {
-      color: var(--muted);
-    }
-
-    .bubble.error {
-      border-color: #f3b4ad;
-      background: #fff2f0;
-      color: var(--danger);
-    }
-
-    .bubble.markdown {
-      white-space: normal;
-    }
-
-    .bubble.markdown p,
-    .bubble.markdown ul,
-    .bubble.markdown ol,
-    .bubble.markdown pre {
-      margin: 0 0 0.85em;
-    }
-
-    .bubble.markdown > :last-child {
-      margin-bottom: 0;
-    }
-
-    .bubble.markdown ul,
-    .bubble.markdown ol {
-      padding-left: 1.25em;
-    }
-
-    .bubble.markdown code {
-      border-radius: 5px;
-      background: var(--code);
-      padding: 0.12em 0.32em;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 0.92em;
-    }
-
-    .bubble.markdown pre {
-      overflow-x: auto;
-      border-radius: 8px;
-      background: var(--code);
-      padding: 11px 12px;
-      white-space: pre;
-    }
-
-    .bubble.markdown pre code {
-      padding: 0;
-      background: transparent;
-    }
-
-    .message-refs {
-      width: min(760px, 100%);
-    }
-
-    details {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface-soft);
-      padding: 10px 12px;
-    }
-
-    summary {
-      cursor: pointer;
-      color: var(--accent-strong);
-      font-size: 13px;
-      font-weight: 800;
-    }
-
-    .composer {
-      border-top: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.86);
-      padding: 16px 24px 20px;
-    }
-
-    .composer-inner {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 12px;
-      max-width: 920px;
-      margin: 0 auto;
-      align-items: end;
-    }
-
-    textarea {
-      width: 100%;
-      min-height: 58px;
-      max-height: 190px;
-      resize: vertical;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      color: var(--text);
-      padding: 13px 14px;
-      line-height: 1.5;
-      outline: none;
-    }
-
-    .send-button {
-      min-width: 104px;
-      border-radius: 8px;
-      background: var(--accent);
-      color: white;
-      padding: 13px 18px;
-      font-weight: 800;
-    }
-
-    .send-button:hover {
-      background: var(--accent-strong);
-    }
-
-    .send-button:disabled {
-      cursor: wait;
-      opacity: 0.6;
-    }
-
-    .refs-panel h2 {
-      margin: 0 0 14px;
-      font-size: 18px;
-    }
-
-    .refs-empty {
-      color: var(--muted);
-      line-height: 1.5;
-      font-size: 14px;
-    }
-
-    .ref-card {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      padding: 12px;
-      margin-bottom: 12px;
-    }
-
-    .ref-meta {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 8px;
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.4;
-    }
-
-    .ref-source {
-      overflow-wrap: anywhere;
-      font-weight: 700;
-    }
-
-    .ref-score {
-      color: var(--coral);
-      font-weight: 800;
-      white-space: nowrap;
-    }
-
-    code {
-      display: block;
-      border-radius: 6px;
-      background: var(--code);
-      color: #34413b;
-      padding: 8px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px;
-      line-height: 1.45;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-    }
-
-    @media (max-width: 1100px) {
-      .app-shell {
-        grid-template-columns: 240px minmax(0, 1fr);
-      }
-
-      .dashboard-content {
-        grid-template-columns: 1fr 1fr;
-      }
-
-      .admin-users-section {
-        grid-column: 1 / -1;
-      }
-
-      .refs-panel {
-        display: none;
-      }
-    }
-
-    @media (max-width: 760px) {
-      .app-shell {
-        grid-template-columns: 1fr;
-      }
-
-      .dashboard-header {
-        align-items: flex-start;
-        flex-direction: column;
-        padding: 16px;
-      }
-
-      .dashboard-content {
-        grid-template-columns: 1fr;
-        padding: 16px;
-      }
-
-      .admin-users-section {
-        grid-column: auto;
-      }
-
-      .sidebar {
-        border-right: 0;
-        border-bottom: 1px solid var(--line);
-      }
-
-      .chat-column {
-        min-height: 70vh;
-      }
-
-      .chat-header {
-        align-items: flex-start;
-        flex-direction: column;
-        padding: 16px;
-      }
-
-      .chat-log {
-        padding: 16px;
-      }
-
-      .composer {
-        padding: 14px 16px 16px;
-      }
-
-      .composer-inner {
-        grid-template-columns: 1fr;
-      }
-
-      .send-button {
-        width: 100%;
-      }
-    }
-  </style>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/css/styles.css">
 </head>
 <body>
-  <main id="loginGate" class="login-gate">
-    <form id="loginForm" class="login-card">
-      <div class="field">
-        <label for="loginUsername">Account</label>
+  <!-- Inline SVG icon sprite: keeps icons local with no external/CDN dependency. -->
+  <svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+    <symbol id="i-send" viewBox="0 0 24 24"><path d="M22 2 11 13M22 2l-7 20-4-9-9-4Z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-logout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.5 12.5 8-8M16 7l3 3M19 4l2 2"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M3 12h18M3 6h18M3 18h18"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20M4 19.5A2.5 2.5 0 0 0 6.5 22H20V2H6.5A2.5 2.5 0 0 0 4 4.5Z"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 15-6.7L21 8M21 3v5h-5M21 12a9 9 0 0 1-15 6.7L3 16M3 21v-5h5"/></symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.7a8.5 8.5 0 0 1-.9-3.8A8.38 8.38 0 0 1 12.5 3 8.38 8.38 0 0 1 21 11.5Z"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  </svg>
+
+  <!-- ===================== Login gate ===================== -->
+  <main id="loginGate" class="gate">
+    <form id="loginForm" class="gate-card" autocomplete="on">
+      <div class="gate-brand">
+        <span class="brand-mark"><svg class="icon"><use href="#i-sparkle"/></svg></span>
+        <div>
+          <h1 class="gate-title">Knowledge Base Assistant</h1>
+          <p class="gate-help">Sign in to your account to continue.</p>
+        </div>
+      </div>
+      <label class="field">
+        <span class="field-label">Account</span>
         <input id="loginUsername" autocomplete="username" autofocus>
-      </div>
-      <div class="field">
-        <label for="loginPassword">Password</label>
+      </label>
+      <label class="field">
+        <span class="field-label">Password</span>
         <input id="loginPassword" type="password" autocomplete="current-password">
-      </div>
-      <button id="loginButton" class="login-button" type="submit">Sign In</button>
-      <div id="loginError" class="login-error"></div>
+      </label>
+      <button id="loginButton" class="btn btn-primary btn-block" type="submit">Sign In</button>
+      <div id="loginError" class="form-error" role="alert"></div>
     </form>
   </main>
 
-  <main id="passwordGate" class="login-gate" hidden>
-    <form id="passwordChangeForm" class="login-card">
-      <div>
-        <h1 id="passwordChangeTitle" class="gate-title">Change Password</h1>
-        <p id="passwordChangeHelp" class="gate-help">
-          Update your password before continuing.
-        </p>
+  <!-- ===================== Password gate ===================== -->
+  <main id="passwordGate" class="gate" hidden>
+    <form id="passwordChangeForm" class="gate-card">
+      <div class="gate-brand">
+        <span class="brand-mark"><svg class="icon"><use href="#i-key"/></svg></span>
+        <div>
+          <h1 id="passwordChangeTitle" class="gate-title">Change Password</h1>
+          <p id="passwordChangeHelp" class="gate-help">Update your password before continuing.</p>
+        </div>
       </div>
-      <div class="field">
-        <label for="passwordCurrent">Current Password</label>
+      <label class="field">
+        <span class="field-label">Current Password</span>
         <input id="passwordCurrent" type="password" autocomplete="current-password">
-      </div>
-      <div class="field">
-        <label for="passwordNew">New Password</label>
+      </label>
+      <label class="field">
+        <span class="field-label">New Password</span>
         <input id="passwordNew" type="password" autocomplete="new-password">
+      </label>
+      <button id="passwordChangeButton" class="btn btn-primary btn-block" type="submit">Update Password</button>
+      <div class="gate-actions">
+        <button id="passwordCancelButton" class="btn btn-ghost" type="button">Cancel</button>
+        <button id="passwordLogoutButton" class="btn btn-ghost" type="button">Sign Out</button>
       </div>
-      <button id="passwordChangeButton" class="login-button" type="submit">
-        Update Password
-      </button>
-      <div class="password-actions">
-        <button id="passwordCancelButton" class="secondary-button" type="button">
-          Cancel
-        </button>
-        <button id="passwordLogoutButton" class="secondary-button" type="button">
-          Sign Out
-        </button>
-      </div>
-      <div id="passwordChangeError" class="login-error"></div>
+      <div id="passwordChangeError" class="form-error" role="alert"></div>
     </form>
   </main>
 
+  <!-- ===================== Main app ===================== -->
   <main id="appShell" class="app-shell" hidden>
-    <aside class="sidebar">
-      <div class="brand">
-        <h1>Knowledge Base Assistant</h1>
-        <p id="modelName">Loading model metadata</p>
+    <div id="scrim" class="scrim" hidden></div>
+
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-head">
+        <span class="brand-mark brand-mark-sm"><svg class="icon"><use href="#i-sparkle"/></svg></span>
+        <span class="brand-name">Knowledge Base</span>
       </div>
 
-      <div id="status" class="status">
-        <span id="statusText">Checking</span>
-        <span class="status-dot"></span>
+      <button id="newSessionButton" class="btn btn-primary btn-block" type="button">
+        <svg class="icon"><use href="#i-plus"/></svg> New chat
+      </button>
+
+      <div class="search-box">
+        <svg class="icon search-icon"><use href="#i-search"/></svg>
+        <input id="sessionSearch" type="search" placeholder="Search chats" autocomplete="off">
       </div>
 
-      <div id="authPanel" class="auth-panel" hidden>
-        <div id="userPanel" class="user-panel" hidden>
-          <div>
+      <nav id="sessionList" class="session-list" aria-label="Chat sessions"></nav>
+
+      <div class="sidebar-foot">
+        <div id="status" class="status">
+          <span class="status-dot"></span>
+          <span id="statusText" class="status-text">Checking…</span>
+        </div>
+        <div id="userCard" class="user-card" hidden>
+          <div class="user-meta">
             <div id="userName" class="user-name"></div>
-            <div id="userRole" class="admin-user-meta"></div>
+            <div id="userRole" class="user-role"></div>
           </div>
           <div class="user-actions">
-            <button id="changePasswordButton" class="secondary-button" type="button">
-              Change Password
+            <button id="adminDashboardButton" class="icon-btn" type="button" title="Admin dashboard" hidden>
+              <svg class="icon"><use href="#i-shield"/></svg>
             </button>
-            <button id="adminDashboardButton" class="secondary-button" type="button" hidden>
-              Admin Dashboard
+            <button id="changePasswordButton" class="icon-btn" type="button" title="Change password">
+              <svg class="icon"><use href="#i-key"/></svg>
             </button>
-            <button id="logoutButton" class="secondary-button" type="button">Sign Out</button>
+            <button id="logoutButton" class="icon-btn" type="button" title="Sign out">
+              <svg class="icon"><use href="#i-logout"/></svg>
+            </button>
           </div>
-        </div>
-      </div>
-
-      <div id="sessionsPanel" class="sessions-panel" hidden>
-        <div class="session-toolbar">
-          <div class="meta-label">Sessions</div>
-          <button id="newSessionButton" class="secondary-button" type="button">New</button>
-        </div>
-        <div id="sessionList" class="session-list"></div>
-      </div>
-
-      <div class="field">
-        <label for="recallTopK">Recall K</label>
-        <input id="recallTopK" type="number" min="1">
-      </div>
-
-      <div class="field">
-        <label for="topK">Rerank K</label>
-        <input id="topK" type="number" min="1">
-      </div>
-
-      <button id="clearButton" class="clear-button" type="button">Clear Chat</button>
-
-      <div class="meta-stack">
-        <div>
-          <div class="meta-label">Collection</div>
-          <div id="collectionName" class="meta-item">Unknown</div>
-        </div>
-        <div>
-          <div class="meta-label">Max Output</div>
-          <div id="maxTokens" class="meta-item">Unknown</div>
-        </div>
-        <div>
-          <div class="meta-label">Reranker</div>
-          <div id="rerankerName" class="meta-item">Unknown</div>
-        </div>
-        <div>
-          <div class="meta-label">Last Route</div>
-          <div id="latestRoute" class="meta-item">None</div>
         </div>
       </div>
     </aside>
 
     <section class="chat-column">
       <header class="chat-header">
+        <button id="sidebarToggle" class="icon-btn only-mobile" type="button" title="Toggle sessions">
+          <svg class="icon"><use href="#i-menu"/></svg>
+        </button>
         <div class="chat-title">
-          <h2>Conversation</h2>
-          <span id="subtitle">Answers grounded in a local Markdown knowledge base</span>
+          <h2 id="sessionTitle">Conversation</h2>
+          <span class="chat-subtitle">Answers grounded in a local Markdown knowledge base</span>
         </div>
-        <div id="compactChip" class="compact-chip" hidden>Memory compacted</div>
+        <div id="compactChip" class="chip" title="Older turns were compacted into memory" hidden>
+          <svg class="icon"><use href="#i-sparkle"/></svg> Memory compacted
+        </div>
+        <div class="header-actions">
+          <button id="refsToggle" class="icon-btn only-mobile" type="button" title="References">
+            <svg class="icon"><use href="#i-book"/></svg>
+          </button>
+          <div class="popover-wrap">
+            <button id="settingsToggle" class="icon-btn" type="button" title="Retrieval settings" aria-expanded="false">
+              <svg class="icon"><use href="#i-settings"/></svg>
+            </button>
+            <div id="settingsPopover" class="popover" hidden>
+              <div class="popover-title">Retrieval</div>
+              <label class="field field-row">
+                <span class="field-label">Recall K</span>
+                <input id="recallTopK" type="number" min="1" inputmode="numeric">
+              </label>
+              <label class="field field-row">
+                <span class="field-label">Rerank K</span>
+                <input id="topK" type="number" min="1" inputmode="numeric">
+              </label>
+              <div class="popover-divider"></div>
+              <dl class="meta-grid">
+                <dt>Model</dt><dd id="modelName">—</dd>
+                <dt>Collection</dt><dd id="collectionName">—</dd>
+                <dt>Reranker</dt><dd id="rerankerName">—</dd>
+                <dt>Max output</dt><dd id="maxTokens">—</dd>
+                <dt>Last route</dt><dd id="latestRoute">None</dd>
+              </dl>
+            </div>
+          </div>
+        </div>
       </header>
 
       <div id="chatLog" class="chat-log"></div>
 
       <form id="composer" class="composer">
-        <div class="composer-inner">
-          <textarea id="prompt" rows="2" placeholder="Ask a question about the indexed knowledge base"></textarea>
-          <button id="sendButton" class="send-button" type="submit">Send</button>
+        <div class="composer-box">
+          <textarea id="prompt" rows="1" placeholder="Ask a question about the indexed knowledge base…"></textarea>
+          <button id="sendButton" class="send-btn" type="submit" title="Send (Ctrl/Cmd + Enter)">
+            <svg class="icon"><use href="#i-send"/></svg>
+          </button>
         </div>
+        <div class="composer-hint">Press <kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>Enter</kbd> to send</div>
       </form>
     </section>
 
-    <aside class="refs-panel">
-      <h2>References</h2>
-      <div id="referenceList" class="refs-empty">No references yet.</div>
+    <aside id="refsPanel" class="refs-panel">
+      <div class="refs-head">
+        <h2><svg class="icon"><use href="#i-book"/></svg> References</h2>
+        <button id="refsClose" class="icon-btn only-mobile" type="button" title="Close">
+          <svg class="icon"><use href="#i-close"/></svg>
+        </button>
+      </div>
+      <div id="referenceList" class="reference-list"></div>
     </aside>
   </main>
 
-  <main id="adminDashboard" class="admin-dashboard" hidden>
-    <header class="dashboard-header">
-      <div>
-        <h1>Admin Dashboard</h1>
-        <p>Account management</p>
+  <!-- ===================== Admin dashboard ===================== -->
+  <main id="adminDashboard" class="admin" hidden>
+    <header class="admin-header">
+      <div class="admin-title">
+        <span class="brand-mark brand-mark-sm"><svg class="icon"><use href="#i-shield"/></svg></span>
+        <div>
+          <h1>Admin Dashboard</h1>
+          <p>Account management</p>
+        </div>
       </div>
-      <div class="dashboard-actions">
-        <button id="adminChangePasswordButton" class="secondary-button" type="button">
-          Change Password
+      <div class="admin-header-actions">
+        <button id="adminChangePasswordButton" class="btn btn-ghost" type="button">
+          <svg class="icon"><use href="#i-key"/></svg> Password
         </button>
-        <button id="backToChatButton" class="secondary-button" type="button">
-          Back to Chat
+        <button id="backToChatButton" class="btn btn-ghost" type="button">
+          <svg class="icon"><use href="#i-chat"/></svg> Back to chat
         </button>
-        <button id="adminLogoutButton" class="secondary-button" type="button">
-          Sign Out
+        <button id="adminLogoutButton" class="btn btn-ghost" type="button">
+          <svg class="icon"><use href="#i-logout"/></svg> Sign out
         </button>
       </div>
     </header>
 
-    <section class="dashboard-content">
-      <section class="dashboard-section">
-        <div class="meta-label">Add User</div>
-        <form id="adminCreateForm" class="admin-create">
-          <input id="adminNewUsername" placeholder="Username" autocomplete="off">
-          <input id="adminNewPassword" type="password" placeholder="Password" autocomplete="new-password">
-          <label class="checkbox-line">
-            <input id="adminNewIsAdmin" type="checkbox">
-            Admin
-          </label>
-          <button class="login-button" type="submit">Add User</button>
-        </form>
-      </section>
-
-      <section class="dashboard-section">
-        <div class="meta-label">Upload CSV</div>
-        <form id="adminCsvForm" class="admin-csv">
-          <div class="admin-help">
-            CSV format must be exactly two columns named email and passwd.
-            Example first row: email,passwd. Extra columns, missing values, and
-            wrong headers are rejected.
-          </div>
-          <input id="adminCsvFile" type="file" accept=".csv,text/csv">
-          <button id="adminCsvButton" class="secondary-button" type="submit">Upload CSV</button>
-          <div id="adminCsvStatus" class="admin-success"></div>
-        </form>
-      </section>
-
-      <section class="dashboard-section admin-users-section">
-        <div class="admin-toolbar">
-          <div>
-            <div class="meta-label">Users</div>
-            <div id="adminError" class="admin-error"></div>
-          </div>
-          <button id="adminRefreshButton" class="secondary-button" type="button">
-            Refresh
+    <div class="admin-grid">
+      <section class="card admin-users">
+        <div class="card-toolbar">
+          <h3 class="card-title">Users</h3>
+          <button id="adminRefreshButton" class="icon-btn" type="button" title="Refresh">
+            <svg class="icon"><use href="#i-refresh"/></svg>
           </button>
         </div>
-        <div id="adminUserList" class="admin-list"></div>
+        <div id="adminError" class="alert" role="alert"></div>
+        <div id="adminUserList" class="admin-user-list"></div>
       </section>
-    </section>
+
+      <div class="admin-main">
+        <section class="card">
+          <h3 class="card-title">Add user</h3>
+          <form id="adminCreateForm" class="stack">
+            <input id="adminNewUsername" placeholder="Username" autocomplete="off">
+            <input id="adminNewPassword" type="password" placeholder="Password" autocomplete="new-password">
+            <label class="checkbox">
+              <input id="adminNewIsAdmin" type="checkbox"> Administrator
+            </label>
+            <button class="btn btn-primary btn-block" type="submit">Add user</button>
+            <div id="adminCreateStatus" class="alert" role="alert"></div>
+          </form>
+        </section>
+
+        <section class="card">
+          <h3 class="card-title">Import CSV</h3>
+          <form id="adminCsvForm" class="stack">
+            <p class="card-help">
+              Exactly two columns named <code>email</code> and <code>passwd</code>.
+              Extra columns, missing values, and wrong headers are rejected.
+            </p>
+            <input id="adminCsvFile" type="file" accept=".csv,text/csv">
+            <button id="adminCsvButton" class="btn btn-ghost btn-block" type="submit">Upload CSV</button>
+            <div id="adminCsvStatus" class="alert" role="status"></div>
+          </form>
+        </section>
+      </div>
+    </div>
   </main>
 
-  <script>
-    const loginGateEl = document.getElementById("loginGate");
-    const passwordGateEl = document.getElementById("passwordGate");
-    const appShellEl = document.getElementById("appShell");
-    const adminDashboardEl = document.getElementById("adminDashboard");
-    const statusEl = document.getElementById("status");
-    const statusTextEl = document.getElementById("statusText");
-    const modelNameEl = document.getElementById("modelName");
-    const collectionNameEl = document.getElementById("collectionName");
-    const maxTokensEl = document.getElementById("maxTokens");
-    const latestRouteEl = document.getElementById("latestRoute");
-    const compactChipEl = document.getElementById("compactChip");
-    const chatLogEl = document.getElementById("chatLog");
-    const referenceListEl = document.getElementById("referenceList");
-    const composerEl = document.getElementById("composer");
-    const promptEl = document.getElementById("prompt");
-    const recallTopKEl = document.getElementById("recallTopK");
-    const topKEl = document.getElementById("topK");
-    const rerankerNameEl = document.getElementById("rerankerName");
-    const sendButton = document.getElementById("sendButton");
-    const clearButton = document.getElementById("clearButton");
-    const authPanelEl = document.getElementById("authPanel");
-    const loginFormEl = document.getElementById("loginForm");
-    const loginUsernameEl = document.getElementById("loginUsername");
-    const loginPasswordEl = document.getElementById("loginPassword");
-    const loginButtonEl = document.getElementById("loginButton");
-    const loginErrorEl = document.getElementById("loginError");
-    const passwordChangeFormEl = document.getElementById("passwordChangeForm");
-    const passwordChangeTitleEl = document.getElementById("passwordChangeTitle");
-    const passwordChangeHelpEl = document.getElementById("passwordChangeHelp");
-    const passwordCurrentEl = document.getElementById("passwordCurrent");
-    const passwordNewEl = document.getElementById("passwordNew");
-    const passwordChangeButtonEl = document.getElementById("passwordChangeButton");
-    const passwordCancelButtonEl = document.getElementById("passwordCancelButton");
-    const passwordLogoutButtonEl = document.getElementById("passwordLogoutButton");
-    const passwordChangeErrorEl = document.getElementById("passwordChangeError");
-    const userPanelEl = document.getElementById("userPanel");
-    const userNameEl = document.getElementById("userName");
-    const userRoleEl = document.getElementById("userRole");
-    const changePasswordButtonEl = document.getElementById("changePasswordButton");
-    const adminDashboardButtonEl = document.getElementById("adminDashboardButton");
-    const logoutButtonEl = document.getElementById("logoutButton");
-    const sessionsPanelEl = document.getElementById("sessionsPanel");
-    const sessionListEl = document.getElementById("sessionList");
-    const newSessionButtonEl = document.getElementById("newSessionButton");
-    const adminChangePasswordButtonEl = document.getElementById("adminChangePasswordButton");
-    const backToChatButtonEl = document.getElementById("backToChatButton");
-    const adminLogoutButtonEl = document.getElementById("adminLogoutButton");
-    const adminRefreshButtonEl = document.getElementById("adminRefreshButton");
-    const adminCreateFormEl = document.getElementById("adminCreateForm");
-    const adminNewUsernameEl = document.getElementById("adminNewUsername");
-    const adminNewPasswordEl = document.getElementById("adminNewPassword");
-    const adminNewIsAdminEl = document.getElementById("adminNewIsAdmin");
-    const adminErrorEl = document.getElementById("adminError");
-    const adminCsvFormEl = document.getElementById("adminCsvForm");
-    const adminCsvFileEl = document.getElementById("adminCsvFile");
-    const adminCsvStatusEl = document.getElementById("adminCsvStatus");
-    const adminUserListEl = document.getElementById("adminUserList");
-
-    const state = {
-      messages: [],
-      conversationSummary: "",
-      summarizedMessageCount: 0,
-      busy: false,
-      authToken: "",
-      currentUser: null,
-      sessions: [],
-      activeSessionId: "",
-      adminUsers: [],
-      currentView: "chat",
-      passwordChangeOpen: false
-    };
-    const authTokenStorageKey = "knowledgeBaseAssistantAuthToken";
-
-    function setStatus(text, className) {
-      statusTextEl.textContent = text;
-      statusEl.className = `status ${className || ""}`.trim();
-    }
-
-    function authHeaders(headers = {}) {
-      const token = state.authToken || localStorage.getItem(authTokenStorageKey);
-      if (!token) return headers;
-      return {...headers, Authorization: `Bearer ${token}`};
-    }
-
-    async function fetchWithAuth(url, options = {}) {
-      const request = () => fetch(url, {
-        ...options,
-        headers: authHeaders(options.headers || {})
-      });
-
-      let response = await request();
-      if (response.status === 403) {
-        const data = await response.clone().json().catch(() => ({}));
-        if (data.detail === "Password change required.") {
-          state.currentUser = {
-            ...state.currentUser,
-            must_change_password: true
-          };
-          state.passwordChangeOpen = false;
-          updateAuthPanels();
-          setStatus("Password change required", "bad");
-        }
-        return response;
-      }
-      if (response.status !== 401) return response;
-      signOutLocal("Session expired. Sign in again.");
-      return response;
-    }
-
-    async function checkHealth() {
-      try {
-        const liveResponse = await fetch("/health");
-        if (!liveResponse.ok) {
-          setStatus("Offline", "bad");
-          return;
-        }
-
-        if (!state.currentUser) {
-          setStatus("Login required", "bad");
-          return;
-        }
-
-        const response = await fetchWithAuth("/health/details");
-        if (response.status === 401) {
-          setStatus("Auth required", "bad");
-          return;
-        }
-        if (response.status === 403) {
-          return;
-        }
-        const data = await response.json();
-        const ready = Boolean(data.qdrant && data.llm);
-        setStatus(ready ? "Ready" : "Degraded", ready ? "ok" : "bad");
-        modelNameEl.textContent = data.llm_model || "Unknown model";
-        collectionNameEl.textContent = data.collection || "Unknown";
-        maxTokensEl.textContent = data.llm_max_tokens
-          ? `${data.llm_max_tokens} tokens`
-          : "Unknown";
-        rerankerNameEl.textContent = data.reranker_enabled
-          ? (data.reranker_model || "Enabled")
-          : "Disabled";
-        if (data.api_recall_top_k_max) {
-          recallTopKEl.max = String(data.api_recall_top_k_max);
-        }
-        if (data.recall_top_k) {
-          recallTopKEl.placeholder = String(data.recall_top_k);
-          if (!recallTopKEl.value) {
-            recallTopKEl.value = String(data.recall_top_k);
-          }
-        }
-        if (data.api_top_k_max) {
-          topKEl.max = String(data.api_top_k_max);
-        }
-        if (data.retrieve_top_k) {
-          topKEl.placeholder = String(data.retrieve_top_k);
-          if (!topKEl.value) {
-            topKEl.value = String(data.retrieve_top_k);
-          }
-        }
-      } catch {
-        setStatus("Offline", "bad");
-      }
-    }
-
-    function updateAuthPanels() {
-      const signedIn = Boolean(state.currentUser);
-      const mustChangePassword = Boolean(state.currentUser?.must_change_password);
-      const showPasswordGate = signedIn && (
-        mustChangePassword || state.passwordChangeOpen
-      );
-      const showAdmin = signedIn
-        && !showPasswordGate
-        && state.currentUser.is_admin
-        && state.currentView === "admin";
-
-      loginGateEl.hidden = signedIn;
-      passwordGateEl.hidden = !showPasswordGate;
-      appShellEl.hidden = !signedIn || showPasswordGate || showAdmin;
-      adminDashboardEl.hidden = !showAdmin;
-      authPanelEl.hidden = !signedIn;
-      sessionsPanelEl.hidden = !signedIn;
-      userPanelEl.hidden = !signedIn;
-      composerEl.hidden = !signedIn;
-      clearButton.disabled = !signedIn;
-      adminDashboardButtonEl.hidden = !signedIn || !state.currentUser.is_admin;
-      passwordCancelButtonEl.hidden = mustChangePassword;
-      passwordChangeTitleEl.textContent = mustChangePassword
-        ? "Change Password Required"
-        : "Change Password";
-      passwordChangeHelpEl.textContent = mustChangePassword
-        ? "This account is using an initial or reset password. Update it before using the system."
-        : "Update your account password.";
-
-      if (state.currentUser) {
-        userNameEl.textContent = state.currentUser.username;
-        userRoleEl.textContent = state.currentUser.is_admin ? "Administrator" : "User";
-        if (showPasswordGate) {
-          passwordCurrentEl.focus();
-        }
-      } else {
-        userNameEl.textContent = "";
-        userRoleEl.textContent = "";
-        loginUsernameEl.focus();
-      }
-    }
-
-    function signOutLocal(message = "") {
-      state.authToken = "";
-      state.currentUser = null;
-      state.sessions = [];
-      state.adminUsers = [];
-      state.activeSessionId = "";
-      state.messages = [];
-      state.conversationSummary = "";
-      state.summarizedMessageCount = 0;
-      state.currentView = "chat";
-      state.passwordChangeOpen = false;
-      localStorage.removeItem(authTokenStorageKey);
-      loginErrorEl.textContent = message;
-      passwordChangeErrorEl.textContent = "";
-      passwordCurrentEl.value = "";
-      passwordNewEl.value = "";
-      latestRouteEl.textContent = "None";
-      compactChipEl.hidden = true;
-      renderSessions();
-      renderAdminUsers();
-      renderMessages();
-      renderReferences([]);
-      updateAuthPanels();
-      setStatus("Login required", "bad");
-    }
-
-    async function restoreAuthSession() {
-      state.authToken = localStorage.getItem(authTokenStorageKey) || "";
-      if (!state.authToken) {
-        signOutLocal("");
-        return;
-      }
-
-      const response = await fetchWithAuth("/auth/me");
-      if (!response.ok) {
-        signOutLocal("Session expired. Sign in again.");
-        return;
-      }
-
-      state.currentUser = await response.json();
-      state.currentView = "chat";
-      updateAuthPanels();
-      if (state.currentUser.must_change_password) {
-        setStatus("Password change required", "bad");
-        return;
-      }
-      await loadSessions(true);
-      await checkHealth();
-    }
-
-    async function login(username, password) {
-      loginButtonEl.disabled = true;
-      loginErrorEl.textContent = "";
-      try {
-        const response = await fetch("/auth/login", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({username, password})
-        });
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.detail || "Sign in failed");
-        }
-
-        state.authToken = data.token;
-        state.currentUser = data.user;
-        state.currentView = "chat";
-        state.passwordChangeOpen = false;
-        localStorage.setItem(authTokenStorageKey, data.token);
-        loginPasswordEl.value = "";
-        updateAuthPanels();
-        if (state.currentUser.must_change_password) {
-          setStatus("Password change required", "bad");
-          return;
-        }
-        await loadSessions(true);
-        await checkHealth();
-      } catch (error) {
-        loginErrorEl.textContent = error.message;
-      } finally {
-        loginButtonEl.disabled = false;
-      }
-    }
-
-    async function logout() {
-      if (state.authToken) {
-        await fetchWithAuth("/auth/logout", {method: "POST"});
-      }
-      signOutLocal("");
-    }
-
-    async function showAdminDashboard() {
-      if (!state.currentUser?.is_admin) return;
-      state.currentView = "admin";
-      updateAuthPanels();
-      await loadAdminUsers();
-    }
-
-    function showChat() {
-      state.currentView = "chat";
-      updateAuthPanels();
-      promptEl.focus();
-    }
-
-    function openPasswordChange() {
-      state.passwordChangeOpen = true;
-      passwordChangeErrorEl.textContent = "";
-      passwordCurrentEl.value = "";
-      passwordNewEl.value = "";
-      updateAuthPanels();
-    }
-
-    function closePasswordChange() {
-      if (state.currentUser?.must_change_password) return;
-      state.passwordChangeOpen = false;
-      passwordChangeErrorEl.textContent = "";
-      passwordCurrentEl.value = "";
-      passwordNewEl.value = "";
-      updateAuthPanels();
-    }
-
-    async function changePassword(currentPassword, newPassword) {
-      passwordChangeButtonEl.disabled = true;
-      passwordChangeErrorEl.textContent = "";
-
-      try {
-        const response = await fetchWithAuth("/auth/password", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({
-            current_password: currentPassword,
-            new_password: newPassword
-          })
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          throw new Error(data.detail || "Unable to change password.");
-        }
-
-        state.currentUser = data;
-        state.passwordChangeOpen = false;
-        passwordCurrentEl.value = "";
-        passwordNewEl.value = "";
-        updateAuthPanels();
-        if (state.currentView === "admin") {
-          await loadAdminUsers();
-        } else {
-          await loadSessions(true);
-        }
-        await checkHealth();
-      } catch (error) {
-        passwordChangeErrorEl.textContent = error.message;
-      } finally {
-        passwordChangeButtonEl.disabled = false;
-      }
-    }
-
-    async function loadSessions(selectFirst = false) {
-      if (!state.currentUser) return;
-
-      const response = await fetchWithAuth("/sessions");
-      if (!response.ok) {
-        if (response.status === 403) return;
-        signOutLocal("Unable to load sessions.");
-        return;
-      }
-
-      state.sessions = await response.json();
-      renderSessions();
-
-      if (!state.sessions.length) {
-        await createNewSession();
-        return;
-      }
-
-      const activeStillExists = state.sessions.some(
-        (session) => session.id === state.activeSessionId
-      );
-      if (selectFirst || !activeStillExists) {
-        await loadSession(state.sessions[0].id);
-      }
-    }
-
-    async function createNewSession() {
-      const response = await fetchWithAuth("/sessions", {method: "POST"});
-      if (!response.ok) {
-        if (response.status === 403) return;
-        signOutLocal("Unable to create a session.");
-        return;
-      }
-      const session = await response.json();
-      applySessionDetail(session);
-      await loadSessions(false);
-      promptEl.focus();
-    }
-
-    async function loadSession(sessionId) {
-      if (!sessionId || sessionId === state.activeSessionId) {
-        renderSessions();
-        return;
-      }
-
-      const response = await fetchWithAuth(`/sessions/${sessionId}`);
-      if (!response.ok) {
-        if (response.status === 403) return;
-        await loadSessions(true);
-        return;
-      }
-
-      const session = await response.json();
-      applySessionDetail(session);
-      promptEl.focus();
-    }
-
-    function applySessionDetail(session) {
-      state.activeSessionId = session.id;
-      state.conversationSummary = session.conversation_summary || "";
-      state.summarizedMessageCount = session.compacted_message_count || 0;
-      state.messages = (session.messages || []).map((message) => ({
-        role: message.role,
-        content: message.content,
-        contexts: message.contexts || [],
-        usedRag: Boolean(message.used_rag),
-        route: message.route || "",
-        routeReason: message.route_reason || ""
-      }));
-      compactChipEl.hidden = !state.conversationSummary;
-      latestRouteEl.textContent = "None";
-      const lastAssistant = [...state.messages]
-        .reverse()
-        .find((message) => message.role === "assistant");
-      if (lastAssistant) {
-        latestRouteEl.textContent =
-          `${lastAssistant.usedRag ? "RAG" : "Direct"} · ${lastAssistant.route || "unknown"}`;
-        renderReferences(lastAssistant.contexts || [], lastAssistant.usedRag);
-      } else {
-        renderReferences([]);
-      }
-      renderSessions();
-      renderMessages();
-    }
-
-    function renderSessions() {
-      sessionListEl.innerHTML = "";
-      if (!state.sessions.length) {
-        const empty = document.createElement("div");
-        empty.className = "refs-empty";
-        empty.textContent = "No saved sessions.";
-        sessionListEl.appendChild(empty);
-        return;
-      }
-
-      for (const session of state.sessions) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "session-button";
-        if (session.id === state.activeSessionId) {
-          button.classList.add("active");
-        }
-        button.textContent = session.title || "New chat";
-        button.addEventListener("click", () => loadSession(session.id));
-        sessionListEl.appendChild(button);
-      }
-    }
-
-    async function loadAdminUsers() {
-      if (!state.currentUser?.is_admin) return;
-
-      const response = await fetchWithAuth("/admin/users");
-      if (!response.ok) {
-        adminErrorEl.textContent = "Unable to load users.";
-        return;
-      }
-
-      state.adminUsers = await response.json();
-      adminErrorEl.textContent = "";
-      renderAdminUsers();
-    }
-
-    async function createAdminUser(username, password, isAdmin) {
-      const response = await fetchWithAuth("/admin/users", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({username, password, is_admin: isAdmin})
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || "Unable to add user.");
-      }
-      adminNewUsernameEl.value = "";
-      adminNewPasswordEl.value = "";
-      adminNewIsAdminEl.checked = false;
-      await loadAdminUsers();
-    }
-
-    async function importAdminUsersCsv(file) {
-      if (!file) {
-        throw new Error("Choose a CSV file first.");
-      }
-
-      const csvText = await file.text();
-      const response = await fetchWithAuth("/admin/users/import-csv", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({csv_text: csvText})
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data.detail || "CSV import failed.");
-      }
-
-      adminCsvFileEl.value = "";
-      adminCsvStatusEl.textContent = `Created ${data.created || 0} users.`;
-      await loadAdminUsers();
-    }
-
-    async function setAdminRole(userId, isAdmin) {
-      const response = await fetchWithAuth(`/admin/users/${userId}/role`, {
-        method: "PATCH",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({is_admin: isAdmin})
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data.detail || "Unable to update role.");
-      }
-      await loadAdminUsers();
-    }
-
-    async function resetAdminUserPassword(userId) {
-      const password = window.prompt("New password");
-      if (!password) return;
-
-      const response = await fetchWithAuth(`/admin/users/${userId}/password`, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({password})
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data.detail || "Unable to reset password.");
-      }
-      adminErrorEl.textContent = "";
-      adminCsvStatusEl.textContent = "Password reset. User must change it at next login.";
-      await loadAdminUsers();
-    }
-
-    async function clearAdminUserData(userId, username) {
-      if (!window.confirm(`Clear chat data for ${username}?`)) return;
-
-      const response = await fetchWithAuth(`/admin/users/${userId}/sessions`, {
-        method: "DELETE"
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data.detail || "Unable to clear user data.");
-      }
-      if (userId === state.currentUser?.id) {
-        await loadSessions(true);
-      }
-      await loadAdminUsers();
-    }
-
-    async function deleteAdminUser(userId, username) {
-      if (!window.confirm(`Delete ${username}?`)) return;
-
-      const response = await fetchWithAuth(`/admin/users/${userId}`, {
-        method: "DELETE"
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(data.detail || "Unable to delete user.");
-      }
-      await loadAdminUsers();
-    }
-
-    function renderAdminUsers() {
-      adminUserListEl.innerHTML = "";
-      if (!state.adminUsers.length) {
-        const empty = document.createElement("div");
-        empty.className = "refs-empty";
-        empty.textContent = "No users.";
-        adminUserListEl.appendChild(empty);
-        return;
-      }
-
-      for (const user of state.adminUsers) {
-        const wrapper = document.createElement("div");
-        wrapper.className = "admin-user";
-
-        const main = document.createElement("div");
-        main.className = "admin-user-main";
-
-        const identity = document.createElement("div");
-        const name = document.createElement("div");
-        name.className = "admin-user-name";
-        name.textContent = user.username;
-        const meta = document.createElement("div");
-        meta.className = "admin-user-meta";
-        const metaItems = [
-          `${user.session_count || 0} sessions`,
-          `${user.message_count || 0} messages`
-        ];
-        if (user.must_change_password) {
-          metaItems.push("password change required");
-        }
-        meta.textContent = metaItems.join(" · ");
-        identity.appendChild(name);
-        identity.appendChild(meta);
-
-        const adminLabel = document.createElement("label");
-        adminLabel.className = "checkbox-line";
-        const adminCheckbox = document.createElement("input");
-        adminCheckbox.type = "checkbox";
-        adminCheckbox.checked = Boolean(user.is_admin);
-        adminCheckbox.disabled = user.id === state.currentUser?.id;
-        adminCheckbox.addEventListener("change", async () => {
-          try {
-            await setAdminRole(user.id, adminCheckbox.checked);
-          } catch (error) {
-            adminErrorEl.textContent = error.message;
-            adminCheckbox.checked = Boolean(user.is_admin);
-          }
-        });
-        adminLabel.appendChild(adminCheckbox);
-        adminLabel.appendChild(document.createTextNode("Admin"));
-
-        main.appendChild(identity);
-        main.appendChild(adminLabel);
-
-        const actions = document.createElement("div");
-        actions.className = "admin-actions";
-
-        const resetButton = document.createElement("button");
-        resetButton.type = "button";
-        resetButton.className = "secondary-button";
-        resetButton.textContent = "Reset";
-        resetButton.addEventListener("click", async () => {
-          try {
-            await resetAdminUserPassword(user.id);
-          } catch (error) {
-            adminErrorEl.textContent = error.message;
-          }
-        });
-
-        const clearButton = document.createElement("button");
-        clearButton.type = "button";
-        clearButton.className = "secondary-button";
-        clearButton.textContent = "Clear";
-        clearButton.addEventListener("click", async () => {
-          try {
-            await clearAdminUserData(user.id, user.username);
-          } catch (error) {
-            adminErrorEl.textContent = error.message;
-          }
-        });
-
-        const deleteButton = document.createElement("button");
-        deleteButton.type = "button";
-        deleteButton.className = "secondary-button danger-button";
-        deleteButton.textContent = "Delete";
-        deleteButton.disabled = user.id === state.currentUser?.id;
-        deleteButton.addEventListener("click", async () => {
-          try {
-            await deleteAdminUser(user.id, user.username);
-          } catch (error) {
-            adminErrorEl.textContent = error.message;
-          }
-        });
-
-        actions.appendChild(resetButton);
-        actions.appendChild(clearButton);
-        actions.appendChild(deleteButton);
-
-        wrapper.appendChild(main);
-        wrapper.appendChild(actions);
-        adminUserListEl.appendChild(wrapper);
-      }
-    }
-
-    function escapeHtml(value) {
-      return String(value || "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-    }
-
-    function renderInlineMarkdown(value) {
-      return String(value || "")
-        .split(/(`[^`]+`)/g)
-        .map((part) => {
-          if (part.startsWith("`") && part.endsWith("`")) {
-            return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
-          }
-          return escapeHtml(part)
-            .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-            .replace(/__([^_]+)__/g, "<strong>$1</strong>");
-        })
-        .join("");
-    }
-
-    function renderMarkdown(value) {
-      const lines = String(value || "").replace(/\r\n/g, "\n").split("\n");
-      const html = [];
-      let inCode = false;
-      let codeLines = [];
-      let listType = "";
-
-      const closeList = () => {
-        if (!listType) return;
-        html.push(`</${listType}>`);
-        listType = "";
-      };
-
-      const openList = (type) => {
-        if (listType === type) return;
-        closeList();
-        listType = type;
-        html.push(`<${type}>`);
-      };
-
-      const closeCode = () => {
-        html.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
-        codeLines = [];
-        inCode = false;
-      };
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("```")) {
-          closeList();
-          if (inCode) {
-            closeCode();
-          } else {
-            inCode = true;
-            codeLines = [];
-          }
-          continue;
-        }
-
-        if (inCode) {
-          codeLines.push(line);
-          continue;
-        }
-
-        if (!trimmed) {
-          closeList();
-          continue;
-        }
-
-        const bullet = line.match(/^\s*[-*]\s+(.+)$/);
-        if (bullet) {
-          openList("ul");
-          html.push(`<li>${renderInlineMarkdown(bullet[1])}</li>`);
-          continue;
-        }
-
-        const numbered = line.match(/^\s*\d+\.\s+(.+)$/);
-        if (numbered) {
-          openList("ol");
-          html.push(`<li>${renderInlineMarkdown(numbered[1])}</li>`);
-          continue;
-        }
-
-        closeList();
-        html.push(`<p>${renderInlineMarkdown(line)}</p>`);
-      }
-
-      closeList();
-      if (inCode) closeCode();
-      return html.join("");
-    }
-
-    function renderMessages() {
-      chatLogEl.innerHTML = "";
-
-      if (state.messages.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "empty-state";
-        const title = document.createElement("h2");
-        title.textContent = "Ask against your local knowledge base";
-        const text = document.createElement("p");
-        text.textContent =
-          "The chat keeps recent turns, compacts older context, and retrieves Markdown references for each answer.";
-        empty.appendChild(title);
-        empty.appendChild(text);
-        chatLogEl.appendChild(empty);
-        return;
-      }
-
-      for (const message of state.messages) {
-        const wrapper = document.createElement("article");
-        wrapper.className = `message ${message.role}`;
-
-        const role = document.createElement("div");
-        role.className = "role";
-        role.textContent = message.role === "user" ? "You" : "Assistant";
-
-        const bubble = document.createElement("div");
-        bubble.className = "bubble";
-        if (message.loading) bubble.classList.add("loading");
-        if (message.error) bubble.classList.add("error");
-        if (message.loading || message.error) {
-          bubble.textContent = message.content;
-        } else {
-          bubble.classList.add("markdown");
-          bubble.innerHTML = renderMarkdown(message.content);
-        }
-
-        wrapper.appendChild(role);
-        wrapper.appendChild(bubble);
-
-        if (message.role === "assistant" && !message.loading && !message.error) {
-          wrapper.appendChild(renderRouteMeta(message));
-        }
-
-        if (message.role === "assistant" && message.contexts?.length) {
-          wrapper.appendChild(renderInlineReferences(message.contexts));
-        }
-
-        chatLogEl.appendChild(wrapper);
-      }
-
-      chatLogEl.scrollTop = chatLogEl.scrollHeight;
-    }
-
-    function renderRouteMeta(message) {
-      const meta = document.createElement("div");
-      meta.className = "message-route";
-      const pill = document.createElement("span");
-      pill.className = "route-pill";
-      const mode = message.usedRag ? "RAG" : "Direct";
-      pill.textContent = `${mode} · ${message.route || "unknown"}`;
-      meta.appendChild(pill);
-
-      if (message.routeReason) {
-        meta.appendChild(document.createTextNode(` ${message.routeReason}`));
-      }
-
-      return meta;
-    }
-
-    function renderInlineReferences(contexts) {
-      const container = document.createElement("div");
-      container.className = "message-refs";
-      const details = document.createElement("details");
-      details.open = true;
-      const summary = document.createElement("summary");
-      summary.textContent = `References (${contexts.length})`;
-      details.appendChild(summary);
-
-      for (const item of contexts) {
-        details.appendChild(renderReferenceCard(item, 420));
-      }
-
-      container.appendChild(details);
-      return container;
-    }
-
-    function renderReferences(contexts, usedRag = true) {
-      referenceListEl.innerHTML = "";
-      referenceListEl.className = contexts.length && usedRag ? "" : "refs-empty";
-
-      if (!usedRag) {
-        referenceListEl.textContent = "No retrieval used for this answer.";
-        return;
-      }
-
-      if (!contexts.length) {
-        referenceListEl.textContent = "No references yet.";
-        return;
-      }
-
-      for (const item of contexts) {
-        referenceListEl.appendChild(renderReferenceCard(item, 760));
-      }
-    }
-
-    function renderReferenceCard(item, maxLength) {
-      const wrapper = document.createElement("div");
-      wrapper.className = "ref-card";
-
-      const meta = document.createElement("div");
-      meta.className = "ref-meta";
-
-      const source = document.createElement("div");
-      source.className = "ref-source";
-      const headings = Array.isArray(item.headings) && item.headings.length
-        ? ` · ${item.headings.join(" > ")}`
-        : "";
-      source.textContent =
-        `${item.source} · chunk ${item.chunk_id} · ${item.content_type || "text"}${headings}`;
-
-      const score = document.createElement("div");
-      score.className = "ref-score";
-      if (item.rerank_score !== null && item.rerank_score !== undefined) {
-        score.textContent = `rerank ${Number(item.rerank_score).toFixed(4)}`;
-        score.title = `Vector score ${Number(item.score).toFixed(4)}`;
-      } else {
-        score.textContent = `vector ${Number(item.score).toFixed(4)}`;
-      }
-
-      const text = document.createElement("code");
-      const body = item.text || "";
-      text.textContent =
-        body.length > maxLength ? `${body.slice(0, maxLength)}...` : body;
-
-      meta.appendChild(source);
-      meta.appendChild(score);
-      wrapper.appendChild(meta);
-      wrapper.appendChild(text);
-      return wrapper;
-    }
-
-    function setBusy(isBusy) {
-      state.busy = isBusy;
-      sendButton.disabled = isBusy;
-      sendButton.textContent = isBusy ? "Thinking" : "Send";
-    }
-
-    async function ask(question) {
-      if (!state.activeSessionId) {
-        await createNewSession();
-        if (!state.activeSessionId) return;
-      }
-
-      const userMessage = {role: "user", content: question};
-      const assistantMessage = {
-        role: "assistant",
-        content: "Thinking...",
-        contexts: [],
-        usedRag: false,
-        route: "",
-        routeReason: "",
-        loading: true
-      };
-
-      state.messages.push(userMessage, assistantMessage);
-      renderMessages();
-      renderReferences([]);
-      setBusy(true);
-
-      try {
-        const response = await fetchWithAuth("/rag", {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({
-            question,
-            session_id: state.activeSessionId,
-            recall_top_k: recallTopKEl.value ? Number(recallTopKEl.value) : null,
-            top_k: topKEl.value ? Number(topKEl.value) : null
-          })
-        });
-
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.detail || "Request failed");
-        }
-
-        assistantMessage.content = data.answer;
-        if (data.session_id) {
-          state.activeSessionId = data.session_id;
-        }
-        assistantMessage.contexts = data.contexts || [];
-        assistantMessage.usedRag = Boolean(data.used_rag);
-        assistantMessage.route = data.route || "";
-        assistantMessage.routeReason = data.route_reason || "";
-        assistantMessage.loading = false;
-        state.conversationSummary =
-          data.conversation_summary || state.conversationSummary;
-        state.summarizedMessageCount += data.compacted_history_messages || 0;
-        compactChipEl.hidden = !state.conversationSummary;
-        latestRouteEl.textContent =
-          `${assistantMessage.usedRag ? "RAG" : "Direct"} · ${assistantMessage.route || "unknown"}`;
-        renderReferences(assistantMessage.contexts, assistantMessage.usedRag);
-        await loadSessions(false);
-      } catch (error) {
-        assistantMessage.content = error.message;
-        assistantMessage.loading = false;
-        assistantMessage.error = true;
-      } finally {
-        setBusy(false);
-        renderMessages();
-      }
-    }
-
-    composerEl.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const question = promptEl.value.trim();
-      if (!question || state.busy) return;
-      promptEl.value = "";
-      ask(question);
-    });
-
-    promptEl.addEventListener("keydown", (event) => {
-      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-        composerEl.requestSubmit();
-      }
-    });
-
-    loginFormEl.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const username = loginUsernameEl.value.trim();
-      const password = loginPasswordEl.value;
-      if (!username || !password) {
-        loginErrorEl.textContent = "Username and password are required.";
-        return;
-      }
-      login(username, password);
-    });
-
-    logoutButtonEl.addEventListener("click", () => {
-      logout();
-    });
-
-    adminLogoutButtonEl.addEventListener("click", () => {
-      logout();
-    });
-
-    passwordLogoutButtonEl.addEventListener("click", () => {
-      logout();
-    });
-
-    changePasswordButtonEl.addEventListener("click", () => {
-      openPasswordChange();
-    });
-
-    passwordCancelButtonEl.addEventListener("click", () => {
-      closePasswordChange();
-    });
-
-    passwordChangeFormEl.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const currentPassword = passwordCurrentEl.value;
-      const newPassword = passwordNewEl.value;
-      if (!currentPassword || !newPassword) {
-        passwordChangeErrorEl.textContent =
-          "Current password and new password are required.";
-        return;
-      }
-      changePassword(currentPassword, newPassword);
-    });
-
-    adminDashboardButtonEl.addEventListener("click", () => {
-      showAdminDashboard();
-    });
-
-    adminChangePasswordButtonEl.addEventListener("click", () => {
-      openPasswordChange();
-    });
-
-    backToChatButtonEl.addEventListener("click", () => {
-      showChat();
-    });
-
-    newSessionButtonEl.addEventListener("click", () => {
-      createNewSession();
-    });
-
-    adminRefreshButtonEl.addEventListener("click", () => {
-      loadAdminUsers();
-    });
-
-    adminCreateFormEl.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const username = adminNewUsernameEl.value.trim();
-      const password = adminNewPasswordEl.value;
-      const isAdmin = adminNewIsAdminEl.checked;
-      if (!username || !password) {
-        adminErrorEl.textContent = "Username and password are required.";
-        return;
-      }
-
-      try {
-        await createAdminUser(username, password, isAdmin);
-      } catch (error) {
-        adminErrorEl.textContent = error.message;
-      }
-    });
-
-    adminCsvFormEl.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      adminErrorEl.textContent = "";
-      adminCsvStatusEl.textContent = "";
-
-      try {
-        await importAdminUsersCsv(adminCsvFileEl.files[0]);
-      } catch (error) {
-        adminErrorEl.textContent = error.message;
-      }
-    });
-
-    clearButton.addEventListener("click", async () => {
-      if (state.activeSessionId) {
-        await fetchWithAuth(`/sessions/${state.activeSessionId}`, {
-          method: "DELETE"
-        });
-      }
-      await createNewSession();
-    });
-
-    renderMessages();
-    restoreAuthSession();
-  </script>
+  <script type="module" src="/static/js/main.js"></script>
 </body>
 </html>

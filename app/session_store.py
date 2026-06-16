@@ -639,6 +639,34 @@ class SessionStore:
             ).fetchone()
         return chat_session_from_row(row) if row else None
 
+    def rename_chat_session(
+        self,
+        user_id: UUID,
+        session_id: UUID,
+        title: str,
+    ) -> ChatSessionRecord | None:
+        clean_title = clean_session_title(
+            title,
+            self.config.session_title_max_chars,
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE chat_sessions
+                SET title = %s
+                WHERE id = %s AND user_id = %s
+                RETURNING id,
+                          user_id,
+                          title,
+                          conversation_summary,
+                          compacted_message_count,
+                          created_at,
+                          updated_at
+                """,
+                (clean_title, session_id, user_id),
+            ).fetchone()
+        return chat_session_from_row(row) if row else None
+
     def delete_chat_session(self, user_id: UUID, session_id: UUID) -> bool:
         with self._connect() as conn:
             result = conn.execute(
