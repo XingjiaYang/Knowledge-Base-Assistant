@@ -65,7 +65,9 @@ Answer + retrieved references + compacted conversation memory
 Main modules:
 
 - `app/main.py`: FastAPI routes, health check, and static UI serving.
-- `app/static/index.html`: browser chat interface.
+- `app/static/`: browser chat UI — `index.html` shell, `css/styles.css`, and
+  ES modules under `js/` (`store`, `api`, `dom`, `markdown`, and `views/`).
+  Served directly by FastAPI with no build step.
 - `app/session_store.py`: PostgreSQL-backed users, login tokens, chat sessions,
   messages, and compacted conversation summaries.
 - `app/intent_router.py`: keyword, embedding, and LLM fallback routing.

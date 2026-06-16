@@ -12,6 +12,7 @@ from uuid import UUID
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from qdrant_client.http.exceptions import UnexpectedResponse
 
@@ -85,6 +86,10 @@ INDEX_HTML = (
     if INDEX_HTML_PATH.exists()
     else INDEX_HTML_FALLBACK
 )
+
+STATIC_DIR = INDEX_HTML_PATH.parent
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 class ChatMessageRequest(BaseModel):
@@ -248,6 +253,14 @@ class AdminUsersCsvImportRequest(BaseModel):
 class AdminUsersCsvImportResponse(BaseModel):
     created: int
     users: list[AdminUserResponse]
+
+
+class SessionRenameRequest(BaseModel):
+    title: str = Field(
+        ...,
+        min_length=1,
+        max_length=settings.session_title_max_chars,
+    )
 
 
 class SessionSummaryResponse(BaseModel):
@@ -604,6 +617,24 @@ async def get_session(
 
     messages = await asyncio.to_thread(session_store.list_messages, session.id)
     return SessionDetailResponse.from_session_detail(session, messages)
+
+
+@app.patch("/sessions/{session_id}", response_model=SessionSummaryResponse)
+async def rename_session(
+    session_id: UUID,
+    request: Request,
+    rename_request: SessionRenameRequest,
+    user: Annotated[CurrentUser, Depends(require_password_ready_user)],
+) -> SessionSummaryResponse:
+    session = await asyncio.to_thread(
+        _session_store(request).rename_chat_session,
+        user.id,
+        session_id,
+        rename_request.title,
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return SessionSummaryResponse.from_session(session)
 
 
 @app.delete("/sessions/{session_id}")
