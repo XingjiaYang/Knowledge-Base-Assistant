@@ -8,11 +8,12 @@ configurable LLM provider.
 
 - `app/`: application code. `main.py` exposes the FastAPI app and routes,
   `static/` contains the browser UI, `intent_router.py` chooses RAG vs direct
-  chat, `rag.py` coordinates retrieval, prompts, generation, and history
-  compaction, `vector_store.py` manages Markdown chunking and Qdrant,
-  `session_store.py` manages PostgreSQL-backed users, auth sessions, chat
-  sessions, messages, and summaries, `llm_client.py` calls cloud or local LLM
-  APIs, and `config.py` reads environment settings.
+  chat, `rag.py` coordinates recall, reranking, prompts, generation, and
+  history compaction, `reranker.py` loads and runs the Jina cross-encoder,
+  `vector_store.py` manages Markdown chunking and Qdrant, `session_store.py`
+  manages PostgreSQL-backed users, auth sessions, chat sessions, messages, and
+  summaries, `llm_client.py` calls cloud or local LLM APIs, and `config.py`
+  reads environment settings.
 - `scripts/`: operational and smoke-test scripts for local services,
   ingestion, retrieval, routing, prompt budgeting, settings, and session
   helpers.
@@ -52,6 +53,8 @@ configurable LLM provider.
   behavior without a live PostgreSQL service.
 - `python scripts/test_intent_router.py`: smoke-test routing for RAG vs
   direct-chat questions.
+- `python scripts/test_reranker.py`: smoke-test cross-encoder reranker ordering
+  with a fake model.
 - `python scripts/test_prompt_budget.py`: validate prompt trimming, query
   budgets, and history compaction behavior.
 - `python scripts/test_settings.py`: validate configuration wiring, auth gates,
@@ -112,3 +115,10 @@ features.
 
 For restricted networks, configure runtime proxy or mirror values in `.env`.
 Docker daemon proxy settings only affect image pulls, not running containers.
+
+RAG retrieval is two-stage when reranking is enabled: Qdrant recalls
+`RECALL_TOP_K` candidates, `jinaai/jina-reranker-v3` reranks them through its
+native `AutoModel.rerank()` interface, and only `RETRIEVE_TOP_K` chunks enter
+the prompt. The API preloads and warms the reranker during startup by default
+with `RERANKER_PRELOAD=1`; keep Hugging Face cache, mirror, or proxy settings
+ready before rebuilding containers.

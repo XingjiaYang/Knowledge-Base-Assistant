@@ -18,6 +18,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from app.config import settings
 from app.llm_client import LLMClient
 from app.rag import RAGPipeline
+from app.reranker import Reranker
 from app.security import bearer_token
 from app.session_store import (
     ChatSessionRecord,
@@ -37,11 +38,15 @@ async def lifespan(_app: FastAPI):
     _app.state.vector_store = VectorStore(settings)
     _app.state.llm_client = LLMClient(settings)
     _app.state.session_store = SessionStore(settings)
+    _app.state.reranker = Reranker(settings)
+    if settings.reranker_enabled and settings.reranker_preload:
+        await asyncio.to_thread(_app.state.reranker.warmup)
     await asyncio.to_thread(_app.state.session_store.init_db)
     _app.state.rag_pipeline = RAGPipeline(
         settings,
         vector_store=_app.state.vector_store,
         llm_client=_app.state.llm_client,
+        reranker=_app.state.reranker,
     )
     try:
         yield
@@ -99,6 +104,11 @@ class RAGRequest(BaseModel):
     )
     session_id: UUID | None = None
     top_k: int | None = Field(default=None, ge=1, le=settings.api_top_k_max)
+    recall_top_k: int | None = Field(
+        default=None,
+        ge=1,
+        le=settings.api_recall_top_k_max,
+    )
     history: list[ChatMessageRequest] = Field(
         default_factory=list,
         max_length=settings.api_history_max_messages,
@@ -114,6 +124,7 @@ class ContextResponse(BaseModel):
     source: str
     chunk_id: int
     score: float
+    rerank_score: float | None = None
     content_type: str
     h1: str
     h2: str
@@ -129,6 +140,7 @@ class ContextResponse(BaseModel):
             source=result.source,
             chunk_id=result.chunk_id,
             score=result.score,
+            rerank_score=result.rerank_score,
             content_type=result.content_type,
             h1=result.h1,
             h2=result.h2,
@@ -625,10 +637,15 @@ async def health_details(request: Request) -> dict[str, object]:
         "llm_base_url": settings.llm_base_url,
         "llm_model": settings.llm_model,
         "llm_max_tokens": settings.llm_max_tokens,
+        "recall_top_k": settings.recall_top_k,
         "retrieve_top_k": settings.retrieve_top_k,
         "retrieve_score_threshold": settings.retrieve_score_threshold,
         "history_recent_turns": settings.history_recent_turns,
         "api_top_k_max": settings.api_top_k_max,
+        "api_recall_top_k_max": settings.api_recall_top_k_max,
+        "reranker_enabled": settings.reranker_enabled,
+        "reranker_preload": settings.reranker_preload,
+        "reranker_model": settings.reranker_model,
         "intent_router": settings.intent_router_enabled,
         "auth_enabled": True,
     }
@@ -661,6 +678,7 @@ async def rag(
             http_request.app.state.rag_pipeline.answer,
             rag_request.question,
             top_k=rag_request.top_k,
+            recall_top_k=rag_request.recall_top_k,
             history=history,
             conversation_summary=conversation_summary,
         )

@@ -23,14 +23,23 @@ from app.session_store import ChatSessionRecord, CurrentUser
 def assert_api_limits() -> None:
     config = Settings(
         api_top_k_max=9,
+        api_recall_top_k_max=321,
         api_message_max_chars=123,
         api_question_max_chars=456,
         api_summary_max_chars=789,
         api_history_max_messages=10,
+        recall_top_k=200,
+        retrieve_top_k=5,
     )
 
     if config.api_top_k_max != 9:
         raise AssertionError("API top_k max should be configurable.")
+    if config.api_recall_top_k_max != 321:
+        raise AssertionError("API recall top_k max should be configurable.")
+    if config.recall_top_k != 200:
+        raise AssertionError("Recall top_k should be configurable.")
+    if config.retrieve_top_k != 5:
+        raise AssertionError("Final top_k should be configurable.")
     if config.api_message_max_chars != 123:
         raise AssertionError("API message char limit should be configurable.")
     if config.api_question_max_chars != 456:
@@ -57,6 +66,10 @@ def assert_llm_settings() -> None:
         llm_retry_backoff_max_seconds=4.0,
         retrieve_score_threshold=0.42,
         intent_embedding_rag_threshold=0.55,
+        reranker_model="jinaai/jina-reranker-v3",
+        reranker_preload=True,
+        reranker_dtype="auto",
+        reranker_max_documents_per_call=32,
     )
 
     if config.llm_provider != "anthropic":
@@ -77,6 +90,14 @@ def assert_llm_settings() -> None:
         raise AssertionError("LLM retry max backoff should be configurable.")
     if config.retrieve_score_threshold != 0.42:
         raise AssertionError("Retrieval score threshold should be configurable.")
+    if config.reranker_model != "jinaai/jina-reranker-v3":
+        raise AssertionError("Reranker model should be configurable.")
+    if not config.reranker_preload:
+        raise AssertionError("Reranker preload should be configurable.")
+    if config.reranker_dtype != "auto":
+        raise AssertionError("Reranker dtype should be configurable.")
+    if config.reranker_max_documents_per_call != 32:
+        raise AssertionError("Reranker per-call document limit should be configurable.")
 
     print("LLM settings -> ok")
 
@@ -341,12 +362,14 @@ def assert_rag_endpoint_accepts_original_body_shape() -> None:
     request = RAGRequest(
         question="Hello",
         top_k=1,
+        recall_top_k=10,
         history=[],
         conversation_summary="",
     )
     if (
         request.question != "Hello"
         or request.top_k != 1
+        or request.recall_top_k != 10
         or request.history != []
         or request.conversation_summary != ""
     ):
@@ -446,7 +469,12 @@ def assert_invalid_settings_rejected() -> None:
             "llm_retry_backoff_max_seconds": 1.0,
         },
         {"api_top_k_max": 0},
+        {"api_recall_top_k_max": 0},
         {"retrieve_score_threshold": -0.1},
+        {"recall_top_k": 0},
+        {"reranker_model": ""},
+        {"reranker_dtype": ""},
+        {"reranker_max_documents_per_call": 0},
     ]
     for kwargs in invalid_configs:
         try:

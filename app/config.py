@@ -37,9 +37,23 @@ class Settings:
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
     chunk_size: int = _env_int("CHUNK_SIZE", 800)
     chunk_overlap: int = _env_int("CHUNK_OVERLAP", 120)
-    retrieve_top_k: int = _env_int("RETRIEVE_TOP_K", 4)
+    recall_top_k: int = _env_int("RECALL_TOP_K", 200)
+    retrieve_top_k: int = _env_int("RETRIEVE_TOP_K", 5)
     retrieve_score_threshold: float = _env_float("RETRIEVE_SCORE_THRESHOLD", 0.0)
     api_top_k_max: int = _env_int("API_TOP_K_MAX", 20)
+    api_recall_top_k_max: int = _env_int("API_RECALL_TOP_K_MAX", 1000)
+    reranker_enabled: bool = _env_bool("RERANKER_ENABLED", True)
+    reranker_model: str = os.getenv("RERANKER_MODEL", "jinaai/jina-reranker-v3")
+    reranker_preload: bool = _env_bool("RERANKER_PRELOAD", True)
+    reranker_trust_remote_code: bool = _env_bool(
+        "RERANKER_TRUST_REMOTE_CODE",
+        True,
+    )
+    reranker_dtype: str = os.getenv("RERANKER_DTYPE", "auto")
+    reranker_max_documents_per_call: int = _env_int(
+        "RERANKER_MAX_DOCUMENTS_PER_CALL",
+        64,
+    )
 
     llm_provider: str = os.getenv("LLM_PROVIDER", "openai_compatible")
     llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
@@ -148,12 +162,24 @@ class Settings:
             raise ValueError("CHUNK_OVERLAP must leave room for new chunk content.")
         if self.retrieve_top_k <= 0:
             raise ValueError("RETRIEVE_TOP_K must be greater than 0.")
+        if self.recall_top_k <= 0:
+            raise ValueError("RECALL_TOP_K must be greater than 0.")
         if self.retrieve_score_threshold < 0:
             raise ValueError(
                 "RETRIEVE_SCORE_THRESHOLD must be greater than or equal to 0."
             )
         if self.api_top_k_max <= 0:
             raise ValueError("API_TOP_K_MAX must be greater than 0.")
+        if self.api_recall_top_k_max <= 0:
+            raise ValueError("API_RECALL_TOP_K_MAX must be greater than 0.")
+        if not self.reranker_model.strip():
+            raise ValueError("RERANKER_MODEL must not be empty.")
+        if not self.reranker_dtype.strip():
+            raise ValueError("RERANKER_DTYPE must not be empty.")
+        if self.reranker_max_documents_per_call <= 0:
+            raise ValueError(
+                "RERANKER_MAX_DOCUMENTS_PER_CALL must be greater than 0."
+            )
         if self.llm_timeout_seconds <= 0:
             raise ValueError("LLM_TIMEOUT_SECONDS must be greater than 0.")
         if self.llm_retry_attempts <= 0:

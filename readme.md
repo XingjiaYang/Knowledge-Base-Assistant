@@ -23,7 +23,7 @@ files under `data/docs/` and rebuild the Qdrant collection to use another domain
 - Docker Compose deployment for PostgreSQL, Qdrant, document ingestion, and FastAPI.
 - Configurable cloud LLM providers with an optional local vLLM profile.
 - Replaceable Markdown corpus without domain-specific routing code.
-- Chat-style web UI at `/` with adjustable `top_k` retrieval.
+- Chat-style web UI at `/` with adjustable recall and reranked context counts.
 - Required account login with PostgreSQL-backed chat sessions per user and an
   admin UI for user/data management.
 - Admin CSV import for batch user creation with strict `email,passwd` format
@@ -50,7 +50,8 @@ IntentRouter
    |-- configured LLM zero-shot fallback for ambiguous cases
    |
 RAGPipeline or Direct Chat
-   |-- optional SentenceTransformers -> Qdrant vector search
+   |-- optional SentenceTransformers -> Qdrant vector recall
+   |-- optional Jina cross-encoder reranking
    |-- OpenAI-compatible or Anthropic LLM API
    |
 Answer + retrieved references + compacted conversation memory
@@ -63,7 +64,9 @@ Main modules:
 - `app/session_store.py`: PostgreSQL-backed users, login tokens, chat sessions,
   messages, and compacted conversation summaries.
 - `app/intent_router.py`: keyword, embedding, and LLM fallback routing.
-- `app/rag.py`: retrieval, prompt construction, and history compaction.
+- `app/rag.py`: recall, reranking, prompt construction, and history compaction.
+- `app/reranker.py`: startup-preloaded Jina cross-encoder reranking for
+  recalled chunks.
 - `app/vector_store.py`: Markdown chunking, embeddings, Qdrant collection
   management, and search.
 - `app/llm_client.py`: provider-aware client for cloud APIs or local vLLM.
@@ -215,6 +218,7 @@ LLM_HEALTH_CHECK_ENABLED=0
 LLM_HEALTH_PATH=
 
 API_TOP_K_MAX=20
+API_RECALL_TOP_K_MAX=1000
 API_MESSAGE_MAX_CHARS=16000
 API_QUESTION_MAX_CHARS=16000
 API_SUMMARY_MAX_CHARS=12000
@@ -234,10 +238,17 @@ SESSION_TITLE_MAX_CHARS=80
 
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 QDRANT_COLLECTION=tech_docs
-RETRIEVE_TOP_K=4
+RECALL_TOP_K=200
+RETRIEVE_TOP_K=5
 RETRIEVE_SCORE_THRESHOLD=0
 CHUNK_SIZE=800
 CHUNK_OVERLAP=120
+RERANKER_ENABLED=1
+RERANKER_MODEL=jinaai/jina-reranker-v3
+RERANKER_PRELOAD=1
+RERANKER_TRUST_REMOTE_CODE=1
+RERANKER_DTYPE=auto
+RERANKER_MAX_DOCUMENTS_PER_CALL=64
 
 HISTORY_RECENT_TURNS=16
 HISTORY_COMPACT_AFTER_TURNS=40
@@ -274,8 +285,18 @@ LLM chat requests retry transient provider errors (`429`, `502`, `503`, `504`)
 with exponential backoff. Keep `DEBUG=0` outside local development so API errors
 return generic messages while details stay in server logs.
 
-Set `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector results
-before they enter the LLM prompt.
+When intent routing chooses RAG, the pipeline first recalls `RECALL_TOP_K`
+chunks from Qdrant, reranks those candidates with the multilingual
+`jinaai/jina-reranker-v3` cross-encoder, then keeps `RETRIEVE_TOP_K` chunks for
+the LLM prompt and response references. The browser UI exposes both values as
+`Recall K` and `Rerank K`; defaults are `200` and `5`. Set
+`RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector results before
+reranking. With `RERANKER_PRELOAD=1`, the API loads and warms the reranker
+during startup through Jina's native `AutoModel.rerank()` interface, so model
+download or load failures happen before the service accepts requests.
+`jina-reranker-v3` is a listwise reranker, so candidates are reranked in
+batches of `RERANKER_MAX_DOCUMENTS_PER_CALL` when recall returns more than the
+model should process in one call.
 
 Account login and PostgreSQL-backed sessions are always enabled. By default,
 startup creates an administrator account if it does not already exist:
@@ -401,15 +422,17 @@ curl http://localhost:8080/rag \
   -d "{
     \"session_id\": \"${SESSION_ID}\",
     \"question\": \"When should I choose DuckDB over ClickHouse?\",
-    \"top_k\": 4
+    \"recall_top_k\": 200,
+    \"top_k\": 5
   }"
 ```
 
 Response fields:
 
 - `answer`: generated response.
-- `contexts`: retrieved chunks with `source`, `chunk_id`, `score`,
-  `content_type`, `headings`, line bounds, and `h1`/`h2`/`h3` metadata.
+- `contexts`: reranked chunks with `source`, `chunk_id`, vector `score`,
+  optional `rerank_score`, `content_type`, `headings`, line bounds, and
+  `h1`/`h2`/`h3` metadata.
 - `conversation_summary`: compact memory for future turns.
 - `compacted_history_messages`: number of old messages merged into memory.
 - `used_rag`: whether Qdrant retrieval was used for this answer.
@@ -477,6 +500,12 @@ Smoke-test intent routing:
 
 ```bash
 python scripts/test_intent_router.py
+```
+
+Smoke-test cross-encoder reranker ordering with a fake model:
+
+```bash
+python scripts/test_reranker.py
 ```
 
 Smoke-test prompt budgeting and history trimming:
