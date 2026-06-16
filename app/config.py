@@ -30,6 +30,7 @@ def _env_bool(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class Settings:
     debug: bool = _env_bool("DEBUG", False)
+    cuda_enabled: bool = _env_bool("CUDA", True)
 
     docs_dir: Path = PROJECT_ROOT / "data" / "docs"
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")

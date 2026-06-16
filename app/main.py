@@ -637,6 +637,7 @@ async def health_details(request: Request) -> dict[str, object]:
         "llm_base_url": settings.llm_base_url,
         "llm_model": settings.llm_model,
         "llm_max_tokens": settings.llm_max_tokens,
+        "cuda_enabled": settings.cuda_enabled,
         "recall_top_k": settings.recall_top_k,
         "retrieve_top_k": settings.retrieve_top_k,
         "retrieve_score_threshold": settings.retrieve_score_threshold,

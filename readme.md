@@ -84,8 +84,8 @@ This repository is intended to be pushed without local runtime state. The
 committed project should include:
 
 - Source code under `app/`, `scripts/`, and `docker/`.
-- Deployment files: `Dockerfile`, `compose.yaml`, `.env.example`, and
-  dependency files.
+- Deployment files: `Dockerfile`, `compose.yaml`, `compose.cpu.yaml`,
+  `.env.example`, and dependency files.
 - Markdown corpus files under `data/docs/`.
 - Contributor/project docs such as `readme.md` and `AGENTS.md`.
 
@@ -99,8 +99,10 @@ Prerequisites:
 
 - Docker with Compose v2.
 - A cloud LLM API key for the default cloud-backed setup.
-- Optional: NVIDIA Container Toolkit and enough GPU memory if you run the local
-  vLLM profile.
+- Optional: a compatible NVIDIA GPU, current NVIDIA driver, and NVIDIA
+  Container Toolkit if you want Docker containers to use CUDA. Very old GPUs
+  may not support the PyTorch/Transformers CUDA build used by the embedding
+  model, reranker, or local vLLM profile.
 
 Create local settings:
 
@@ -206,6 +208,7 @@ Common settings from `.env.example`:
 
 ```bash
 DEBUG=0
+CUDA=TRUE
 QDRANT_IMAGE=qdrant/qdrant:v1.18.1
 
 LLM_PROVIDER=openai_compatible
@@ -296,12 +299,41 @@ chunks from Qdrant, reranks those candidates with the multilingual
 the LLM prompt and response references. The browser UI exposes both values as
 `Recall K` and `Rerank K`; defaults are `200` and `5`. Set
 `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector results before
-reranking. With `RERANKER_PRELOAD=1`, the API loads and warms the reranker
-during startup through Jina's native `AutoModel.rerank()` interface, so model
-download or load failures happen before the service accepts requests.
+reranking. With `CUDA=TRUE` (the default), the BGE embedding model and Jina
+reranker prefer CUDA when PyTorch can see a compatible NVIDIA GPU; if CUDA is
+not visible or model placement fails, they log the fallback and continue on
+CPU. Set `CUDA=FALSE` to force CPU. With `RERANKER_PRELOAD=1`, the API loads
+and warms the reranker during startup through Jina's native
+`AutoModel.rerank()` interface, so model download or load failures happen
+before the service accepts requests.
 `jina-reranker-v3` is a listwise reranker, so candidates are reranked in
 batches of `RERANKER_MAX_DOCUMENTS_PER_CALL` when recall returns more than the
 model should process in one call.
+
+The default Compose configuration exposes all visible NVIDIA GPUs to the API
+container with `gpus: all`, so a plain startup uses CUDA when Docker can provide
+GPU devices:
+
+```bash
+docker compose up --build
+```
+
+For a portable startup that tries GPU first and retries on CPU if Docker rejects
+GPU device allocation, use the wrapper:
+
+```bash
+scripts/compose_up.sh up --build
+```
+
+On machines where you want to force CPU from the start, use the CPU override:
+
+```bash
+CUDA=FALSE docker compose -f compose.yaml -f compose.cpu.yaml up --build
+```
+
+If Docker exposes GPU devices but PyTorch cannot use them, or the GPU
+architecture is too old for the installed CUDA/PyTorch build, the application
+falls back to CPU after it starts.
 
 Account login and PostgreSQL-backed sessions are always enabled. By default,
 startup creates an administrator account if it does not already exist:

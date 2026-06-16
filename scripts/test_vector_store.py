@@ -35,6 +35,28 @@ class FakeEmbeddingModel:
         return np.asarray([[1.0, 0.0] for _ in texts], dtype=np.float32)
 
 
+class FakeRuntimeCudaEmbeddingModel(FakeEmbeddingModel):
+    def __init__(self, device: str = "cpu") -> None:
+        self.device = device
+        self.devices = [device]
+        self.calls = 0
+
+    def to(self, device: str) -> "FakeRuntimeCudaEmbeddingModel":
+        self.device = device
+        self.devices.append(device)
+        return self
+
+    def encode(
+        self,
+        texts: str | list[str],
+        normalize_embeddings: bool = True,
+    ) -> np.ndarray:
+        self.calls += 1
+        if self.device == "cuda":
+            raise RuntimeError("CUDA encode failed")
+        return super().encode(texts, normalize_embeddings=normalize_embeddings)
+
+
 class CountingQdrantClient(QdrantClient):
     def __init__(self) -> None:
         super().__init__(":memory:")
@@ -220,6 +242,59 @@ def assert_vector_store_lazy_loads_once_under_concurrency() -> None:
     print("VectorStore concurrent lazy loading -> ok")
 
 
+def assert_embedding_model_respects_cpu_override() -> None:
+    original_sentence_transformer = vector_store_module.SentenceTransformer
+    calls: list[dict[str, object]] = []
+
+    def fake_sentence_transformer(*args: object, **kwargs: object) -> FakeEmbeddingModel:
+        calls.append(dict(kwargs))
+        return FakeEmbeddingModel()
+
+    try:
+        vector_store_module.SentenceTransformer = fake_sentence_transformer
+        store = VectorStore(Settings(cuda_enabled=False))
+        _ = store.model
+    finally:
+        vector_store_module.SentenceTransformer = original_sentence_transformer
+
+    if calls != [{"device": "cpu"}]:
+        raise AssertionError(f"Embedding model should load on CPU override: {calls}")
+
+    print("Embedding model CPU override -> ok")
+
+
+def assert_embedding_encode_falls_back_to_cpu_on_cuda_failure() -> None:
+    original_sentence_transformer = vector_store_module.SentenceTransformer
+    original_preferred_device = vector_store_module.preferred_torch_device
+    models: list[FakeRuntimeCudaEmbeddingModel] = []
+
+    def fake_sentence_transformer(
+        *args: object,
+        **kwargs: object,
+    ) -> FakeRuntimeCudaEmbeddingModel:
+        model = FakeRuntimeCudaEmbeddingModel(device=str(kwargs.get("device", "cpu")))
+        models.append(model)
+        return model
+
+    try:
+        vector_store_module.SentenceTransformer = fake_sentence_transformer
+        vector_store_module.preferred_torch_device = lambda *_args: "cuda"
+        store = VectorStore(Settings())
+        embedding = store.encode("query")
+    finally:
+        vector_store_module.preferred_torch_device = original_preferred_device
+        vector_store_module.SentenceTransformer = original_sentence_transformer
+
+    if np.asarray(embedding).tolist() != [1.0, 0.0]:
+        raise AssertionError("Embedding encode should retry successfully on CPU.")
+    if models[0].devices != ["cuda", "cpu"]:
+        raise AssertionError("Embedding model should move to CPU after CUDA failure.")
+    if models[0].calls != 2:
+        raise AssertionError("Embedding encode should retry exactly once.")
+
+    print("Embedding CUDA encode fallback -> ok")
+
+
 def assert_collection_setup_avoids_redundant_indexes() -> None:
     client = CountingQdrantClient()
     config = Settings(collection_name="index-test")
@@ -332,6 +407,8 @@ def assert_search_score_threshold() -> None:
 def main() -> None:
     assert_vector_store_lazy_loads_dependencies()
     assert_vector_store_lazy_loads_once_under_concurrency()
+    assert_embedding_model_respects_cpu_override()
+    assert_embedding_encode_falls_back_to_cpu_on_cuda_failure()
     assert_collection_setup_avoids_redundant_indexes()
     assert_ingest_streams_files_and_skips_recreate_deletes()
     assert_search_score_threshold()
