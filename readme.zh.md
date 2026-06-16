@@ -23,7 +23,7 @@ profile 保留。
 - 管理员可以上传 CSV 批量创建用户；CSV 必须只有两列，表头必须为 `email,passwd`。
 - 支持 OpenAI-compatible、Anthropic 和可选本地 vLLM。
 - Markdown 语料可替换，检索逻辑不依赖具体业务领域。
-- 前端支持多会话、`top_k` 调整、引用展示和路由结果展示。
+- 前端支持多会话、召回数量和重排后引用数量调整、引用展示和路由结果展示。
 - 对话历史保存在后端，旧消息会压缩成 summary 后继续参与后续回答。
 - 支持 Hugging Face cache、离线模型目录、镜像和容器运行时代理配置。
 
@@ -41,7 +41,8 @@ IntentRouter
    |-- configured LLM zero-shot fallback for ambiguous cases
    |
 RAGPipeline or Direct Chat
-   |-- optional SentenceTransformers -> Qdrant vector search
+   |-- optional SentenceTransformers -> Qdrant vector recall
+   |-- optional Jina cross-encoder reranking
    |-- OpenAI-compatible or Anthropic LLM API
    |
 Answer + retrieved references + compacted conversation memory
@@ -53,7 +54,8 @@ Answer + retrieved references + compacted conversation memory
 - `app/static/index.html`：浏览器聊天界面和管理员界面。
 - `app/session_store.py`：PostgreSQL 用户、登录 token、会话、消息和 summary。
 - `app/intent_router.py`：关键词、embedding 和 LLM fallback 意图路由。
-- `app/rag.py`：检索、prompt 构造、历史压缩。
+- `app/rag.py`：召回、重排、prompt 构造、历史压缩。
+- `app/reranker.py`：启动时预加载 Jina cross-encoder，并对召回 chunk 重排。
 - `app/vector_store.py`：Markdown 切块、embedding、Qdrant collection 管理和搜索。
 - `app/llm_client.py`：不同 LLM provider 的请求封装。
 - `scripts/`：ingest、服务启动和 smoke test 脚本。
@@ -164,14 +166,31 @@ AUTH_BOOTSTRAP_USERS=
 
 QDRANT_COLLECTION=tech_docs
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
-RETRIEVE_TOP_K=4
+RECALL_TOP_K=200
+RETRIEVE_TOP_K=5
 CHUNK_SIZE=800
 CHUNK_OVERLAP=120
+RERANKER_ENABLED=1
+RERANKER_MODEL=jinaai/jina-reranker-v3
+RERANKER_PRELOAD=1
+RERANKER_TRUST_REMOTE_CODE=1
+RERANKER_DTYPE=auto
+RERANKER_MAX_DOCUMENTS_PER_CALL=64
 
 INGEST_ON_STARTUP=1
 RECREATE_COLLECTION=0
 WAIT_FOR_LLM=0
 ```
+
+当意图路由判断需要 RAG 时，系统会先从 Qdrant 召回 `RECALL_TOP_K`
+个候选 chunk，再使用多语言 `jinaai/jina-reranker-v3` cross-encoder
+重排，最后只保留 `RETRIEVE_TOP_K` 个 chunk 进入 LLM prompt 和引用列表。
+前端对应控件为 `Recall K` 和 `Rerank K`，默认分别为 `200` 和 `5`。
+`RERANKER_PRELOAD=1` 时 API 会在启动阶段加载并预热 reranker，模型下载或加载
+错误会在服务接受请求前暴露，而不是第一次用户提问时才失败。代码使用 Jina
+模型原生的 `AutoModel.rerank()` 接口执行重排。
+`jina-reranker-v3` 是 listwise reranker；召回数量超过
+`RERANKER_MAX_DOCUMENTS_PER_CALL` 时会分批重排，再按分数全局排序。
 
 `LLM_PROVIDER=openai_compatible` 适用于 OpenAI-compatible 云端 API 和本地 vLLM。
 Anthropic 使用：
@@ -244,7 +263,8 @@ curl http://localhost:8080/rag \
   -d "{
     \"session_id\": \"${SESSION_ID}\",
     \"question\": \"When should I choose DuckDB over ClickHouse?\",
-    \"top_k\": 4
+    \"recall_top_k\": 200,
+    \"top_k\": 5
   }"
 ```
 
@@ -277,6 +297,7 @@ python scripts/test_session_store.py
 python scripts/test_prompt_budget.py
 python scripts/test_chunking.py
 python scripts/test_intent_router.py
+python scripts/test_reranker.py
 python scripts/test_vector_store.py
 ```
 

@@ -36,6 +36,7 @@ class SearchResult:
     source: str
     chunk_id: int
     score: float
+    rerank_score: float | None = None
     content_type: str = "text"
     h1: str = ""
     h2: str = ""

@@ -27,15 +27,29 @@ class FakeVectorStore:
 
     def __init__(self) -> None:
         self.search_calls = 0
+        self.search_top_ks: list[int | None] = []
 
     def search(self, query: str, top_k: int | None = None) -> list[SearchResult]:
         self.search_calls += 1
+        self.search_top_ks.append(top_k)
         return [
             SearchResult(
                 text="New employees request equipment through the IT portal.",
                 source="data/docs/onboarding.md",
                 chunk_id=0,
                 score=0.9,
+            ),
+            SearchResult(
+                text="Managers approve equipment requests within two business days.",
+                source="data/docs/onboarding.md",
+                chunk_id=1,
+                score=0.8,
+            ),
+            SearchResult(
+                text="Finance handles laptop budget exceptions.",
+                source="data/docs/onboarding.md",
+                chunk_id=2,
+                score=0.7,
             )
         ]
 
@@ -49,6 +63,20 @@ class FakeLLMClient:
         max_tokens: int | None = None,
     ) -> str:
         return "ok"
+
+
+class FakeReranker:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int, int | None]] = []
+
+    def rerank(
+        self,
+        query: str,
+        contexts: list[SearchResult],
+        top_k: int | None = None,
+    ) -> list[SearchResult]:
+        self.calls.append((query, len(contexts), top_k))
+        return list(reversed(contexts))[:top_k or len(contexts)]
 
 
 class FakeClassifierLLM:
@@ -146,21 +174,29 @@ def assert_pipeline_search_behavior() -> None:
     config = Settings()
     vector_store = FakeVectorStore()
     llm_client = FakeLLMClient()
+    reranker = FakeReranker()
     router = IntentRouter(config, embedder=None, llm_client=None)
     pipeline = RAGPipeline(
         config,
         vector_store=vector_store,
         llm_client=llm_client,
         intent_router=router,
+        reranker=reranker,
     )
 
     direct_answer = pipeline.answer("写一首短诗")
-    if direct_answer.used_rag or vector_store.search_calls != 0:
+    if direct_answer.used_rag or vector_store.search_calls != 0 or reranker.calls:
         raise AssertionError("Direct route should not call vector search.")
 
-    rag_answer = pipeline.answer("新员工如何申请开发设备？")
+    rag_answer = pipeline.answer("新员工如何申请开发设备？", top_k=2, recall_top_k=7)
     if not rag_answer.used_rag or vector_store.search_calls != 1:
         raise AssertionError("Knowledge-base route should call vector search once.")
+    if vector_store.search_top_ks != [7]:
+        raise AssertionError("Vector recall should use recall_top_k.")
+    if reranker.calls != [("新员工如何申请开发设备？", 3, 2)]:
+        raise AssertionError(f"Reranker should receive recalled contexts: {reranker.calls}")
+    if [context.chunk_id for context in rag_answer.contexts] != [2, 1]:
+        raise AssertionError("RAG answer should keep reranked final top_k contexts.")
 
     print("Pipeline search behavior -> ok")
 

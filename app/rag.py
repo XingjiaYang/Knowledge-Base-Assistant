@@ -8,6 +8,7 @@ from app.config import Settings, settings
 from app.intent_router import IntentRouter
 from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget, TrimStrategy
+from app.reranker import Reranker
 from app.vector_store import SearchResult, VectorStore
 
 
@@ -38,6 +39,7 @@ class RAGPipeline:
         vector_store: VectorStore | None = None,
         llm_client: LLMClient | None = None,
         intent_router: IntentRouter | None = None,
+        reranker: Reranker | None = None,
     ) -> None:
         self.config = config
         self.budget = PromptBudget.from_config(config)
@@ -48,11 +50,13 @@ class RAGPipeline:
             embedder=self._intent_embedder(self.vector_store),
             llm_client=self.llm_client,
         )
+        self.reranker = reranker or Reranker(config)
 
     def answer(
         self,
         question: str,
         top_k: int | None = None,
+        recall_top_k: int | None = None,
         history: list[ChatMessage] | None = None,
         conversation_summary: str | None = None,
     ) -> RAGAnswer:
@@ -63,19 +67,23 @@ class RAGPipeline:
         )
         intent = self.intent_router.route(question, recent_history, summary)
         logger.info(
-            "RAG request routed: route=%s use_rag=%s top_k=%s history=%s "
-            "compacted=%s",
+            "RAG request routed: route=%s use_rag=%s recall_top_k=%s top_k=%s "
+            "history=%s compacted=%s",
             intent.route,
             intent.use_rag,
-            top_k or self.config.retrieve_top_k,
+            self._recall_top_k(recall_top_k, top_k),
+            self._final_top_k(top_k),
             len(recent_history),
             compacted_count,
         )
 
         if intent.use_rag:
             search_query = self._build_search_query(question, recent_history)
-            contexts = self.vector_store.search(search_query, top_k=top_k)
-            logger.info("Vector search returned %s contexts.", len(contexts))
+            contexts = self._retrieve_contexts(
+                search_query,
+                top_k=top_k,
+                recall_top_k=recall_top_k,
+            )
             messages = self._build_rag_messages(
                 question,
                 contexts,
@@ -96,6 +104,47 @@ class RAGPipeline:
             route=intent.route,
             route_reason=intent.reason,
         )
+
+    def _retrieve_contexts(
+        self,
+        search_query: str,
+        top_k: int | None = None,
+        recall_top_k: int | None = None,
+    ) -> list[SearchResult]:
+        final_top_k = self._final_top_k(top_k)
+        recall_limit = self._recall_top_k(recall_top_k, top_k)
+        recalled_contexts = self.vector_store.search(search_query, top_k=recall_limit)
+        logger.info(
+            "Vector recall returned %s contexts before reranking.",
+            len(recalled_contexts),
+        )
+
+        if not self.config.reranker_enabled or not recalled_contexts:
+            return recalled_contexts[:final_top_k]
+
+        reranked_contexts = self.reranker.rerank(
+            search_query,
+            recalled_contexts,
+            top_k=final_top_k,
+        )
+        logger.info(
+            "Reranker returned %s contexts from %s recalled contexts.",
+            len(reranked_contexts),
+            len(recalled_contexts),
+        )
+        return reranked_contexts
+
+    def _final_top_k(self, top_k: int | None = None) -> int:
+        return max(1, top_k or self.config.retrieve_top_k)
+
+    def _recall_top_k(
+        self,
+        recall_top_k: int | None = None,
+        top_k: int | None = None,
+    ) -> int:
+        final_top_k = self._final_top_k(top_k)
+        recall_limit = max(1, recall_top_k or self.config.recall_top_k)
+        return max(recall_limit, final_top_k)
 
     def _normalize_history(self, history: list[ChatMessage]) -> list[ChatMessage]:
         max_messages = max(0, self.config.history_max_messages)

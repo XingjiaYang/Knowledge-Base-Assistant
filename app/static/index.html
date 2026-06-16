@@ -944,7 +944,12 @@
       </div>
 
       <div class="field">
-        <label for="topK">Top K</label>
+        <label for="recallTopK">Recall K</label>
+        <input id="recallTopK" type="number" min="1">
+      </div>
+
+      <div class="field">
+        <label for="topK">Rerank K</label>
         <input id="topK" type="number" min="1">
       </div>
 
@@ -958,6 +963,10 @@
         <div>
           <div class="meta-label">Max Output</div>
           <div id="maxTokens" class="meta-item">Unknown</div>
+        </div>
+        <div>
+          <div class="meta-label">Reranker</div>
+          <div id="rerankerName" class="meta-item">Unknown</div>
         </div>
         <div>
           <div class="meta-label">Last Route</div>
@@ -1069,7 +1078,9 @@
     const referenceListEl = document.getElementById("referenceList");
     const composerEl = document.getElementById("composer");
     const promptEl = document.getElementById("prompt");
+    const recallTopKEl = document.getElementById("recallTopK");
     const topKEl = document.getElementById("topK");
+    const rerankerNameEl = document.getElementById("rerankerName");
     const sendButton = document.getElementById("sendButton");
     const clearButton = document.getElementById("clearButton");
     const authPanelEl = document.getElementById("authPanel");
@@ -1190,11 +1201,26 @@
         maxTokensEl.textContent = data.llm_max_tokens
           ? `${data.llm_max_tokens} tokens`
           : "Unknown";
+        rerankerNameEl.textContent = data.reranker_enabled
+          ? (data.reranker_model || "Enabled")
+          : "Disabled";
+        if (data.api_recall_top_k_max) {
+          recallTopKEl.max = String(data.api_recall_top_k_max);
+        }
+        if (data.recall_top_k) {
+          recallTopKEl.placeholder = String(data.recall_top_k);
+          if (!recallTopKEl.value) {
+            recallTopKEl.value = String(data.recall_top_k);
+          }
+        }
         if (data.api_top_k_max) {
           topKEl.max = String(data.api_top_k_max);
         }
         if (data.retrieve_top_k) {
           topKEl.placeholder = String(data.retrieve_top_k);
+          if (!topKEl.value) {
+            topKEl.value = String(data.retrieve_top_k);
+          }
         }
       } catch {
         setStatus("Offline", "bad");
@@ -1940,7 +1966,12 @@
 
       const score = document.createElement("div");
       score.className = "ref-score";
-      score.textContent = Number(item.score).toFixed(4);
+      if (item.rerank_score !== null && item.rerank_score !== undefined) {
+        score.textContent = `rerank ${Number(item.rerank_score).toFixed(4)}`;
+        score.title = `Vector score ${Number(item.score).toFixed(4)}`;
+      } else {
+        score.textContent = `vector ${Number(item.score).toFixed(4)}`;
+      }
 
       const text = document.createElement("code");
       const body = item.text || "";
@@ -1989,6 +2020,7 @@
           body: JSON.stringify({
             question,
             session_id: state.activeSessionId,
+            recall_top_k: recallTopKEl.value ? Number(recallTopKEl.value) : null,
             top_k: topKEl.value ? Number(topKEl.value) : null
           })
         });

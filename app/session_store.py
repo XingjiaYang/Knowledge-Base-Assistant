@@ -935,6 +935,7 @@ def search_result_to_dict(result: SearchResult) -> dict[str, Any]:
         "source": result.source,
         "chunk_id": result.chunk_id,
         "score": result.score,
+        "rerank_score": result.rerank_score,
         "content_type": result.content_type,
         "h1": result.h1,
         "h2": result.h2,
