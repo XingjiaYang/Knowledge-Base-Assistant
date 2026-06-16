@@ -82,6 +82,7 @@ class FakeReranker:
 class FakeClassifierLLM:
     def __init__(self, response: str) -> None:
         self.response = response
+        self.calls: list[list[dict[str, str]]] = []
 
     def chat(
         self,
@@ -90,6 +91,7 @@ class FakeClassifierLLM:
         top_p: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
+        self.calls.append(messages)
         return self.response
 
 
@@ -275,12 +277,13 @@ def assert_anchor_vectors_initialize_once_under_concurrency() -> None:
 
 
 def assert_llm_fallback_behavior() -> None:
+    classifier = FakeClassifierLLM(
+        '{"use_rag": "true", "reason": "knowledge-base follow-up"}'
+    )
     rag_router = IntentRouter(
         Settings(),
         embedder=None,
-        llm_client=FakeClassifierLLM(
-            '{"use_rag": "true", "reason": "knowledge-base follow-up"}'
-        ),
+        llm_client=classifier,
     )
     assert_route(
         rag_router,
@@ -289,6 +292,13 @@ def assert_llm_fallback_behavior() -> None:
         history=[Message("assistant", "We reviewed the vacation policy.")],
         expected_route="llm_rag",
     )
+    fallback_prompt = classifier.calls[-1][-1]["content"]
+    if "家是本" not in fallback_prompt or "朱剑秋" not in fallback_prompt:
+        raise AssertionError("LLM fallback prompt should describe the local corpus.")
+    if "SQL/database questions" not in fallback_prompt:
+        raise AssertionError(
+            "LLM fallback prompt should route unrelated SQL/database questions direct."
+        )
 
     direct_router = IntentRouter(
         Settings(),
@@ -349,6 +359,30 @@ def main() -> None:
         "基于文档回答：SQLite 适合什么场景？",
         True,
         expected_route="keyword_rag",
+    )
+    assert_route(
+        router,
+        "朱剑秋和勇哥连线发生了什么？",
+        True,
+        expected_route="keyword_rag",
+    )
+    assert_route(
+        router,
+        "家是本菜单价格如何？",
+        True,
+        expected_route="keyword_rag",
+    )
+    assert_route(
+        router,
+        "写一首关于家是本的诗",
+        False,
+        expected_route="keyword_direct",
+    )
+    assert_route(
+        router,
+        "不用知识库，直接回答：朱剑秋是谁？",
+        False,
+        expected_route="keyword_direct",
     )
     assert_direct_task_matching_is_case_insensitive()
     assert_embedding_context_behavior()

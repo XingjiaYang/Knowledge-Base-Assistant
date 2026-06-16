@@ -10,9 +10,12 @@ Qdrant 负责向量检索，PostgreSQL 负责必需的用户账号、登录 toke
 OpenAI-compatible API，也支持 Anthropic；本地 vLLM 作为可选 Docker Compose
 profile 保留。
 
-仓库自带一组数据库系统 Markdown 文档作为示例语料。应用和意图路由不绑定数据
-库领域；替换 `data/docs/` 下的 Markdown 并重建 Qdrant collection 后即可用于
-其他知识域。
+仓库当前自带一组由 Kimi 生成的餐饮创业案例 Markdown 语料，围绕家是本、
+朱剑秋、勇哥连线、菜单定价、顾客评价、社交媒体反应和财务模拟展开。这类
+小众合成语料比常见 SQL 或数据库知识更适合检验 RAG grounding，因为通用模型
+不太可能从预训练中直接记住这些细节。意图路由的 embedding 层保持通用；关键词层
+和 LLM fallback prompt 包含当前语料的边界与专名提示，替换 `data/docs/` 后应同步
+更新。
 
 ## 功能概览
 
@@ -22,7 +25,7 @@ profile 保留。
 - 管理员可以在前端创建用户、删除用户、重置密码、切换管理员权限、清空用户会话。
 - 管理员可以上传 CSV 批量创建用户；CSV 必须只有两列，表头必须为 `email,passwd`。
 - 支持 OpenAI-compatible、Anthropic 和可选本地 vLLM。
-- Markdown 语料可替换，检索逻辑不依赖具体业务领域。
+- Markdown 语料可替换，当前语料的关键词提示集中在意图路由 keyword 层。
 - 前端支持多会话、召回数量和重排后引用数量调整、引用展示和路由结果展示。
 - 对话历史保存在后端，旧消息会压缩成 summary 后继续参与后续回答。
 - 支持 Hugging Face cache、离线模型目录、镜像和容器运行时代理配置。
@@ -206,7 +209,12 @@ OpenAI-compatible 使用 `GET /models`，Anthropic 使用
 
 ## 替换知识库
 
-`data/docs/` 下的 Markdown 文件是 RAG 语料来源。替换知识库步骤：
+`data/docs/` 下的 Markdown 文件是 RAG 语料来源。当前提交的样例语料是家是本
+餐饮创业案例，包含公司概览、FAQ、菜单与定价、顾客评价、B站评论、社交媒体
+存档、财务模拟、时间线、朱剑秋人物侧写、勇哥连线事件和歌曲文档。检索链路
+使用向量召回加可选 reranker，目前没有 BM25 关键词索引。
+
+替换知识库步骤：
 
 1. 替换或编辑 `data/docs/` 下的 Markdown 文件。
 2. 重建 Qdrant collection：
@@ -215,7 +223,9 @@ OpenAI-compatible 使用 `GET /models`，Anthropic 使用
    python scripts/ingest_docs.py --recreate
    ```
 
-3. 通过浏览器或 `/rag` API 提问。
+3. 如需让意图路由识别新语料主题，更新 `app/intent_router.py` 中的
+   `DOMAIN_RAG_PHRASES`、`DOMAIN_RAG_PATTERNS` 和 LLM fallback 的语料描述。
+4. 通过浏览器或 `/rag` API 提问。
 
 Ingest 会递归扫描子目录。增量 ingest 会用当前 Markdown 文件替换同一 source 的旧
 chunk，避免修改或缩短文件后留下陈旧 chunk。删除文档、整体替换语料或修改
