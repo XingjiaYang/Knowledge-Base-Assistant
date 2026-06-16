@@ -23,6 +23,7 @@ from qdrant_client.models import (
 from sentence_transformers import SentenceTransformer
 
 from app.config import PROJECT_ROOT, Settings, settings
+from app.device import preferred_torch_device
 
 
 logger = logging.getLogger(__name__)
@@ -378,6 +379,7 @@ class VectorStore:
         self.config = config
         self._client = client
         self._model = model
+        self._model_device = "cpu" if model is not None else None
         self._client_lock = Lock()
         self._model_lock = Lock()
         self._ensured_payload_indexes: set[str] = set()
@@ -396,11 +398,34 @@ class VectorStore:
         if self._model is None:
             with self._model_lock:
                 if self._model is None:
-                    logger.info(
-                        "Loading embedding model %s.",
-                        self.config.embedding_model,
+                    device = preferred_torch_device(
+                        self.config.cuda_enabled,
+                        "Embedding model",
                     )
-                    self._model = SentenceTransformer(self.config.embedding_model)
+                    logger.info(
+                        "Loading embedding model %s on %s.",
+                        self.config.embedding_model,
+                        device,
+                    )
+                    try:
+                        self._model = SentenceTransformer(
+                            self.config.embedding_model,
+                            device=device,
+                        )
+                        self._model_device = device
+                    except Exception as exc:
+                        if device != "cuda":
+                            raise
+                        logger.warning(
+                            "Embedding model failed to load on CUDA; "
+                            "falling back to CPU: %s",
+                            exc,
+                        )
+                        self._model = SentenceTransformer(
+                            self.config.embedding_model,
+                            device="cpu",
+                        )
+                        self._model_device = "cpu"
         return self._model
 
     def close(self) -> None:
@@ -584,7 +609,7 @@ class VectorStore:
         if not chunks:
             return []
 
-        embeddings = self.model.encode(
+        embeddings = self._encode(
             [chunk.embedding_text for chunk in chunks],
             normalize_embeddings=True,
         )
@@ -664,7 +689,7 @@ class VectorStore:
             return source_path.name
 
     def _embed_one(self, text: str) -> list[float]:
-        embedding = self.model.encode(text, normalize_embeddings=True)
+        embedding = self._encode(text, normalize_embeddings=True)
         return embedding.tolist()
 
     def encode(
@@ -672,7 +697,35 @@ class VectorStore:
         texts: str | Sequence[str],
         normalize_embeddings: bool = True,
     ) -> object:
-        return self.model.encode(texts, normalize_embeddings=normalize_embeddings)
+        return self._encode(texts, normalize_embeddings=normalize_embeddings)
+
+    def _encode(
+        self,
+        texts: str | Sequence[str],
+        normalize_embeddings: bool = True,
+    ) -> object:
+        try:
+            return self.model.encode(
+                texts,
+                normalize_embeddings=normalize_embeddings,
+            )
+        except Exception as exc:
+            if self._model_device != "cuda":
+                raise
+            logger.warning(
+                "Embedding model failed during CUDA encode; falling back to CPU: %s",
+                exc,
+            )
+            self._move_model_to_cpu()
+            return self.model.encode(
+                texts,
+                normalize_embeddings=normalize_embeddings,
+            )
+
+    def _move_model_to_cpu(self) -> None:
+        if self._model is not None and hasattr(self._model, "to"):
+            self._model.to("cpu")
+        self._model_device = "cpu"
 
     @staticmethod
     def _metadata_filter(

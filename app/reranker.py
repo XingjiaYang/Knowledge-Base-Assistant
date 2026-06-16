@@ -6,6 +6,7 @@ from threading import Lock
 from typing import Sequence
 
 from app.config import Settings, settings
+from app.device import preferred_torch_device
 from app.vector_store import SearchResult
 
 
@@ -20,6 +21,7 @@ class Reranker:
     ) -> None:
         self.config = config
         self._model = model
+        self._model_device = "cpu" if model is not None else None
         self._model_lock = Lock()
 
     @property
@@ -29,18 +31,42 @@ class Reranker:
                 if self._model is None:
                     from transformers import AutoModel
 
+                    device = preferred_torch_device(
+                        self.config.cuda_enabled,
+                        "Reranker model",
+                    )
                     logger.info(
-                        "Loading reranker model %s.",
+                        "Loading reranker model %s on %s.",
                         self.config.reranker_model,
+                        device,
                     )
                     model = AutoModel.from_pretrained(
                         self.config.reranker_model,
                         trust_remote_code=self.config.reranker_trust_remote_code,
                         dtype=self.config.reranker_dtype,
                     )
+                    self._model_device = self._move_model_to_device(model, device)
                     model.eval()
                     self._model = model
         return self._model
+
+    @staticmethod
+    def _move_model_to_device(model: object, device: str) -> str:
+        if not hasattr(model, "to"):
+            return device
+
+        try:
+            model.to(device)
+            return device
+        except Exception as exc:
+            if device != "cuda":
+                raise
+            logger.warning(
+                "Reranker model failed to move to CUDA; falling back to CPU: %s",
+                exc,
+            )
+            model.to("cpu")
+            return "cpu"
 
     def warmup(self) -> None:
         if not self.config.reranker_enabled:
@@ -72,17 +98,17 @@ class Reranker:
         documents = [self._document_text(context) for context in contexts]
         batch_size = self.config.reranker_max_documents_per_call
         if len(documents) <= batch_size:
-            results = self.model.rerank(
+            results = self._rerank_documents(
                 query,
                 documents,
-                top_n=min(limit, len(contexts)),
+                min(limit, len(contexts)),
             )
             return self._results_to_contexts(contexts, results)
 
         results: list[dict[str, object]] = []
         for offset in range(0, len(documents), batch_size):
             batch_documents = documents[offset : offset + batch_size]
-            batch_results = self.model.rerank(query, batch_documents)
+            batch_results = self._rerank_documents(query, batch_documents)
             for result in batch_results:
                 result = dict(result)
                 result["index"] = int(result["index"]) + offset
@@ -98,6 +124,24 @@ class Reranker:
             reverse=True,
         )
         return reranked[:limit]
+
+    def _rerank_documents(
+        self,
+        query: str,
+        documents: list[str],
+        top_n: int | None = None,
+    ) -> list[dict[str, object]]:
+        try:
+            return self.model.rerank(query, documents, top_n=top_n)
+        except Exception as exc:
+            if self._model_device != "cuda":
+                raise
+            logger.warning(
+                "Reranker failed during CUDA inference; falling back to CPU: %s",
+                exc,
+            )
+            self._model_device = self._move_model_to_device(self.model, "cpu")
+            return self.model.rerank(query, documents, top_n=top_n)
 
     @staticmethod
     def _results_to_contexts(

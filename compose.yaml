@@ -68,12 +68,14 @@ services:
     depends_on:
       - qdrant
       - postgres
+    gpus: all
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "${APP_PORT:-8080}:8080"
     environment:
       API_PORT: "8080"
+      CUDA: ${CUDA:-TRUE}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-tech_docs}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}

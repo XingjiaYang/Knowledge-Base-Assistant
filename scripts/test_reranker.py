@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import Settings
+import app.reranker as reranker_module
 from app.reranker import Reranker
 from app.vector_store import SearchResult
 
@@ -59,6 +61,56 @@ class FakeBatchRerankerModel:
             key=lambda result: result["relevance_score"],
             reverse=True,
         )
+
+
+class FakeDeviceModel:
+    def __init__(self) -> None:
+        self.devices: list[str] = []
+        self.eval_called = False
+
+    def to(self, device: str) -> "FakeDeviceModel":
+        self.devices.append(device)
+        if device == "cuda":
+            raise RuntimeError("CUDA failed")
+        return self
+
+    def eval(self) -> "FakeDeviceModel":
+        self.eval_called = True
+        return self
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        top_n: int | None = None,
+    ) -> list[dict[str, object]]:
+        return [{"index": 0, "relevance_score": 1.0}]
+
+
+class FakeRuntimeCudaRerankerModel:
+    def __init__(self) -> None:
+        self.device = "cpu"
+        self.devices: list[str] = []
+        self.calls = 0
+
+    def to(self, device: str) -> "FakeRuntimeCudaRerankerModel":
+        self.device = device
+        self.devices.append(device)
+        return self
+
+    def eval(self) -> "FakeRuntimeCudaRerankerModel":
+        return self
+
+    def rerank(
+        self,
+        query: str,
+        documents: list[str],
+        top_n: int | None = None,
+    ) -> list[dict[str, object]]:
+        self.calls += 1
+        if self.device == "cuda":
+            raise RuntimeError("CUDA inference failed")
+        return [{"index": 0, "relevance_score": 1.0}]
 
 
 def assert_reranker_orders_by_model_score() -> None:
@@ -136,10 +188,91 @@ def assert_warmup_uses_rerank() -> None:
     print("Reranker warmup -> ok")
 
 
+def assert_reranker_falls_back_to_cpu_when_cuda_move_fails() -> None:
+    original_transformers = sys.modules.get("transformers")
+    original_preferred_device = reranker_module.preferred_torch_device
+    loaded_models: list[FakeDeviceModel] = []
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(*args: object, **kwargs: object) -> FakeDeviceModel:
+            model = FakeDeviceModel()
+            loaded_models.append(model)
+            return model
+
+    sys.modules["transformers"] = SimpleNamespace(AutoModel=FakeAutoModel)
+    reranker_module.preferred_torch_device = lambda *_args: "cuda"
+    try:
+        reranker = Reranker(Settings())
+        model = reranker.model
+    finally:
+        reranker_module.preferred_torch_device = original_preferred_device
+        if original_transformers is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = original_transformers
+
+    if model is not loaded_models[0]:
+        raise AssertionError("Reranker should keep the loaded model instance.")
+    if loaded_models[0].devices != ["cuda", "cpu"]:
+        raise AssertionError("Reranker should fall back to CPU after CUDA failure.")
+    if not loaded_models[0].eval_called:
+        raise AssertionError("Reranker model should be put in eval mode.")
+
+    print("Reranker CUDA fallback -> ok")
+
+
+def assert_reranker_falls_back_to_cpu_when_cuda_inference_fails() -> None:
+    original_transformers = sys.modules.get("transformers")
+    original_preferred_device = reranker_module.preferred_torch_device
+    loaded_models: list[FakeRuntimeCudaRerankerModel] = []
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(
+            *args: object,
+            **kwargs: object,
+        ) -> FakeRuntimeCudaRerankerModel:
+            model = FakeRuntimeCudaRerankerModel()
+            loaded_models.append(model)
+            return model
+
+    sys.modules["transformers"] = SimpleNamespace(AutoModel=FakeAutoModel)
+    reranker_module.preferred_torch_device = lambda *_args: "cuda"
+    try:
+        reranker = Reranker(Settings())
+        contexts = [
+            SearchResult(
+                text="candidate",
+                source="data/docs/guide.md",
+                chunk_id=1,
+                score=0.9,
+            )
+        ]
+        reranked = reranker.rerank("query", contexts, top_k=1)
+    finally:
+        reranker_module.preferred_torch_device = original_preferred_device
+        if original_transformers is None:
+            sys.modules.pop("transformers", None)
+        else:
+            sys.modules["transformers"] = original_transformers
+
+    if [context.chunk_id for context in reranked] != [1]:
+        raise AssertionError("Reranker should retry on CPU after CUDA inference failure.")
+    if loaded_models[0].devices != ["cuda", "cpu"]:
+        raise AssertionError("Reranker should move to CPU after CUDA inference failure.")
+    if loaded_models[0].calls != 2:
+        raise AssertionError("Reranker should retry exactly once after CUDA failure.")
+
+    print("Reranker CUDA inference fallback -> ok")
+
+
 def main() -> None:
     assert_reranker_orders_by_model_score()
     assert_reranker_batches_large_recalls()
     assert_warmup_uses_rerank()
+    assert_reranker_falls_back_to_cpu_when_cuda_move_fails()
+    assert_reranker_falls_back_to_cpu_when_cuda_inference_fails()
 
 
 if __name__ == "__main__":

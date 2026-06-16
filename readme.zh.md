@@ -66,7 +66,9 @@ Answer + retrieved references + compacted conversation memory
 
 ## 快速启动
 
-准备 Docker Compose v2 和一个云端 LLM API key。复制配置：
+准备 Docker Compose v2 和一个云端 LLM API key。如果希望 Docker 容器使用
+CUDA，还需要兼容的 NVIDIA GPU、较新的 NVIDIA 驱动和 NVIDIA Container
+Toolkit；过老的显卡可能不支持当前 PyTorch/Transformers CUDA 构建。复制配置：
 
 ```bash
 cp .env.example .env
@@ -154,6 +156,9 @@ AUTH_BOOTSTRAP_USERS=analyst:change-me,viewer:change-me-too
 常用配置见 `.env.example`：
 
 ```bash
+DEBUG=0
+CUDA=TRUE
+
 LLM_PROVIDER=openai_compatible
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
@@ -189,11 +194,37 @@ WAIT_FOR_LLM=0
 个候选 chunk，再使用多语言 `jinaai/jina-reranker-v3` cross-encoder
 重排，最后只保留 `RETRIEVE_TOP_K` 个 chunk 进入 LLM prompt 和引用列表。
 前端对应控件为 `Recall K` 和 `Rerank K`，默认分别为 `200` 和 `5`。
+`CUDA=TRUE` 是默认值，BGE embedding 模型和 Jina reranker 会在 PyTorch 能看到
+兼容 NVIDIA GPU 时优先使用 CUDA；如果 CUDA 不可见或模型迁移到 GPU 失败，会
+记录日志并回退到 CPU。设置 `CUDA=FALSE` 可强制全部使用 CPU。
 `RERANKER_PRELOAD=1` 时 API 会在启动阶段加载并预热 reranker，模型下载或加载
 错误会在服务接受请求前暴露，而不是第一次用户提问时才失败。代码使用 Jina
 模型原生的 `AutoModel.rerank()` 接口执行重排。
 `jina-reranker-v3` 是 listwise reranker；召回数量超过
 `RERANKER_MAX_DOCUMENTS_PER_CALL` 时会分批重排，再按分数全局排序。
+
+默认 Compose 配置会给 API 容器设置 `gpus: all`，所以普通启动会在 Docker 能提供
+GPU 设备时直接使用 CUDA：
+
+```bash
+docker compose up --build
+```
+
+如果希望一条命令先尝试 GPU、Docker 在容器创建前拒绝 GPU 时再自动重试 CPU，
+使用这个 wrapper：
+
+```bash
+scripts/compose_up.sh up --build
+```
+
+如果你想从一开始就强制 CPU，使用 CPU override：
+
+```bash
+CUDA=FALSE docker compose -f compose.yaml -f compose.cpu.yaml up --build
+```
+
+如果 Docker 已经暴露 GPU，但 PyTorch 仍无法使用，或显卡架构太老不兼容当前
+CUDA/PyTorch 构建，应用启动后会回退到 CPU。
 
 `LLM_PROVIDER=openai_compatible` 适用于 OpenAI-compatible 云端 API 和本地 vLLM。
 Anthropic 使用：

@@ -66,6 +66,7 @@ def assert_llm_settings() -> None:
         llm_retry_backoff_max_seconds=4.0,
         retrieve_score_threshold=0.42,
         intent_embedding_rag_threshold=0.55,
+        cuda_enabled=False,
         reranker_model="jinaai/jina-reranker-v3",
         reranker_preload=True,
         reranker_dtype="auto",
@@ -90,6 +91,8 @@ def assert_llm_settings() -> None:
         raise AssertionError("LLM retry max backoff should be configurable.")
     if config.retrieve_score_threshold != 0.42:
         raise AssertionError("Retrieval score threshold should be configurable.")
+    if config.cuda_enabled:
+        raise AssertionError("CUDA preference should be configurable.")
     if config.reranker_model != "jinaai/jina-reranker-v3":
         raise AssertionError("Reranker model should be configurable.")
     if not config.reranker_preload:
