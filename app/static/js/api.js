@@ -77,4 +77,7 @@ export const api = {
     send(`/admin/users/${id}/password`, { method: "POST", ...jsonBody({ password }) }),
   clearUserSessions: (id) => send(`/admin/users/${id}/sessions`, { method: "DELETE" }),
   deleteUser: (id) => send(`/admin/users/${id}`, { method: "DELETE" }),
+  getLLMSettings: () => send("/admin/llm-settings"),
+  updateLLMSettings: (payload) =>
+    send("/admin/llm-settings", { method: "PUT", ...jsonBody(payload) }),
 };

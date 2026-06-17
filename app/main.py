@@ -26,6 +26,7 @@ from app.session_store import (
     CurrentUser,
     SessionStore,
     StoredChatMessage,
+    LLMSettingsRecord,
     UserRecord,
 )
 from app.vector_store import SearchResult, VectorStore
@@ -37,12 +38,15 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _app.state.vector_store = VectorStore(settings)
-    _app.state.llm_client = LLMClient(settings)
     _app.state.session_store = SessionStore(settings)
+    await asyncio.to_thread(_app.state.session_store.init_db)
+    _app.state.llm_client = LLMClient(
+        settings,
+        runtime_settings_provider=_app.state.session_store.get_llm_runtime_settings,
+    )
     _app.state.reranker = Reranker(settings)
     if settings.reranker_enabled and settings.reranker_preload:
         await asyncio.to_thread(_app.state.reranker.warmup)
-    await asyncio.to_thread(_app.state.session_store.init_db)
     _app.state.rag_pipeline = RAGPipeline(
         settings,
         vector_store=_app.state.vector_store,
@@ -197,6 +201,7 @@ class UserResponse(BaseModel):
     id: str
     username: str
     is_admin: bool
+    is_superuser: bool
     must_change_password: bool
 
     @classmethod
@@ -205,6 +210,7 @@ class UserResponse(BaseModel):
             id=str(user.id),
             username=user.username,
             is_admin=user.is_admin,
+            is_superuser=user.is_superuser,
             must_change_password=user.must_change_password,
         )
 
@@ -233,6 +239,7 @@ class AdminUserResponse(BaseModel):
     username: str
     is_active: bool
     is_admin: bool
+    is_superuser: bool
     must_change_password: bool
     created_at: str
     updated_at: str
@@ -247,6 +254,7 @@ class AdminUserResponse(BaseModel):
             username=user.username,
             is_active=user.is_active,
             is_admin=user.is_admin,
+            is_superuser=user.is_superuser,
             must_change_password=user.must_change_password,
             created_at=user.created_at.isoformat(),
             updated_at=user.updated_at.isoformat(),
@@ -270,6 +278,31 @@ class AdminPasswordUpdateRequest(BaseModel):
 
 class AdminRoleUpdateRequest(BaseModel):
     is_admin: bool
+
+
+class AdminLLMSettingsResponse(BaseModel):
+    provider: str
+    base_url: str
+    model: str
+    api_key_configured: bool
+    source: str
+
+    @classmethod
+    def from_record(cls, record: LLMSettingsRecord) -> "AdminLLMSettingsResponse":
+        return cls(
+            provider=record.provider,
+            base_url=record.base_url,
+            model=record.model,
+            api_key_configured=record.api_key_configured,
+            source=record.source,
+        )
+
+
+class AdminLLMSettingsUpdateRequest(BaseModel):
+    provider: Literal["openai_compatible", "anthropic"]
+    base_url: str = Field(..., min_length=1, max_length=2000)
+    model: str = Field(..., min_length=1, max_length=300)
+    api_key: str | None = Field(default=None, max_length=10000)
 
 
 class AdminUsersCsvImportRequest(BaseModel):
@@ -383,6 +416,14 @@ def require_admin_auth(
     return user
 
 
+def require_superuser_auth(
+    user: Annotated[CurrentUser, Depends(require_admin_auth)],
+) -> CurrentUser:
+    if not user.is_superuser:
+        raise HTTPException(status_code=403, detail="Superuser access required.")
+    return user
+
+
 def raise_unauthorized() -> None:
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -475,6 +516,7 @@ async def change_password(
             id=user.id,
             username=user.username,
             is_admin=user.is_admin,
+            is_superuser=user.is_superuser,
             must_change_password=False,
         )
     )
@@ -602,6 +644,38 @@ async def admin_delete_user(
     return {"status": "ok"}
 
 
+@app.get("/admin/llm-settings", response_model=AdminLLMSettingsResponse)
+async def admin_get_llm_settings(
+    request: Request,
+    _superuser: Annotated[CurrentUser, Depends(require_superuser_auth)],
+) -> AdminLLMSettingsResponse:
+    record = await asyncio.to_thread(
+        _session_store(request).get_llm_settings_record,
+    )
+    return AdminLLMSettingsResponse.from_record(record)
+
+
+@app.put("/admin/llm-settings", response_model=AdminLLMSettingsResponse)
+async def admin_update_llm_settings(
+    request: Request,
+    update_request: AdminLLMSettingsUpdateRequest,
+    _superuser: Annotated[CurrentUser, Depends(require_superuser_auth)],
+) -> AdminLLMSettingsResponse:
+    try:
+        record = await asyncio.to_thread(
+            _session_store(request).update_llm_settings,
+            update_request.provider,
+            update_request.base_url,
+            update_request.model,
+            update_request.api_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    request.app.state.llm_client.close()
+    return AdminLLMSettingsResponse.from_record(record)
+
+
 @app.get("/sessions", response_model=list[SessionSummaryResponse])
 async def list_sessions(
     request: Request,
@@ -681,6 +755,9 @@ async def delete_session(
 
 @app.get("/health/details", dependencies=[Depends(require_password_ready_user)])
 async def health_details(request: Request) -> dict[str, object]:
+    llm_settings = await asyncio.to_thread(
+        _session_store(request).get_llm_settings_record,
+    )
     qdrant_ok, llm_ok = await asyncio.gather(
         asyncio.to_thread(_qdrant_health, request.app.state.vector_store),
         asyncio.to_thread(request.app.state.llm_client.health),
@@ -691,8 +768,11 @@ async def health_details(request: Request) -> dict[str, object]:
         "qdrant": qdrant_ok,
         "llm": llm_ok,
         "collection": settings.collection_name,
-        "llm_base_url": settings.llm_base_url,
-        "llm_model": settings.llm_model,
+        "llm_provider": llm_settings.provider,
+        "llm_base_url": llm_settings.base_url,
+        "llm_model": llm_settings.model,
+        "llm_api_key_configured": llm_settings.api_key_configured,
+        "llm_settings_source": llm_settings.source,
         "llm_max_tokens": settings.llm_max_tokens,
         "cuda_enabled": settings.cuda_enabled,
         "bm25_top_k": settings.bm25_top_k,

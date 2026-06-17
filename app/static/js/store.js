@@ -24,6 +24,7 @@ export const state = {
   renamingSessionId: "",
   // admin
   adminUsers: [],
+  llmSettings: null,
   currentView: "chat", // "chat" | "admin"
   // meta
   health: null,
@@ -83,6 +84,7 @@ export function resetState() {
     sessionFilter: "",
     renamingSessionId: "",
     adminUsers: [],
+    llmSettings: null,
     currentView: "chat",
     health: null,
   });

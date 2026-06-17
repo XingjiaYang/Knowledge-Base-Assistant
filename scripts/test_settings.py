@@ -14,7 +14,7 @@ import httpx
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.config import Settings
+from app.config import LLMRuntimeSettings, Settings
 from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget
 from app.session_store import ChatSessionRecord, CurrentUser
@@ -217,6 +217,49 @@ def assert_llm_retry_behavior() -> None:
     client.close()
 
     print("LLM retry behavior -> ok")
+
+
+def assert_llm_runtime_settings_provider() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers.get("authorization")
+        seen["body"] = request.read().decode("utf-8")
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "runtime ok"}}]},
+        )
+
+    base = Settings(
+        llm_base_url="https://env.example/v1",
+        llm_api_key="env-key",
+        llm_model="env-model",
+    )
+    runtime = LLMRuntimeSettings.from_settings(
+        base,
+        provider="openai_compatible",
+        base_url="https://runtime.example/v1",
+        api_key="runtime-key",
+        model="runtime-model",
+    )
+    client = LLMClient(
+        base,
+        transport=httpx.MockTransport(handler),
+        runtime_settings_provider=lambda: runtime,
+    )
+    answer = client.chat([{"role": "user", "content": "hello"}])
+    if answer != "runtime ok":
+        raise AssertionError("Runtime LLM settings should still return provider output.")
+    if seen.get("url") != "https://runtime.example/v1/chat/completions":
+        raise AssertionError("Runtime LLM base URL should override env config.")
+    if seen.get("authorization") != "Bearer runtime-key":
+        raise AssertionError("Runtime LLM API key should override env config.")
+    if "runtime-model" not in str(seen.get("body")):
+        raise AssertionError("Runtime LLM model should override env config.")
+    client.close()
+
+    print("LLM runtime settings provider -> ok")
 
 
 def assert_llm_client_connection_reuse() -> None:
@@ -441,6 +484,52 @@ def assert_password_change_gate_blocks_app_features() -> None:
     print("Password-change gate -> ok")
 
 
+def assert_superuser_gate_and_llm_settings_models() -> None:
+    from fastapi import HTTPException
+
+    from app.main import (
+        AdminLLMSettingsUpdateRequest,
+        UserResponse,
+        require_superuser_auth,
+    )
+
+    normal_admin = CurrentUser(
+        FakeSessionStore.user_id,
+        "admin",
+        is_admin=True,
+        is_superuser=False,
+    )
+    try:
+        require_superuser_auth(normal_admin)
+    except HTTPException as exc:
+        if exc.status_code != 403:
+            raise AssertionError("Non-superuser admins should receive 403.")
+    else:
+        raise AssertionError("Non-superuser admins should not pass superuser auth.")
+
+    superuser = CurrentUser(
+        FakeSessionStore.user_id,
+        "admin",
+        is_admin=True,
+        is_superuser=True,
+    )
+    if require_superuser_auth(superuser) is not superuser:
+        raise AssertionError("Superuser should pass superuser auth.")
+    if not UserResponse.from_user(superuser).is_superuser:
+        raise AssertionError("User response should expose superuser status.")
+
+    request = AdminLLMSettingsUpdateRequest(
+        provider="anthropic",
+        base_url="https://api.anthropic.com/v1",
+        model="claude-test",
+        api_key="secret",
+    )
+    if request.provider != "anthropic" or request.model != "claude-test":
+        raise AssertionError("LLM settings request should parse editable fields.")
+
+    print("Superuser LLM settings gate -> ok")
+
+
 def assert_csv_import_parser() -> None:
     from app.main import parse_user_csv
 
@@ -546,6 +635,7 @@ def main() -> None:
     assert_llm_client_input_validation()
     assert_llm_health_requests()
     assert_llm_retry_behavior()
+    assert_llm_runtime_settings_provider()
     assert_llm_client_connection_reuse()
     assert_account_auth_is_always_enabled()
     assert_public_health_endpoint()
@@ -553,6 +643,7 @@ def main() -> None:
     assert_rag_endpoint_accepts_original_body_shape()
     assert_rag_endpoint_requires_login()
     assert_password_change_gate_blocks_app_features()
+    assert_superuser_gate_and_llm_settings_models()
     assert_csv_import_parser()
     assert_invalid_settings_rejected()
     assert_prompt_budget_settings()

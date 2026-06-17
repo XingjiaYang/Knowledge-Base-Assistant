@@ -4,6 +4,9 @@ import os
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LLM_PROVIDER_OPENAI = "openai_compatible"
+LLM_PROVIDER_ANTHROPIC = "anthropic"
+LLM_PROVIDER_CHOICES = {LLM_PROVIDER_OPENAI, LLM_PROVIDER_ANTHROPIC}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -25,6 +28,68 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "y", "on"}
+
+
+def normalize_llm_provider(provider: str) -> str:
+    normalized = provider.strip().lower().replace("-", "_")
+    if normalized in {"openai", "openai_compatible", "openai_compat"}:
+        return LLM_PROVIDER_OPENAI
+    if normalized in {"anthropic", "claude"}:
+        return LLM_PROVIDER_ANTHROPIC
+    raise ValueError("LLM provider must be openai_compatible or anthropic.")
+
+
+@dataclass(frozen=True)
+class LLMRuntimeSettings:
+    llm_provider: str
+    llm_base_url: str
+    llm_api_key: str
+    llm_model: str
+    llm_temperature: float
+    llm_top_p: float
+    llm_max_tokens: int
+    llm_timeout_seconds: float
+    llm_retry_attempts: int
+    llm_retry_backoff_seconds: float
+    llm_retry_backoff_max_seconds: float
+    llm_health_check_enabled: bool
+    llm_health_path: str
+    llm_anthropic_version: str
+
+    @classmethod
+    def from_settings(
+        cls,
+        config: "Settings",
+        *,
+        provider: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+    ) -> "LLMRuntimeSettings":
+        return cls(
+            llm_provider=normalize_llm_provider(provider or config.llm_provider),
+            llm_base_url=(base_url or config.llm_base_url).strip(),
+            llm_api_key=config.llm_api_key if api_key is None else api_key,
+            llm_model=(model or config.llm_model).strip(),
+            llm_temperature=config.llm_temperature,
+            llm_top_p=config.llm_top_p,
+            llm_max_tokens=config.llm_max_tokens,
+            llm_timeout_seconds=config.llm_timeout_seconds,
+            llm_retry_attempts=config.llm_retry_attempts,
+            llm_retry_backoff_seconds=config.llm_retry_backoff_seconds,
+            llm_retry_backoff_max_seconds=config.llm_retry_backoff_max_seconds,
+            llm_health_check_enabled=config.llm_health_check_enabled,
+            llm_health_path=config.llm_health_path,
+            llm_anthropic_version=config.llm_anthropic_version,
+        )
+
+    def validate(self) -> "LLMRuntimeSettings":
+        normalize_llm_provider(self.llm_provider)
+        if not self.llm_base_url.strip():
+            raise ValueError("LLM base URL must not be empty.")
+        if not self.llm_model.strip():
+            raise ValueError("LLM model must not be empty.")
+        return self
 
 
 @dataclass(frozen=True)

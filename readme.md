@@ -356,8 +356,14 @@ password: 123456
 ```
 
 Change `AUTH_DEFAULT_ADMIN_PASSWORD` before exposing the app beyond local
-development. Existing users are not overwritten on restart. You can also add
-non-admin initial users through
+development. Existing users are not overwritten on restart. The startup-created
+default administrator is also the single superuser. Only this superuser can
+edit runtime LLM settings from the Admin panel: provider format
+(`openai_compatible` or `anthropic`), API base URL, model name, and API key.
+These runtime values are stored in PostgreSQL and override the `.env` LLM
+defaults without rebuilding the container; `.env` remains the bootstrap
+fallback. API keys are never returned to the browser, and leaving the key field
+blank keeps the current key. You can also add non-admin initial users through
 `AUTH_BOOTSTRAP_USERS`, for example:
 
 ```bash
@@ -371,9 +377,10 @@ metadata, and compacted summary are stored in PostgreSQL. The browser opens to
 the sign-in form and only shows the RAG workspace after a valid login.
 Administrators see an Admin panel for creating users, importing users from CSV,
 deleting users, resetting passwords, toggling admin access, and clearing a
-user's chat data. CSV imports must contain exactly two columns named `email` and
-`passwd`; rows with missing values, wrong headers, or extra columns are
-rejected. `/rag` accepts a `session_id` and manages history server-side.
+user's chat data. Superuser-only controls for global LLM settings are shown in
+the same Admin panel. CSV imports must contain exactly two columns named
+`email` and `passwd`; rows with missing values, wrong headers, or extra columns
+are rejected. `/rag` accepts a `session_id` and manages history server-side.
 
 ## Replace the Knowledge Base
 

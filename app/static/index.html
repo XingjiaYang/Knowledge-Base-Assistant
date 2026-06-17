@@ -262,6 +262,25 @@
             <div id="adminCsvStatus" class="alert" role="status"></div>
           </form>
         </section>
+
+        <section id="adminLlmSettingsSection" class="card" hidden>
+          <h3 class="card-title">LLM Settings</h3>
+          <form id="adminLlmSettingsForm" class="stack">
+            <label class="field-label" for="adminLlmProvider">API format</label>
+            <select id="adminLlmProvider">
+              <option value="openai_compatible">OpenAI-compatible</option>
+              <option value="anthropic">Anthropic</option>
+            </select>
+            <label class="field-label" for="adminLlmBaseUrl">API URL</label>
+            <input id="adminLlmBaseUrl" placeholder="https://api.openai.com/v1" autocomplete="off">
+            <label class="field-label" for="adminLlmModel">Model</label>
+            <input id="adminLlmModel" placeholder="gpt-4o-mini" autocomplete="off">
+            <label class="field-label" for="adminLlmApiKey">API key</label>
+            <input id="adminLlmApiKey" type="password" placeholder="Leave blank to keep current key" autocomplete="new-password">
+            <button id="adminLlmSaveButton" class="btn btn-primary btn-block" type="submit">Save LLM settings</button>
+            <div id="adminLlmSettingsStatus" class="alert" role="status"></div>
+          </form>
+        </section>
       </div>
     </div>
   </main>
