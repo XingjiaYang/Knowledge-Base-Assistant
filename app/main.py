@@ -92,6 +92,14 @@ if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+@app.middleware("http")
+async def no_store_static_cache(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 class ChatMessageRequest(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(
@@ -109,7 +117,17 @@ class RAGRequest(BaseModel):
     )
     session_id: UUID | None = None
     top_k: int | None = Field(default=None, ge=1, le=settings.api_top_k_max)
+    bm25_top_k: int | None = Field(
+        default=None,
+        ge=1,
+        le=settings.api_recall_top_k_max,
+    )
     recall_top_k: int | None = Field(
+        default=None,
+        ge=1,
+        le=settings.api_recall_top_k_max,
+    )
+    rrf_top_k: int | None = Field(
         default=None,
         ge=1,
         le=settings.api_recall_top_k_max,
@@ -130,6 +148,10 @@ class ContextResponse(BaseModel):
     chunk_id: int
     score: float
     rerank_score: float | None = None
+    vector_score: float | None = None
+    bm25_score: float | None = None
+    rrf_score: float | None = None
+    retrieval_source: str = "vector"
     content_type: str
     h1: str
     h2: str
@@ -146,6 +168,10 @@ class ContextResponse(BaseModel):
             chunk_id=result.chunk_id,
             score=result.score,
             rerank_score=result.rerank_score,
+            vector_score=result.vector_score,
+            bm25_score=result.bm25_score,
+            rrf_score=result.rrf_score,
+            retrieval_source=result.retrieval_source,
             content_type=result.content_type,
             h1=result.h1,
             h2=result.h2,
@@ -669,7 +695,9 @@ async def health_details(request: Request) -> dict[str, object]:
         "llm_model": settings.llm_model,
         "llm_max_tokens": settings.llm_max_tokens,
         "cuda_enabled": settings.cuda_enabled,
+        "bm25_top_k": settings.bm25_top_k,
         "recall_top_k": settings.recall_top_k,
+        "rrf_top_k": settings.rrf_top_k,
         "retrieve_top_k": settings.retrieve_top_k,
         "retrieve_score_threshold": settings.retrieve_score_threshold,
         "history_recent_turns": settings.history_recent_turns,
@@ -711,6 +739,8 @@ async def rag(
             rag_request.question,
             top_k=rag_request.top_k,
             recall_top_k=rag_request.recall_top_k,
+            bm25_top_k=rag_request.bm25_top_k,
+            rrf_top_k=rag_request.rrf_top_k,
             history=history,
             conversation_summary=conversation_summary,
         )

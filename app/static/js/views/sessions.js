@@ -1,9 +1,9 @@
 // Sidebar session list: search/filter, select, inline rename, and delete.
 // Also owns the session data actions used by the chat view.
 
-import { state, on, emit } from "../store.js";
-import { api } from "../api.js";
-import { byId, el, clear, icon } from "../dom.js";
+import { state, on, emit } from "../store.js?v=20260617-hybrid-retrieval";
+import { api } from "../api.js?v=20260617-hybrid-retrieval";
+import { byId, el, clear, icon } from "../dom.js?v=20260617-hybrid-retrieval";
 
 let els = {};
 

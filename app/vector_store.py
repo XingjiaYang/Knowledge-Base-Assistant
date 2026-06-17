@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 import logging
+import math
 from pathlib import Path
 import re
 from threading import Lock
@@ -38,6 +40,10 @@ class SearchResult:
     chunk_id: int
     score: float
     rerank_score: float | None = None
+    vector_score: float | None = None
+    bm25_score: float | None = None
+    rrf_score: float | None = None
+    retrieval_source: str = "vector"
     content_type: str = "text"
     h1: str = ""
     h2: str = ""
@@ -72,11 +78,31 @@ class MarkdownChunk:
     end_line: int
 
 
+@dataclass(frozen=True)
+class _BM25Document:
+    result: SearchResult
+    term_counts: dict[str, int]
+    length: int
+
+
+@dataclass(frozen=True)
+class _BM25Index:
+    signature: tuple[tuple[str, int, int], ...]
+    documents: tuple[_BM25Document, ...]
+    document_frequencies: dict[str, int]
+    average_length: float
+
+
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _TABLE_DIVIDER_RE = re.compile(
     r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$"
 )
+_ASCII_TOKEN_RE = re.compile(r"[a-z0-9_]+")
+_CJK_BLOCK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 _MARKDOWN = MarkdownIt("gfm-like", {"linkify": False})
+_BM25_K1 = 1.5
+_BM25_B = 0.75
+_RRF_RANK_CONSTANT = 60
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -369,6 +395,18 @@ def _tail_text(text: str, max_chars: int) -> str:
     return "".join(reversed(tail_tokens)).strip()
 
 
+def _bm25_tokens(text: str) -> list[str]:
+    lowered = text.lower()
+    tokens = _ASCII_TOKEN_RE.findall(lowered)
+    for block in _CJK_BLOCK_RE.findall(text):
+        tokens.extend(block)
+        tokens.extend(
+            block[index : index + 2]
+            for index in range(max(0, len(block) - 1))
+        )
+    return [token for token in tokens if token]
+
+
 class VectorStore:
     def __init__(
         self,
@@ -382,6 +420,8 @@ class VectorStore:
         self._model_device = "cpu" if model is not None else None
         self._client_lock = Lock()
         self._model_lock = Lock()
+        self._bm25_lock = Lock()
+        self._bm25_index: _BM25Index | None = None
         self._ensured_payload_indexes: set[str] = set()
 
     @property
@@ -433,6 +473,8 @@ class VectorStore:
             client = self._client
             self._client = None
             self._ensured_payload_indexes.clear()
+        with self._bm25_lock:
+            self._bm25_index = None
 
         if client is not None and hasattr(client, "close"):
             client.close()
@@ -499,6 +541,8 @@ class VectorStore:
             inserted,
             self.config.collection_name,
         )
+        with self._bm25_lock:
+            self._bm25_index = None
         return inserted
 
     def _ensure_payload_index(self, field_name: str) -> None:
@@ -588,6 +632,8 @@ class VectorStore:
                     source=self._public_source(str(payload.get("source", ""))),
                     chunk_id=int(payload.get("chunk_id", -1)),
                     score=score,
+                    vector_score=score,
+                    retrieval_source="vector",
                     content_type=str(payload.get("content_type", "text")),
                     h1=str(payload.get("h1", "")),
                     h2=str(payload.get("h2", "")),
@@ -598,6 +644,108 @@ class VectorStore:
                 )
             )
         return results
+
+    def search_bm25(
+        self,
+        query: str,
+        top_k: int | None = None,
+        metadata_filter: dict[str, str] | None = None,
+    ) -> list[SearchResult]:
+        limit = max(1, top_k or self.config.bm25_top_k)
+        index = self._ensure_bm25_index()
+        if not index.documents:
+            return []
+
+        query_terms = set(_bm25_tokens(query))
+        if not query_terms:
+            return []
+
+        metadata_filter = metadata_filter or {}
+        document_count = len(index.documents)
+        scored: list[tuple[float, SearchResult]] = []
+        for document in index.documents:
+            if not self._matches_result_metadata(document.result, metadata_filter):
+                continue
+
+            score = 0.0
+            for term in query_terms:
+                frequency = document.term_counts.get(term, 0)
+                if not frequency:
+                    continue
+
+                document_frequency = index.document_frequencies.get(term, 0)
+                idf = math.log(
+                    1
+                    + (
+                        (document_count - document_frequency + 0.5)
+                        / (document_frequency + 0.5)
+                    )
+                )
+                denominator = frequency + _BM25_K1 * (
+                    1
+                    - _BM25_B
+                    + _BM25_B * document.length / index.average_length
+                )
+                score += idf * (frequency * (_BM25_K1 + 1)) / denominator
+
+            if score > 0:
+                scored.append(
+                    (
+                        score,
+                        replace(
+                            document.result,
+                            score=score,
+                            bm25_score=score,
+                            retrieval_source="bm25",
+                        ),
+                    )
+                )
+
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                item[1].source,
+                -item[1].chunk_id,
+            ),
+            reverse=True,
+        )
+        logger.info("BM25 recall returned %s contexts.", min(len(scored), limit))
+        return [result for _, result in scored[:limit]]
+
+    def hybrid_search(
+        self,
+        query: str,
+        bm25_top_k: int | None = None,
+        vector_top_k: int | None = None,
+        rrf_top_k: int | None = None,
+        metadata_filter: dict[str, str] | None = None,
+    ) -> list[SearchResult]:
+        bm25_limit = max(1, bm25_top_k or self.config.bm25_top_k)
+        vector_limit = max(1, vector_top_k or self.config.recall_top_k)
+        fused_limit = max(1, rrf_top_k or self.config.rrf_top_k)
+
+        bm25_results = self.search_bm25(
+            query,
+            top_k=bm25_limit,
+            metadata_filter=metadata_filter,
+        )
+        vector_results = self.search(
+            query,
+            top_k=vector_limit,
+            metadata_filter=metadata_filter,
+        )
+        fused = self._rrf_fuse(
+            vector_results,
+            bm25_results,
+            top_k=fused_limit,
+        )
+        logger.info(
+            "Hybrid recall fused bm25=%s vector=%s into rrf=%s contexts.",
+            len(bm25_results),
+            len(vector_results),
+            len(fused),
+        )
+        return fused
 
     def _points_for_file(self, file_path: Path) -> list[PointStruct]:
         text = file_path.read_text(encoding="utf-8")
@@ -726,6 +874,173 @@ class VectorStore:
         if self._model is not None and hasattr(self._model, "to"):
             self._model.to("cpu")
         self._model_device = "cpu"
+
+    def _ensure_bm25_index(self) -> _BM25Index:
+        signature = self._docs_signature()
+        if self._bm25_index is not None and self._bm25_index.signature == signature:
+            return self._bm25_index
+
+        with self._bm25_lock:
+            if (
+                self._bm25_index is not None
+                and self._bm25_index.signature == signature
+            ):
+                return self._bm25_index
+            self._bm25_index = self._build_bm25_index(signature)
+            return self._bm25_index
+
+    def _build_bm25_index(
+        self,
+        signature: tuple[tuple[str, int, int], ...],
+    ) -> _BM25Index:
+        documents: list[_BM25Document] = []
+        document_frequencies: Counter[str] = Counter()
+
+        for file_path in sorted(self.config.docs_dir.rglob("*.md")):
+            text = file_path.read_text(encoding="utf-8")
+            chunks = chunk_markdown(
+                text,
+                chunk_size=self.config.chunk_size,
+                overlap=self.config.chunk_overlap,
+            )
+            source = self._display_source(file_path)
+            for idx, chunk in enumerate(chunks):
+                tokens = _bm25_tokens(chunk.embedding_text)
+                if not tokens:
+                    continue
+
+                term_counts = Counter(tokens)
+                document_frequencies.update(term_counts.keys())
+                documents.append(
+                    _BM25Document(
+                        result=SearchResult(
+                            text=chunk.text,
+                            source=source,
+                            chunk_id=idx,
+                            score=0.0,
+                            content_type=chunk.content_type,
+                            h1=chunk.h1,
+                            h2=chunk.h2,
+                            h3=chunk.h3,
+                            headings=chunk.headings,
+                            start_line=chunk.start_line,
+                            end_line=chunk.end_line,
+                            retrieval_source="bm25",
+                        ),
+                        term_counts=dict(term_counts),
+                        length=len(tokens),
+                    )
+                )
+
+        average_length = (
+            sum(document.length for document in documents) / len(documents)
+            if documents
+            else 1.0
+        )
+        logger.info(
+            "Built BM25 index from %s chunks under %s.",
+            len(documents),
+            self.config.docs_dir,
+        )
+        return _BM25Index(
+            signature=signature,
+            documents=tuple(documents),
+            document_frequencies=dict(document_frequencies),
+            average_length=max(average_length, 1.0),
+        )
+
+    def _docs_signature(self) -> tuple[tuple[str, int, int], ...]:
+        docs_dir = self.config.docs_dir
+        if not docs_dir.exists():
+            return ()
+
+        signature: list[tuple[str, int, int]] = []
+        for file_path in sorted(docs_dir.rglob("*.md")):
+            stat = file_path.stat()
+            signature.append((str(file_path.resolve()), stat.st_mtime_ns, stat.st_size))
+        return tuple(signature)
+
+    @staticmethod
+    def _rrf_fuse(
+        vector_results: Sequence[SearchResult],
+        bm25_results: Sequence[SearchResult],
+        top_k: int,
+    ) -> list[SearchResult]:
+        by_key: dict[tuple[str, int], SearchResult] = {}
+        rrf_scores: dict[tuple[str, int], float] = {}
+        vector_scores: dict[tuple[str, int], float] = {}
+        bm25_scores: dict[tuple[str, int], float] = {}
+        sources: dict[tuple[str, int], set[str]] = {}
+
+        for label, results in (("vector", vector_results), ("bm25", bm25_results)):
+            for rank, result in enumerate(results, start=1):
+                key = VectorStore._result_key(result)
+                if key not in by_key or label == "vector":
+                    by_key[key] = result
+                rrf_scores[key] = rrf_scores.get(key, 0.0) + (
+                    1.0 / (_RRF_RANK_CONSTANT + rank)
+                )
+                sources.setdefault(key, set()).add(label)
+                if label == "vector":
+                    vector_scores[key] = (
+                        result.vector_score
+                        if result.vector_score is not None
+                        else result.score
+                    )
+                else:
+                    bm25_scores[key] = (
+                        result.bm25_score
+                        if result.bm25_score is not None
+                        else result.score
+                    )
+
+        keys = sorted(
+            rrf_scores,
+            key=lambda key: (
+                rrf_scores[key],
+                vector_scores.get(key, float("-inf")),
+                bm25_scores.get(key, float("-inf")),
+                by_key[key].source,
+                -by_key[key].chunk_id,
+            ),
+            reverse=True,
+        )
+
+        fused: list[SearchResult] = []
+        for key in keys[: max(1, top_k)]:
+            source_labels = sources.get(key, set())
+            retrieval_source = "hybrid" if len(source_labels) > 1 else next(iter(source_labels))
+            rrf_score = rrf_scores[key]
+            fused.append(
+                replace(
+                    by_key[key],
+                    score=rrf_score,
+                    vector_score=vector_scores.get(key),
+                    bm25_score=bm25_scores.get(key),
+                    rrf_score=rrf_score,
+                    retrieval_source=retrieval_source,
+                )
+            )
+        return fused
+
+    @staticmethod
+    def _result_key(result: SearchResult) -> tuple[str, int]:
+        return result.source, result.chunk_id
+
+    @staticmethod
+    def _matches_result_metadata(
+        result: SearchResult,
+        metadata_filter: dict[str, str],
+    ) -> bool:
+        if not metadata_filter:
+            return True
+        for key, expected in metadata_filter.items():
+            if not expected:
+                continue
+            actual = getattr(result, key, "")
+            if actual != expected:
+                return False
+        return True
 
     @staticmethod
     def _metadata_filter(

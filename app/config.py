@@ -38,7 +38,9 @@ class Settings:
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
     chunk_size: int = _env_int("CHUNK_SIZE", 800)
     chunk_overlap: int = _env_int("CHUNK_OVERLAP", 120)
-    recall_top_k: int = _env_int("RECALL_TOP_K", 200)
+    bm25_top_k: int = _env_int("BM25_TOP_K", 100)
+    recall_top_k: int = _env_int("RECALL_TOP_K", 100)
+    rrf_top_k: int = _env_int("RRF_TOP_K", 100)
     retrieve_top_k: int = _env_int("RETRIEVE_TOP_K", 5)
     retrieve_score_threshold: float = _env_float("RETRIEVE_SCORE_THRESHOLD", 0.0)
     api_top_k_max: int = _env_int("API_TOP_K_MAX", 20)
@@ -163,8 +165,12 @@ class Settings:
             raise ValueError("CHUNK_OVERLAP must leave room for new chunk content.")
         if self.retrieve_top_k <= 0:
             raise ValueError("RETRIEVE_TOP_K must be greater than 0.")
+        if self.bm25_top_k <= 0:
+            raise ValueError("BM25_TOP_K must be greater than 0.")
         if self.recall_top_k <= 0:
             raise ValueError("RECALL_TOP_K must be greater than 0.")
+        if self.rrf_top_k <= 0:
+            raise ValueError("RRF_TOP_K must be greater than 0.")
         if self.retrieve_score_threshold < 0:
             raise ValueError(
                 "RETRIEVE_SCORE_THRESHOLD must be greater than or equal to 0."

@@ -1,14 +1,14 @@
 // Entry point: mount views, wire cross-cutting events, manage responsive
 // drawers, and restore the persisted auth session on load.
 
-import { state, on, emit, loadToken, setStatus } from "./store.js";
-import { api } from "./api.js";
-import { byId } from "./dom.js";
-import { mountAuth, signOutLocal } from "./views/auth.js";
-import { mountSessions, loadSessions } from "./views/sessions.js";
-import { mountChat } from "./views/chat.js";
-import { mountMeta, refreshHealth } from "./views/meta.js";
-import { mountAdmin } from "./views/admin.js";
+import { state, on, emit, loadToken, setStatus } from "./store.js?v=20260617-hybrid-retrieval";
+import { api } from "./api.js?v=20260617-hybrid-retrieval";
+import { byId } from "./dom.js?v=20260617-hybrid-retrieval";
+import { mountAuth, signOutLocal } from "./views/auth.js?v=20260617-hybrid-retrieval";
+import { mountSessions, loadSessions } from "./views/sessions.js?v=20260617-hybrid-retrieval";
+import { mountChat } from "./views/chat.js?v=20260617-hybrid-retrieval";
+import { mountMeta, refreshHealth } from "./views/meta.js?v=20260617-hybrid-retrieval";
+import { mountAdmin } from "./views/admin.js?v=20260617-hybrid-retrieval";
 
 mountAuth();
 mountMeta();

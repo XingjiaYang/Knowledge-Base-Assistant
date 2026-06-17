@@ -2,9 +2,9 @@
 // top-level screen is visible. Auth actions emit events that main.js wires
 // to data loading (sessions, health, admin) — avoiding cross-view imports.
 
-import { state, emit, on, saveToken, clearToken, resetState, setStatus } from "../store.js";
-import { api } from "../api.js";
-import { byId } from "../dom.js";
+import { state, emit, on, saveToken, clearToken, resetState, setStatus } from "../store.js?v=20260617-hybrid-retrieval";
+import { api } from "../api.js?v=20260617-hybrid-retrieval";
+import { byId } from "../dom.js?v=20260617-hybrid-retrieval";
 
 let els = {};
 

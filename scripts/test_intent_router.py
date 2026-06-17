@@ -28,10 +28,28 @@ class FakeVectorStore:
     def __init__(self) -> None:
         self.search_calls = 0
         self.search_top_ks: list[int | None] = []
+        self.bm25_top_ks: list[int | None] = []
+        self.rrf_top_ks: list[int | None] = []
 
     def search(self, query: str, top_k: int | None = None) -> list[SearchResult]:
         self.search_calls += 1
         self.search_top_ks.append(top_k)
+        return self._results()
+
+    def hybrid_search(
+        self,
+        query: str,
+        bm25_top_k: int | None = None,
+        vector_top_k: int | None = None,
+        rrf_top_k: int | None = None,
+    ) -> list[SearchResult]:
+        self.search_calls += 1
+        self.bm25_top_ks.append(bm25_top_k)
+        self.search_top_ks.append(vector_top_k)
+        self.rrf_top_ks.append(rrf_top_k)
+        return self._results()
+
+    def _results(self) -> list[SearchResult]:
         return [
             SearchResult(
                 text="New employees request equipment through the IT portal.",
@@ -190,11 +208,21 @@ def assert_pipeline_search_behavior() -> None:
     if direct_answer.used_rag or vector_store.search_calls != 0 or reranker.calls:
         raise AssertionError("Direct route should not call vector search.")
 
-    rag_answer = pipeline.answer("新员工如何申请开发设备？", top_k=2, recall_top_k=7)
+    rag_answer = pipeline.answer(
+        "新员工如何申请开发设备？",
+        top_k=2,
+        bm25_top_k=6,
+        recall_top_k=7,
+        rrf_top_k=5,
+    )
     if not rag_answer.used_rag or vector_store.search_calls != 1:
         raise AssertionError("Knowledge-base route should call vector search once.")
     if vector_store.search_top_ks != [7]:
         raise AssertionError("Vector recall should use recall_top_k.")
+    if vector_store.bm25_top_ks != [6]:
+        raise AssertionError("BM25 recall should use bm25_top_k.")
+    if vector_store.rrf_top_ks != [5]:
+        raise AssertionError("RRF fusion should use rrf_top_k.")
     if reranker.calls != [("新员工如何申请开发设备？", 3, 2)]:
         raise AssertionError(f"Reranker should receive recalled contexts: {reranker.calls}")
     if [context.chunk_id for context in rag_answer.contexts] != [2, 1]:

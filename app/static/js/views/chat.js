@@ -1,10 +1,10 @@
 // Chat column: message log, composer, and the references panel rendering.
 
-import { state, on, emit } from "../store.js";
-import { api } from "../api.js";
-import { byId, el, clear, icon } from "../dom.js";
-import { renderMarkdown } from "../markdown.js";
-import { createSession, reloadSessions } from "./sessions.js";
+import { state, on, emit } from "../store.js?v=20260617-hybrid-retrieval";
+import { api } from "../api.js?v=20260617-hybrid-retrieval";
+import { byId, el, clear, icon } from "../dom.js?v=20260617-hybrid-retrieval";
+import { renderMarkdown } from "../markdown.js?v=20260617-hybrid-retrieval";
+import { createSession, reloadSessions } from "./sessions.js?v=20260617-hybrid-retrieval";
 
 let els = {};
 
@@ -76,7 +76,9 @@ async function ask(question) {
     const data = await api.ask({
       question,
       session_id: state.activeSessionId,
+      bm25_top_k: state.bm25TopK ?? null,
       recall_top_k: state.recallTopK ?? null,
+      rrf_top_k: state.rrfTopK ?? null,
       top_k: state.topK ?? null,
     });
 
@@ -207,19 +209,31 @@ function renderReferences() {
 
 function renderReferenceCard(item, maxLength) {
   const left = el("div", {}, [el("div", { class: "ref-source", text: item.source })]);
-  const sub = [`chunk ${item.chunk_id}`, item.content_type || "text"];
+  const sourceLabel = item.retrieval_source || "retrieval";
+  const sub = [`chunk ${item.chunk_id}`, item.content_type || "text", sourceLabel];
   const headings =
     Array.isArray(item.headings) && item.headings.length ? item.headings.join(" › ") : "";
   if (headings) sub.push(headings);
   left.append(el("div", { class: "ref-sub", text: sub.join(" · ") }));
 
   const hasRerank = item.rerank_score !== null && item.rerank_score !== undefined;
+  const scoreParts = [
+    item.rrf_score !== null && item.rrf_score !== undefined
+      ? `rrf ${Number(item.rrf_score).toFixed(4)}`
+      : "",
+    item.vector_score !== null && item.vector_score !== undefined
+      ? `vector ${Number(item.vector_score).toFixed(4)}`
+      : "",
+    item.bm25_score !== null && item.bm25_score !== undefined
+      ? `bm25 ${Number(item.bm25_score).toFixed(3)}`
+      : "",
+  ].filter(Boolean);
   const score = el("div", {
     class: "ref-score",
     text: hasRerank
       ? `rerank ${Number(item.rerank_score).toFixed(3)}`
-      : `vector ${Number(item.score).toFixed(3)}`,
-    title: hasRerank ? `vector score ${Number(item.score).toFixed(4)}` : "",
+      : scoreParts[0] || `score ${Number(item.score).toFixed(3)}`,
+    title: scoreParts.join(" · "),
   });
 
   const meta = el("div", { class: "ref-meta" }, [left, score]);

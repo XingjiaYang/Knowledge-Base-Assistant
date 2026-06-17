@@ -57,6 +57,8 @@ class RAGPipeline:
         question: str,
         top_k: int | None = None,
         recall_top_k: int | None = None,
+        bm25_top_k: int | None = None,
+        rrf_top_k: int | None = None,
         history: list[ChatMessage] | None = None,
         conversation_summary: str | None = None,
     ) -> RAGAnswer:
@@ -67,11 +69,14 @@ class RAGPipeline:
         )
         intent = self.intent_router.route(question, recent_history, summary)
         logger.info(
-            "RAG request routed: route=%s use_rag=%s recall_top_k=%s top_k=%s "
-            "history=%s compacted=%s",
+            "RAG request routed: route=%s use_rag=%s bm25_top_k=%s "
+            "vector_top_k=%s rrf_top_k=%s final_top_k=%s history=%s "
+            "compacted=%s",
             intent.route,
             intent.use_rag,
-            self._recall_top_k(recall_top_k, top_k),
+            self._bm25_top_k(bm25_top_k),
+            self._vector_top_k(recall_top_k),
+            self._rrf_top_k(rrf_top_k, top_k),
             self._final_top_k(top_k),
             len(recent_history),
             compacted_count,
@@ -83,6 +88,8 @@ class RAGPipeline:
                 search_query,
                 top_k=top_k,
                 recall_top_k=recall_top_k,
+                bm25_top_k=bm25_top_k,
+                rrf_top_k=rrf_top_k,
             )
             messages = self._build_rag_messages(
                 question,
@@ -110,12 +117,27 @@ class RAGPipeline:
         search_query: str,
         top_k: int | None = None,
         recall_top_k: int | None = None,
+        bm25_top_k: int | None = None,
+        rrf_top_k: int | None = None,
     ) -> list[SearchResult]:
         final_top_k = self._final_top_k(top_k)
-        recall_limit = self._recall_top_k(recall_top_k, top_k)
-        recalled_contexts = self.vector_store.search(search_query, top_k=recall_limit)
+        bm25_limit = self._bm25_top_k(bm25_top_k)
+        vector_limit = self._vector_top_k(recall_top_k)
+        rrf_limit = self._rrf_top_k(rrf_top_k, top_k)
+        if hasattr(self.vector_store, "hybrid_search"):
+            recalled_contexts = self.vector_store.hybrid_search(
+                search_query,
+                bm25_top_k=bm25_limit,
+                vector_top_k=vector_limit,
+                rrf_top_k=rrf_limit,
+            )
+        else:
+            recalled_contexts = self.vector_store.search(
+                search_query,
+                top_k=vector_limit,
+            )[:rrf_limit]
         logger.info(
-            "Vector recall returned %s contexts before reranking.",
+            "Hybrid recall returned %s contexts before reranking.",
             len(recalled_contexts),
         )
 
@@ -137,14 +159,20 @@ class RAGPipeline:
     def _final_top_k(self, top_k: int | None = None) -> int:
         return max(1, top_k or self.config.retrieve_top_k)
 
-    def _recall_top_k(
+    def _bm25_top_k(self, bm25_top_k: int | None = None) -> int:
+        return max(1, bm25_top_k or self.config.bm25_top_k)
+
+    def _vector_top_k(self, recall_top_k: int | None = None) -> int:
+        return max(1, recall_top_k or self.config.recall_top_k)
+
+    def _rrf_top_k(
         self,
-        recall_top_k: int | None = None,
+        rrf_top_k: int | None = None,
         top_k: int | None = None,
     ) -> int:
         final_top_k = self._final_top_k(top_k)
-        recall_limit = max(1, recall_top_k or self.config.recall_top_k)
-        return max(recall_limit, final_top_k)
+        fused_limit = max(1, rrf_top_k or self.config.rrf_top_k)
+        return max(fused_limit, final_top_k)
 
     def _normalize_history(self, history: list[ChatMessage]) -> list[ChatMessage]:
         max_messages = max(0, self.config.history_max_messages)
