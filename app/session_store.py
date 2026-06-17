@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 import psycopg
 from psycopg.rows import dict_row
 
-from app.config import Settings, settings
+from app.config import LLMRuntimeSettings, Settings, normalize_llm_provider, settings
 from app.rag import ChatMessage
 from app.vector_store import SearchResult
 
@@ -33,6 +33,7 @@ class CurrentUser:
     username: str
     is_admin: bool = False
     must_change_password: bool = False
+    is_superuser: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class UserRecord:
     username: str
     is_active: bool
     is_admin: bool
+    is_superuser: bool
     must_change_password: bool
     created_at: datetime
     updated_at: datetime
@@ -72,6 +74,15 @@ class StoredChatMessage:
     created_at: datetime
 
 
+@dataclass(frozen=True)
+class LLMSettingsRecord:
+    provider: str
+    base_url: str
+    model: str
+    api_key_configured: bool
+    source: str
+
+
 class SessionStore:
     def __init__(self, config: Settings = settings) -> None:
         self.config = config
@@ -87,6 +98,7 @@ class SessionStore:
                         password_hash TEXT NOT NULL,
                         is_active BOOLEAN NOT NULL DEFAULT TRUE,
                         is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                        is_superuser BOOLEAN NOT NULL DEFAULT FALSE,
                         must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -103,7 +115,20 @@ class SessionStore:
                 cur.execute(
                     """
                     ALTER TABLE app_users
+                    ADD COLUMN IF NOT EXISTS is_superuser BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE app_users
                     ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_app_users_single_superuser
+                    ON app_users (is_superuser)
+                    WHERE is_superuser = TRUE
                     """
                 )
                 cur.execute(
@@ -175,6 +200,15 @@ class SessionStore:
                     ON chat_messages(session_id, id)
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
             self._bootstrap_users(conn)
             self.delete_expired_auth_sessions(conn)
 
@@ -195,9 +229,10 @@ class SessionStore:
                         username,
                         password_hash,
                         is_admin,
+                        is_superuser,
                         must_change_password
                     )
-                    VALUES (%s, %s, %s, FALSE, FALSE)
+                    VALUES (%s, %s, %s, FALSE, FALSE, FALSE)
                     ON CONFLICT (username) DO NOTHING
                     """,
                     (uuid4(), normalize_username(username), hash_password(password)),
@@ -211,17 +246,28 @@ class SessionStore:
 
         conn.execute(
             """
+            UPDATE app_users
+            SET is_superuser = FALSE,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE username <> %s AND is_superuser = TRUE
+            """,
+            (username,),
+        )
+        conn.execute(
+            """
             INSERT INTO app_users (
                 id,
                 username,
                 password_hash,
                 is_active,
                 is_admin,
+                is_superuser,
                 must_change_password
             )
-            VALUES (%s, %s, %s, TRUE, TRUE, FALSE)
+            VALUES (%s, %s, %s, TRUE, TRUE, TRUE, FALSE)
             ON CONFLICT (username) DO UPDATE
             SET is_admin = TRUE,
+                is_superuser = TRUE,
                 is_active = TRUE,
                 must_change_password = CASE
                     WHEN app_users.is_admin = FALSE OR app_users.is_active = FALSE
@@ -229,7 +275,9 @@ class SessionStore:
                     ELSE app_users.must_change_password
                 END,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE app_users.is_admin = FALSE OR app_users.is_active = FALSE
+            WHERE app_users.is_admin = FALSE
+               OR app_users.is_superuser = FALSE
+               OR app_users.is_active = FALSE
             """,
             (uuid4(), username, hash_password(password)),
         )
@@ -239,7 +287,12 @@ class SessionStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, username, password_hash, is_admin, must_change_password
+                SELECT id,
+                       username,
+                       password_hash,
+                       is_admin,
+                       is_superuser,
+                       must_change_password
                 FROM app_users
                 WHERE username = %s AND is_active = TRUE
                 """,
@@ -261,6 +314,7 @@ class SessionStore:
                 id=row["id"],
                 username=row["username"],
                 is_admin=row["is_admin"],
+                is_superuser=row["is_superuser"],
                 must_change_password=row["must_change_password"],
             )
 
@@ -303,7 +357,11 @@ class SessionStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT u.id, u.username, u.is_admin, u.must_change_password
+                SELECT u.id,
+                       u.username,
+                       u.is_admin,
+                       u.is_superuser,
+                       u.must_change_password
                 FROM auth_sessions s
                 JOIN app_users u ON u.id = s.user_id
                 WHERE s.token_hash = %s
@@ -327,6 +385,7 @@ class SessionStore:
                 id=row["id"],
                 username=row["username"],
                 is_admin=row["is_admin"],
+                is_superuser=row["is_superuser"],
                 must_change_password=row["must_change_password"],
             )
 
@@ -338,6 +397,7 @@ class SessionStore:
                        u.username,
                        u.is_active,
                        u.is_admin,
+                       u.is_superuser,
                        u.must_change_password,
                        u.created_at,
                        u.updated_at,
@@ -373,14 +433,16 @@ class SessionStore:
                     password_hash,
                     is_active,
                     is_admin,
+                    is_superuser,
                     must_change_password
                 )
-                VALUES (%s, %s, %s, TRUE, %s, %s)
+                VALUES (%s, %s, %s, TRUE, %s, FALSE, %s)
                 ON CONFLICT (username) DO NOTHING
                 RETURNING id,
                           username,
                           is_active,
                           is_admin,
+                          is_superuser,
                           must_change_password,
                           created_at,
                           updated_at,
@@ -428,14 +490,16 @@ class SessionStore:
                         password_hash,
                         is_active,
                         is_admin,
+                        is_superuser,
                         must_change_password
                     )
-                    VALUES (%s, %s, %s, TRUE, %s, %s)
+                    VALUES (%s, %s, %s, TRUE, %s, FALSE, %s)
                     ON CONFLICT (username) DO NOTHING
                     RETURNING id,
                               username,
                               is_active,
                               is_admin,
+                              is_superuser,
                               must_change_password,
                               created_at,
                               updated_at,
@@ -518,6 +582,8 @@ class SessionStore:
 
     def set_user_admin(self, user_id: UUID, is_admin: bool) -> bool:
         with self._connect() as conn:
+            if not is_admin and self._is_superuser(conn, user_id):
+                raise ValueError("Cannot remove administrator role from superuser.")
             if not is_admin and self._is_last_admin(conn, user_id):
                 raise ValueError("Cannot remove the last administrator.")
 
@@ -534,6 +600,8 @@ class SessionStore:
 
     def delete_user(self, user_id: UUID) -> bool:
         with self._connect() as conn:
+            if self._is_superuser(conn, user_id):
+                raise ValueError("Cannot delete the superuser.")
             if self._is_last_admin(conn, user_id):
                 raise ValueError("Cannot delete the last administrator.")
 
@@ -547,6 +615,89 @@ class SessionStore:
                 (user_id,),
             )
         return result.rowcount
+
+    def get_llm_runtime_settings(self) -> LLMRuntimeSettings:
+        values = self._read_settings(
+            [
+                "llm_provider",
+                "llm_base_url",
+                "llm_api_key",
+                "llm_model",
+            ]
+        )
+        return LLMRuntimeSettings.from_settings(
+            self.config,
+            provider=values.get("llm_provider"),
+            base_url=values.get("llm_base_url"),
+            api_key=values.get("llm_api_key"),
+            model=values.get("llm_model"),
+        ).validate()
+
+    def get_llm_settings_record(self) -> LLMSettingsRecord:
+        values = self._read_settings(
+            [
+                "llm_provider",
+                "llm_base_url",
+                "llm_api_key",
+                "llm_model",
+            ]
+        )
+        runtime = LLMRuntimeSettings.from_settings(
+            self.config,
+            provider=values.get("llm_provider"),
+            base_url=values.get("llm_base_url"),
+            api_key=values.get("llm_api_key"),
+            model=values.get("llm_model"),
+        ).validate()
+        return LLMSettingsRecord(
+            provider=runtime.llm_provider,
+            base_url=runtime.llm_base_url,
+            model=runtime.llm_model,
+            api_key_configured=bool(runtime.llm_api_key),
+            source="database" if values else ".env",
+        )
+
+    def update_llm_settings(
+        self,
+        provider: str,
+        base_url: str,
+        model: str,
+        api_key: str | None = None,
+    ) -> LLMSettingsRecord:
+        provider = normalize_llm_provider(provider)
+        base_url = base_url.strip()
+        model = model.strip()
+        current = self.get_llm_runtime_settings()
+        runtime = LLMRuntimeSettings.from_settings(
+            self.config,
+            provider=provider,
+            base_url=base_url,
+            api_key=current.llm_api_key if api_key is None else api_key.strip(),
+            model=model,
+        ).validate()
+
+        values = {
+            "llm_provider": runtime.llm_provider,
+            "llm_base_url": runtime.llm_base_url,
+            "llm_model": runtime.llm_model,
+        }
+        if api_key is not None:
+            values["llm_api_key"] = runtime.llm_api_key
+
+        with self._connect() as conn:
+            for key, value in values.items():
+                conn.execute(
+                    """
+                    INSERT INTO app_settings (key, value)
+                    VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE
+                    SET value = EXCLUDED.value,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (key, value),
+                )
+
+        return self.get_llm_settings_record()
 
     def delete_auth_session(self, token: str) -> None:
         with self._connect() as conn:
@@ -832,6 +983,27 @@ class SessionStore:
         ).fetchone()["count"]
         return int(admin_count) <= 1
 
+    def _is_superuser(self, conn: psycopg.Connection[Any], user_id: UUID) -> bool:
+        row = conn.execute(
+            "SELECT is_superuser FROM app_users WHERE id = %s",
+            (user_id,),
+        ).fetchone()
+        return bool(row and row["is_superuser"])
+
+    def _read_settings(self, keys: list[str]) -> dict[str, str]:
+        if not keys:
+            return {}
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT key, value
+                FROM app_settings
+                WHERE key = ANY(%s)
+                """,
+                (keys,),
+            ).fetchall()
+        return {row["key"]: row["value"] for row in rows}
+
     def _connect(self) -> psycopg.Connection[Any]:
         return psycopg.connect(
             self.config.database_url,
@@ -932,6 +1104,7 @@ def user_record_from_row(row: dict[str, Any]) -> UserRecord:
         username=row["username"],
         is_active=row["is_active"],
         is_admin=row["is_admin"],
+        is_superuser=row["is_superuser"],
         must_change_password=row["must_change_password"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],

@@ -27,6 +27,13 @@ export function mountAdmin() {
     csvForm: byId("adminCsvForm"),
     csvFile: byId("adminCsvFile"),
     csvStatus: byId("adminCsvStatus"),
+    llmSection: byId("adminLlmSettingsSection"),
+    llmForm: byId("adminLlmSettingsForm"),
+    llmProvider: byId("adminLlmProvider"),
+    llmBaseUrl: byId("adminLlmBaseUrl"),
+    llmModel: byId("adminLlmModel"),
+    llmApiKey: byId("adminLlmApiKey"),
+    llmStatus: byId("adminLlmSettingsStatus"),
     error: byId("adminError"),
     refreshButton: byId("adminRefreshButton"),
     userList: byId("adminUserList"),
@@ -34,14 +41,17 @@ export function mountAdmin() {
 
   els.createForm.addEventListener("submit", onCreate);
   els.csvForm.addEventListener("submit", onImportCsv);
+  els.llmForm.addEventListener("submit", onSaveLLMSettings);
   els.refreshButton.addEventListener("click", loadAdminUsers);
 
   on("admin", renderAdminUsers);
   on("open-admin", () => {
     setAlert(els.createStatus, "");
     setAlert(els.csvStatus, "");
+    setAlert(els.llmStatus, "");
     setAlert(els.error, "");
     loadAdminUsers();
+    loadLLMSettings();
   });
 }
 
@@ -54,6 +64,18 @@ export async function loadAdminUsers() {
     return;
   }
   emit("admin");
+}
+
+async function loadLLMSettings() {
+  const isSuperuser = Boolean(state.currentUser?.is_superuser);
+  els.llmSection.hidden = !isSuperuser;
+  if (!isSuperuser) return;
+  try {
+    state.llmSettings = await api.getLLMSettings();
+    renderLLMSettings();
+  } catch (error) {
+    setAlert(els.llmStatus, error.message || "Unable to load LLM settings.", "error");
+  }
 }
 
 async function onCreate(event) {
@@ -92,6 +114,29 @@ async function onImportCsv(event) {
     await loadAdminUsers();
   } catch (error) {
     setAlert(els.csvStatus, error.message, "error");
+  }
+}
+
+async function onSaveLLMSettings(event) {
+  event.preventDefault();
+  const payload = {
+    provider: els.llmProvider.value,
+    base_url: els.llmBaseUrl.value.trim(),
+    model: els.llmModel.value.trim(),
+  };
+  const apiKey = els.llmApiKey.value.trim();
+  if (apiKey) payload.api_key = apiKey;
+  if (!payload.base_url || !payload.model) {
+    setAlert(els.llmStatus, "API URL and model are required.", "error");
+    return;
+  }
+  try {
+    state.llmSettings = await api.updateLLMSettings(payload);
+    els.llmApiKey.value = "";
+    renderLLMSettings();
+    setAlert(els.llmStatus, "LLM settings saved.", "success");
+  } catch (error) {
+    setAlert(els.llmStatus, error.message, "error");
   }
 }
 
@@ -158,10 +203,26 @@ function renderAdminUsers() {
   }
 }
 
+function renderLLMSettings() {
+  const settings = state.llmSettings;
+  if (!settings) return;
+  els.llmProvider.value = settings.provider || "openai_compatible";
+  els.llmBaseUrl.value = settings.base_url || "";
+  els.llmModel.value = settings.model || "";
+  const keyState = settings.api_key_configured ? "key configured" : "no key configured";
+  setAlert(
+    els.llmStatus,
+    `Using ${settings.source || ".env"} settings, ${keyState}.`,
+    "success",
+  );
+}
+
 function renderUser(user) {
   const isSelf = user.id === state.currentUser?.id;
+  const isSuperuser = Boolean(user.is_superuser);
 
   const tags = el("div", { class: "admin-user-tags" });
+  if (isSuperuser) tags.append(el("span", { class: "tag admin", text: "Superuser" }));
   if (user.is_admin) tags.append(el("span", { class: "tag admin", text: "Admin" }));
   tags.append(el("span", { class: "tag", text: `${user.session_count || 0} sessions` }));
   tags.append(el("span", { class: "tag", text: `${user.message_count || 0} messages` }));
@@ -174,7 +235,7 @@ function renderUser(user) {
     tags,
   ]);
 
-  const roleCheckbox = el("input", { type: "checkbox", disabled: isSelf });
+  const roleCheckbox = el("input", { type: "checkbox", disabled: isSelf || isSuperuser });
   roleCheckbox.checked = Boolean(user.is_admin);
   roleCheckbox.addEventListener("change", () =>
     toggleRole(user, roleCheckbox.checked, roleCheckbox),
@@ -197,7 +258,7 @@ function renderUser(user) {
       {
         class: "btn btn-danger btn-sm",
         type: "button",
-        disabled: isSelf,
+        disabled: isSelf || isSuperuser,
         onClick: () => deleteUser(user),
       },
       [icon("close"), "Delete"],

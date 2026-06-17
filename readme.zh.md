@@ -85,7 +85,12 @@ password: 123456
 ```
 
 生产或公网环境必须修改 `AUTH_DEFAULT_ADMIN_PASSWORD`。如果 PostgreSQL volume 中
-已经存在 `admin` 用户，启动时不会覆盖该用户当前密码。
+已经存在 `admin` 用户，启动时不会覆盖该用户当前密码。启动时创建的默认
+administrator 同时是唯一 superuser；只有这个 superuser 能在前端 Admin 面板修改
+全局 LLM 配置，包括 API 格式（`openai_compatible` 或 `anthropic`）、API URL、
+模型名和 API key。前端保存后配置写入 PostgreSQL 并覆盖 `.env` 中的 LLM 默认值，
+不需要 rebuild 容器；`.env` 仍作为首次启动和未配置时的 fallback。API key 不会回显
+给浏览器，保存时 key 输入框留空表示保留当前 key。
 
 启动服务：
 

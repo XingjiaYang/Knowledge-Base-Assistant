@@ -104,13 +104,13 @@ Browser UI  →  POST /rag
 ### Key Modules
 
 - **`app/config.py`** — Frozen `Settings` dataclass; every tunable parameter is read from env vars here. Adding new config always goes through this class; never hard-code URLs, model names, or limits elsewhere.
-- **`app/main.py`** — FastAPI lifespan (constructs all singletons: `VectorStore`, `LLMClient`, `SessionStore`, `Reranker`, `RAGPipeline`), route definitions, Pydantic request/response models, and auth dependency chain (`require_login_auth` → `require_password_ready_user` → `require_admin_auth`). Serves the UI shell at `/` and mounts static assets at `/static`.
+- **`app/main.py`** — FastAPI lifespan (constructs all singletons: `VectorStore`, `SessionStore`, runtime-configured `LLMClient`, `Reranker`, `RAGPipeline`), route definitions, Pydantic request/response models, and auth dependency chain (`require_login_auth` → `require_password_ready_user` → `require_admin_auth` → `require_superuser_auth`). Serves the UI shell at `/` and mounts static assets at `/static`.
 - **`app/intent_router.py`** — Three-pass classifier: (1) keyword exact/regex match against `FORCE_*`, `DOMAIN_RAG_*`, and `DIRECT_TASK_PATTERNS`; (2) cosine similarity against `RAG_ANCHORS`/`DIRECT_ANCHORS` using the same BGE embedding model; (3) LLM zero-shot fallback. **When swapping the corpus, update `DOMAIN_RAG_PHRASES`, `DOMAIN_RAG_PATTERNS`, and the LLM fallback prompt string inside `_route_with_llm`.**
 - **`app/rag.py`** — Orchestrates the full answer pipeline: history normalization, history compaction (rolling summary via LLM when turn count exceeds `HISTORY_COMPACT_AFTER_TURNS`), intent routing, BM25 + vector recall, RRF fusion, reranking, and prompt construction. `RAGPipeline.answer()` is the single entry point from the API layer.
 - **`app/vector_store.py`** — Markdown-aware chunking (text/code/table separately, heading metadata preserved as `h1`/`h2`/`h3` payload), SentenceTransformers BGE embedding, BM25 keyword indexing over local Markdown chunks, RRF fusion, and Qdrant collection management. Incremental ingest replaces all chunks by `source` filename so no stale chunks accumulate on edits.
 - **`app/reranker.py`** — Jina `jina-reranker-v3` cross-encoder, loaded via `AutoModel.rerank()` (requires `trust_remote_code=True`). Pre-warmed at startup when `RERANKER_PRELOAD=1`. Batched when recall exceeds `RERANKER_MAX_DOCUMENTS_PER_CALL`.
-- **`app/llm_client.py`** — Provider-aware HTTP client supporting `openai_compatible` and `anthropic`. Retries `429`/`5xx` with exponential backoff. The `LLMClient` instance is shared across RAG, history compaction, and intent routing calls.
-- **`app/session_store.py`** — Raw `psycopg2` PostgreSQL (no ORM). Manages users, PBKDF2-SHA256 passwords, SHA-256 bearer tokens, chat sessions, messages with retrieved contexts as JSON, retrieval scores (`vector_score`, `bm25_score`, `rrf_score`, `rerank_score`), route metadata, and compacted conversation summaries.
+- **`app/llm_client.py`** — Provider-aware HTTP client supporting `openai_compatible` and `anthropic`. It reads runtime LLM provider/base URL/model/API key overrides from `SessionStore` before each request while keeping `.env` as fallback. Retries `429`/`5xx` with exponential backoff. The `LLMClient` instance is shared across RAG, history compaction, and intent routing calls.
+- **`app/session_store.py`** — Raw `psycopg2` PostgreSQL (no ORM). Manages users, the single startup-created superuser, PBKDF2-SHA256 passwords, SHA-256 bearer tokens, chat sessions, messages with retrieved contexts as JSON, runtime LLM settings in `app_settings`, retrieval scores (`vector_score`, `bm25_score`, `rrf_score`, `rerank_score`), route metadata, and compacted conversation summaries.
 - **`app/prompt_budget.py`** — Text-trimming utilities used by both `RAGPipeline` and `IntentRouter` to enforce character budgets before building prompts.
 - **`app/security.py`** — `bearer_token()` extracts the raw token string from the `Authorization` header.
 
@@ -135,6 +135,12 @@ Plain ES modules served directly by FastAPI — **no build step, no npm, no CDN*
 | Local vLLM | `openai_compatible` | `http://vllm:8000/v1` |
 
 For Anthropic, the `LLM_ANTHROPIC_VERSION` env var pins the API version header. Health check endpoint defaults: `GET /models` for OpenAI-compatible, `POST /messages/count_tokens` for Anthropic. Override with `LLM_HEALTH_PATH`.
+
+The default startup admin is the only superuser. It can update the runtime LLM
+provider, API base URL, model name, and API key from the Admin UI. These values
+are stored in PostgreSQL `app_settings` and override `.env` without a rebuild;
+blank API key submissions preserve the current key, and API keys are never
+returned to the browser.
 
 ### GPU / CUDA Behavior
 

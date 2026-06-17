@@ -113,9 +113,13 @@ password: 123456
 
 Change `AUTH_DEFAULT_ADMIN_PASSWORD` before exposing the app beyond local
 development. If the PostgreSQL volume already contains that user, startup keeps
-the existing password. Admin-created and CSV-imported users default to
-`must_change_password`, so they must update their password before using app
-features.
+the existing password. The startup-created administrator is the only
+superuser. Superuser-only Admin UI controls can update the global LLM provider
+format, API base URL, model name, and API key at runtime; those values are
+stored in PostgreSQL `app_settings` and override the `.env` LLM defaults. API
+keys are write-only from the browser's perspective. Admin-created and
+CSV-imported users default to `must_change_password`, so they must update their
+password before using app features.
 
 For restricted networks, configure runtime proxy or mirror values in `.env`.
 Docker daemon proxy settings only affect image pulls, not running containers.
