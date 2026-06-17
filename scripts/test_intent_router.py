@@ -295,6 +295,8 @@ def assert_llm_fallback_behavior() -> None:
     fallback_prompt = classifier.calls[-1][-1]["content"]
     if "家是本" not in fallback_prompt or "朱剑秋" not in fallback_prompt:
         raise AssertionError("LLM fallback prompt should describe the local corpus.")
+    if "巨大历史机遇" not in fallback_prompt or "巨大历史鲫鱼" not in fallback_prompt:
+        raise AssertionError("LLM fallback prompt should include the new meme topic.")
     if "SQL/database questions" not in fallback_prompt:
         raise AssertionError(
             "LLM fallback prompt should route unrelated SQL/database questions direct."
@@ -369,6 +371,18 @@ def main() -> None:
     assert_route(
         router,
         "家是本菜单价格如何？",
+        True,
+        expected_route="keyword_rag",
+    )
+    assert_route(
+        router,
+        "巨大历史机遇和巨大历史鲫鱼是什么梗？",
+        True,
+        expected_route="keyword_rag",
+    )
+    assert_route(
+        router,
+        "春熙路门店照片里的标语为什么会火？",
         True,
         expected_route="keyword_rag",
     )

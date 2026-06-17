@@ -95,6 +95,11 @@ class IntentRouter:
         "勇哥",
         "老妈蹄花",
         "葱油饼",
+        "巨大历史机遇",
+        "巨大历史鲫鱼",
+        "历史鲫鱼",
+        "历史机遇体验店",
+        "春熙路神秘小吃店",
         "三年千店",
         "千店扩张",
         "1000家",
@@ -107,6 +112,10 @@ class IntentRouter:
         "哔哩哔哩账号",
         "哔哩哔哩弹幕",
         "bilibili comments",
+        "giant historical opportunity",
+        "huge historical opportunity",
+        "giant historical crucian carp",
+        "historical crucian carp",
         "jiashiben",
         "jia shi ben",
         "zhu jianqiu",
@@ -118,21 +127,34 @@ class IntentRouter:
 
     DOMAIN_RAG_PATTERNS = (
         (
-            r"(家是本|朱剑秋|朱老板|勇哥).{0,40}"
+            r"(家是本|朱剑秋|朱老板|勇哥|巨大历史机遇|巨大历史鲫鱼|历史机遇|历史鲫鱼).{0,40}"
             r"(菜单|定价|价格|财务|营业额|亏损|盈利|客流|租金|选址|春熙路|"
             r"口号|家文化|商标|品牌|妻子|老婆|评论|差评|弹幕|黑粉|引流|"
-            r"豆包|ai|视频|连线|千店|1000家|扩张)"
+            r"豆包|ai|视频|连线|千店|1000家|扩张|标语|门店照片|红色大字|"
+            r"梗|谐音|二创|历史机遇|历史鲫鱼)"
         ),
         (
             r"(菜单|定价|价格|财务|营业额|亏损|盈利|客流|租金|选址|春熙路|"
             r"口号|家文化|商标|品牌|妻子|老婆|评论|差评|弹幕|黑粉|引流|"
-            r"豆包|ai|视频|连线|千店|1000家|扩张).{0,40}"
-            r"(家是本|朱剑秋|朱老板|勇哥)"
+            r"豆包|ai|视频|连线|千店|1000家|扩张|标语|门店照片|红色大字|"
+            r"梗|谐音|二创|历史机遇|历史鲫鱼).{0,40}"
+            r"(家是本|朱剑秋|朱老板|勇哥|巨大历史机遇|巨大历史鲫鱼|历史机遇|历史鲫鱼)"
         ),
         (
-            r"(jiashiben|jia shi ben|zhu jianqiu|yongge|yong ge).{0,80}"
+            r"(春熙路|门店照片|小吃店|红色大字|标语).{0,40}"
+            r"(巨大|历史机遇|历史鲫鱼|谐音|玩梗|二创|标语|口号|家是本|朱剑秋)"
+        ),
+        (
+            r"(巨大|历史机遇|历史鲫鱼|谐音|玩梗|二创|标语|口号|家是本|朱剑秋).{0,40}"
+            r"(春熙路|门店照片|小吃店|红色大字|标语)"
+        ),
+        (
+            r"(jiashiben|jia shi ben|zhu jianqiu|yongge|yong ge|"
+            r"giant historical opportunity|huge historical opportunity|"
+            r"giant historical crucian carp|historical crucian carp).{0,80}"
             r"(menu|price|pricing|finance|revenue|rent|comments|reviews|"
-            r"bilibili|doubao|live|incident|expansion|1000 stores)"
+            r"bilibili|doubao|live|incident|expansion|1000 stores|meme|"
+            r"slogan|wall slogan|viral phrase)"
         ),
     )
 
@@ -330,7 +352,8 @@ class IntentRouter:
             "The currently indexed corpus is a synthetic Chinese restaurant "
             "and business case about 家是本, 朱剑秋, 勇哥连线, menu pricing, "
             "customer reviews, Bilibili/social-media reactions, financial "
-            "simulation, and the related timeline. Use retrieval only when "
+            "simulation, the related timeline, and the 巨大历史机遇/巨大历史鲫鱼 "
+            "slogan meme. Use retrieval only when "
             "the current question is about that local corpus, asks for local "
             "document evidence, asks for citations/references, or is a "
             "follow-up whose recent conversation clearly stays on that corpus. "

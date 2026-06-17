@@ -16,7 +16,8 @@ optional Docker Compose profile.
 
 The repository currently ships with a synthetic restaurant/business case corpus
 about 家是本, 朱剑秋, the Yongge livestream incident, menu pricing, customer
-reviews, social-media reactions, and financial simulation. The corpus is
+reviews, social-media reactions, financial simulation, and the 巨大历史机遇/巨大历史鲫鱼
+slogan meme. The corpus is
 intentionally niche so retrieval grounding matters more than pretrained model
 memory. The intent router keeps its embedding layer domain-general, while the
 keyword layer and LLM fallback prompt include lightweight corpus-specific
@@ -370,9 +371,9 @@ rejected. `/rag` accepts a `session_id` and manages history server-side.
 The Markdown files under `data/docs/` provide the runtime domain content.
 Ingestion scans that tree recursively, so nested topic folders are supported.
 The committed files cover a generated restaurant/business case corpus about
-家是本 and 朱剑秋. Because these topics are unlikely to be memorized well by
-general models, they are a better fit for RAG evaluation than common SQL or
-database-system facts.
+家是本, 朱剑秋, and the 巨大历史机遇/巨大历史鲫鱼 meme. Because these topics are
+unlikely to be memorized well by general models, they are a better fit for RAG
+evaluation than common SQL or database-system facts.
 
 To use another subject:
 
@@ -582,7 +583,8 @@ Markdown files in `data/docs/` are the RAG source of truth. The bundled sample
 files cover a generated Chinese restaurant/business case: company overview,
 FAQ, menu and pricing, customer reviews, Bilibili comments, social-media
 archives, financial simulation, a timeline, a profile of 朱剑秋, the Yongge
-livestream incident, and a song document. Retrieval uses vector recall plus
+livestream incident, the 巨大历史机遇/巨大历史鲫鱼 meme document, and a song
+document. Retrieval uses vector recall plus
 optional reranking; no BM25 keyword index is currently included.
 
 The keyword intent layer contains domain hints for this bundled corpus in
