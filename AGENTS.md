@@ -18,7 +18,8 @@ configurable LLM provider.
   ingestion, retrieval, routing, prompt budgeting, settings, and session
   helpers.
 - `data/docs/`: replaceable Markdown source documents ingested into Qdrant.
-  The committed corpus is database-focused sample content.
+  The committed corpus is a synthetic Chinese restaurant/business case,
+  including the 巨大历史机遇/巨大历史鲫鱼 meme topic.
 - `docker/`, `Dockerfile`, `compose.yaml`: container entrypoint and Docker
   Compose deployment.
 - Runtime state such as `postgres_data/`, `qdrant_storage/`, `models/`, caches,
