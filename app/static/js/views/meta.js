@@ -1,8 +1,8 @@
 // Status indicator, health/model metadata, and the retrieval-settings popover.
 
-import { state, on, emit, setStatus } from "../store.js";
-import { api } from "../api.js";
-import { byId } from "../dom.js";
+import { state, on, emit, setStatus } from "../store.js?v=20260617-hybrid-retrieval";
+import { api } from "../api.js?v=20260617-hybrid-retrieval";
+import { byId } from "../dom.js?v=20260617-hybrid-retrieval";
 
 let els = {};
 
@@ -12,7 +12,9 @@ export function mountMeta() {
     statusText: byId("statusText"),
     settingsToggle: byId("settingsToggle"),
     settingsPopover: byId("settingsPopover"),
+    bm25TopK: byId("bm25TopK"),
     recallTopK: byId("recallTopK"),
+    rrfTopK: byId("rrfTopK"),
     topK: byId("topK"),
     modelName: byId("modelName"),
     collectionName: byId("collectionName"),
@@ -37,8 +39,14 @@ export function mountMeta() {
     if (event.key === "Escape") closePopover();
   });
 
+  els.bm25TopK.addEventListener("input", () => {
+    state.bm25TopK = els.bm25TopK.value ? Number(els.bm25TopK.value) : null;
+  });
   els.recallTopK.addEventListener("input", () => {
     state.recallTopK = els.recallTopK.value ? Number(els.recallTopK.value) : null;
+  });
+  els.rrfTopK.addEventListener("input", () => {
+    state.rrfTopK = els.rrfTopK.value ? Number(els.rrfTopK.value) : null;
   });
   els.topK.addEventListener("input", () => {
     state.topK = els.topK.value ? Number(els.topK.value) : null;
@@ -101,20 +109,18 @@ function renderMeta() {
     ? data.reranker_model || "Enabled"
     : "Disabled";
 
-  if (data.api_recall_top_k_max) els.recallTopK.max = String(data.api_recall_top_k_max);
-  if (data.recall_top_k) {
-    els.recallTopK.placeholder = String(data.recall_top_k);
-    if (!els.recallTopK.value) {
-      els.recallTopK.value = String(data.recall_top_k);
-      state.recallTopK = data.recall_top_k;
-    }
-  }
-  if (data.api_top_k_max) els.topK.max = String(data.api_top_k_max);
-  if (data.retrieve_top_k) {
-    els.topK.placeholder = String(data.retrieve_top_k);
-    if (!els.topK.value) {
-      els.topK.value = String(data.retrieve_top_k);
-      state.topK = data.retrieve_top_k;
-    }
+  applyNumberSetting(els.bm25TopK, "bm25TopK", data.bm25_top_k, data.api_recall_top_k_max);
+  applyNumberSetting(els.recallTopK, "recallTopK", data.recall_top_k, data.api_recall_top_k_max);
+  applyNumberSetting(els.rrfTopK, "rrfTopK", data.rrf_top_k, data.api_recall_top_k_max);
+  applyNumberSetting(els.topK, "topK", data.retrieve_top_k, data.api_top_k_max);
+}
+
+function applyNumberSetting(input, stateKey, value, max) {
+  if (max) input.max = String(max);
+  if (!value) return;
+  input.placeholder = String(value);
+  if (!input.value) {
+    input.value = String(value);
+    state[stateKey] = value;
   }
 }

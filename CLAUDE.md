@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Knowledge Base Assistant is a RAG-and-direct-chat web application. It indexes a local Markdown corpus into Qdrant, routes each user question to either RAG or direct chat via `IntentRouter`, retrieves and reranks relevant chunks, then generates answers with a configurable LLM. The browser UI, auth layer, and session persistence are all served by the same FastAPI process.
+Knowledge Base Assistant is a RAG-and-direct-chat web application. It indexes a
+local Markdown corpus into Qdrant for vector recall and into an in-process BM25
+index for keyword recall, routes each user question to either RAG or direct chat
+via `IntentRouter`, fuses and reranks relevant chunks, then generates answers
+with a configurable LLM. The browser UI, auth layer, and session persistence
+are all served by the same FastAPI process.
 
 ## Development Commands
 
@@ -84,7 +89,10 @@ Browser UI  →  POST /rag
            IntentRouter (keyword → embedding → LLM fallback)
                ↓ use_rag?
          [RAG path]                    [Direct path]
-     VectorStore.search()          build_direct_messages()
+     VectorStore.hybrid_search()   build_direct_messages()
+       |-- BM25 recall
+       |-- Qdrant vector recall
+       |-- RRF fusion
      Reranker.rerank()
      build_rag_messages()
                ↓
@@ -98,11 +106,11 @@ Browser UI  →  POST /rag
 - **`app/config.py`** — Frozen `Settings` dataclass; every tunable parameter is read from env vars here. Adding new config always goes through this class; never hard-code URLs, model names, or limits elsewhere.
 - **`app/main.py`** — FastAPI lifespan (constructs all singletons: `VectorStore`, `LLMClient`, `SessionStore`, `Reranker`, `RAGPipeline`), route definitions, Pydantic request/response models, and auth dependency chain (`require_login_auth` → `require_password_ready_user` → `require_admin_auth`). Serves the UI shell at `/` and mounts static assets at `/static`.
 - **`app/intent_router.py`** — Three-pass classifier: (1) keyword exact/regex match against `FORCE_*`, `DOMAIN_RAG_*`, and `DIRECT_TASK_PATTERNS`; (2) cosine similarity against `RAG_ANCHORS`/`DIRECT_ANCHORS` using the same BGE embedding model; (3) LLM zero-shot fallback. **When swapping the corpus, update `DOMAIN_RAG_PHRASES`, `DOMAIN_RAG_PATTERNS`, and the LLM fallback prompt string inside `_route_with_llm`.**
-- **`app/rag.py`** — Orchestrates the full answer pipeline: history normalization, history compaction (rolling summary via LLM when turn count exceeds `HISTORY_COMPACT_AFTER_TURNS`), intent routing, vector recall + reranking, and prompt construction. `RAGPipeline.answer()` is the single entry point from the API layer.
-- **`app/vector_store.py`** — Markdown-aware chunking (text/code/table separately, heading metadata preserved as `h1`/`h2`/`h3` payload), SentenceTransformers BGE embedding, and Qdrant collection management. Incremental ingest replaces all chunks by `source` filename so no stale chunks accumulate on edits.
+- **`app/rag.py`** — Orchestrates the full answer pipeline: history normalization, history compaction (rolling summary via LLM when turn count exceeds `HISTORY_COMPACT_AFTER_TURNS`), intent routing, BM25 + vector recall, RRF fusion, reranking, and prompt construction. `RAGPipeline.answer()` is the single entry point from the API layer.
+- **`app/vector_store.py`** — Markdown-aware chunking (text/code/table separately, heading metadata preserved as `h1`/`h2`/`h3` payload), SentenceTransformers BGE embedding, BM25 keyword indexing over local Markdown chunks, RRF fusion, and Qdrant collection management. Incremental ingest replaces all chunks by `source` filename so no stale chunks accumulate on edits.
 - **`app/reranker.py`** — Jina `jina-reranker-v3` cross-encoder, loaded via `AutoModel.rerank()` (requires `trust_remote_code=True`). Pre-warmed at startup when `RERANKER_PRELOAD=1`. Batched when recall exceeds `RERANKER_MAX_DOCUMENTS_PER_CALL`.
 - **`app/llm_client.py`** — Provider-aware HTTP client supporting `openai_compatible` and `anthropic`. Retries `429`/`5xx` with exponential backoff. The `LLMClient` instance is shared across RAG, history compaction, and intent routing calls.
-- **`app/session_store.py`** — Raw `psycopg2` PostgreSQL (no ORM). Manages users, PBKDF2-SHA256 passwords, SHA-256 bearer tokens, chat sessions, messages with retrieved contexts as JSON, route metadata, and compacted conversation summaries.
+- **`app/session_store.py`** — Raw `psycopg2` PostgreSQL (no ORM). Manages users, PBKDF2-SHA256 passwords, SHA-256 bearer tokens, chat sessions, messages with retrieved contexts as JSON, retrieval scores (`vector_score`, `bm25_score`, `rrf_score`, `rerank_score`), route metadata, and compacted conversation summaries.
 - **`app/prompt_budget.py`** — Text-trimming utilities used by both `RAGPipeline` and `IntentRouter` to enforce character budgets before building prompts.
 - **`app/security.py`** — `bearer_token()` extracts the raw token string from the `Authorization` header.
 
@@ -116,6 +124,7 @@ Plain ES modules served directly by FastAPI — **no build step, no npm, no CDN*
 - `js/views/{auth,sessions,chat,meta,admin}.js` each own one region: `mountX()` caches elements + wires listeners + subscribes to events. `main.js` mounts all views, wires global events, and manages the responsive drawers.
 - Cross-view imports are one-directional (`chat`/`admin` import data actions from `sessions`); navigation and DB-side effects are bridged through events to avoid cycles.
 - `styles.css` uses design tokens with a `prefers-color-scheme: dark` block. The three-column `.app-shell` is `height: 100dvh; overflow: hidden` so the sidebar and references panel stay pinned while only the session list / chat log / reference list scroll internally.
+- Retrieval controls live in the meta/settings view. `/health/details` initializes `BM25 K`, `Cosine K`, `RRF K`, and `Final K`; `/rag` sends them as `bm25_top_k`, `recall_top_k`, `rrf_top_k`, and `top_k`.
 
 ### LLM Provider Configuration
 
@@ -130,6 +139,15 @@ For Anthropic, the `LLM_ANTHROPIC_VERSION` env var pins the API version header. 
 ### GPU / CUDA Behavior
 
 `CUDA=TRUE` (default) makes both the BGE embedding model and Jina reranker prefer CUDA. If PyTorch cannot allocate GPU (old architecture, OOM, no NVIDIA toolkit), both fall back to CPU with a log message. `compose.cpu.yaml` overrides the GPU device spec for forced-CPU deployments. The `scripts/compose_up.sh` wrapper tries GPU first and retries on CPU if Docker rejects the device allocation.
+
+### Retrieval Observability
+
+The `/rag` response and stored assistant `contexts` are the source of truth for
+which retrieval stages ran. `retrieval_source=hybrid` means a chunk appeared in
+both BM25 and vector recall; pure `bm25` or `vector` sources carry only the
+matching score. `rrf_score` confirms fusion, and `rerank_score` confirms the
+Jina reranker ran. Docker logs may omit the retrieval `logger.info()` lines
+because the container's Python root logger can run at `WARNING`.
 
 ### Replacing the Corpus
 

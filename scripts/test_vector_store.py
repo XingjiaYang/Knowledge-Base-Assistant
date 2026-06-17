@@ -18,7 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from app.config import Settings
 from app.rag import RAGPipeline
 import app.vector_store as vector_store_module
-from app.vector_store import VectorStore
+from app.vector_store import SearchResult, VectorStore
 
 
 class FakeEmbeddingModel:
@@ -404,6 +404,92 @@ def assert_search_score_threshold() -> None:
     print("Search score threshold -> ok")
 
 
+def assert_bm25_recalls_keyword_matches() -> None:
+    with TemporaryDirectory() as temp_dir:
+        docs_dir = Path(temp_dir)
+        (docs_dir / "alpha.md").write_text(
+            "# Alpha\n\nThe wall slogan says 巨大历史鲫鱼 and historical opportunity.",
+            encoding="utf-8",
+        )
+        (docs_dir / "beta.md").write_text(
+            "# Beta\n\nThis unrelated document discusses ordinary operations.",
+            encoding="utf-8",
+        )
+        store = VectorStore(
+            Settings(
+                docs_dir=docs_dir,
+                chunk_size=120,
+                chunk_overlap=10,
+                bm25_top_k=2,
+            ),
+            client=QdrantClient(":memory:"),
+            model=FakeEmbeddingModel(),
+        )
+
+        results = store.search_bm25("巨大历史鲫鱼是什么梗？", top_k=1)
+        if len(results) != 1 or results[0].source != "alpha.md":
+            raise AssertionError(f"BM25 should recall the keyword-matched doc: {results}")
+        if results[0].bm25_score is None or results[0].bm25_score <= 0:
+            raise AssertionError("BM25 result should expose a positive BM25 score.")
+        if results[0].retrieval_source != "bm25":
+            raise AssertionError("BM25 result should record its retrieval source.")
+
+    print("BM25 keyword recall -> ok")
+
+
+def assert_rrf_fuses_vector_and_bm25_results() -> None:
+    vector_results = [
+        SearchResult(
+            text="vector first",
+            source="a.md",
+            chunk_id=0,
+            score=0.9,
+            vector_score=0.9,
+            retrieval_source="vector",
+        ),
+        SearchResult(
+            text="shared",
+            source="b.md",
+            chunk_id=0,
+            score=0.8,
+            vector_score=0.8,
+            retrieval_source="vector",
+        ),
+    ]
+    bm25_results = [
+        SearchResult(
+            text="shared",
+            source="b.md",
+            chunk_id=0,
+            score=4.0,
+            bm25_score=4.0,
+            retrieval_source="bm25",
+        ),
+        SearchResult(
+            text="bm25 only",
+            source="c.md",
+            chunk_id=0,
+            score=3.0,
+            bm25_score=3.0,
+            retrieval_source="bm25",
+        ),
+    ]
+
+    fused = VectorStore._rrf_fuse(vector_results, bm25_results, top_k=2)
+    if [result.source for result in fused] != ["b.md", "a.md"]:
+        raise AssertionError(f"RRF should lift shared results: {fused}")
+    shared = fused[0]
+    if (
+        shared.retrieval_source != "hybrid"
+        or shared.vector_score != 0.8
+        or shared.bm25_score != 4.0
+        or shared.rrf_score is None
+    ):
+        raise AssertionError("RRF result should preserve hybrid score metadata.")
+
+    print("RRF fusion -> ok")
+
+
 def main() -> None:
     assert_vector_store_lazy_loads_dependencies()
     assert_vector_store_lazy_loads_once_under_concurrency()
@@ -412,6 +498,8 @@ def main() -> None:
     assert_collection_setup_avoids_redundant_indexes()
     assert_ingest_streams_files_and_skips_recreate_deletes()
     assert_search_score_threshold()
+    assert_bm25_recalls_keyword_matches()
+    assert_rrf_fuses_vector_and_bm25_results()
     assert_incremental_ingest_replaces_source_points()
 
 

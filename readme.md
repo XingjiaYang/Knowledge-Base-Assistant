@@ -7,12 +7,12 @@ replaceable local Markdown knowledge base. It uses intent routing to choose
 between retrieval-augmented answers grounded in the indexed corpus and direct
 chat for requests that do not need retrieval.
 
-Qdrant provides vector search, PostgreSQL stores required user accounts and
-account-scoped chat sessions, SentenceTransformers generates embeddings, and
-FastAPI serves both the API and browser UI. Generation is
-provider-configurable: the default setup targets an OpenAI-compatible cloud API,
-Anthropic is supported, and a local vLLM service remains available as an
-optional Docker Compose profile.
+Qdrant provides vector search, a local BM25 index provides keyword recall,
+PostgreSQL stores required user accounts and account-scoped chat sessions,
+SentenceTransformers generates embeddings, and FastAPI serves both the API and
+browser UI. Generation is provider-configurable: the default setup targets an
+OpenAI-compatible cloud API, Anthropic is supported, and a local vLLM service
+remains available as an optional Docker Compose profile.
 
 The repository currently ships with a synthetic restaurant/business case corpus
 about 家是本, 朱剑秋, the Yongge livestream incident, menu pricing, customer
@@ -29,7 +29,8 @@ boundaries that should be updated when `data/docs/` is replaced.
 - Configurable cloud LLM providers with an optional local vLLM profile.
 - Replaceable Markdown corpus with isolated keyword hints for the bundled
   domain.
-- Chat-style web UI at `/` with adjustable recall and reranked context counts.
+- Chat-style web UI at `/` with adjustable BM25, cosine, RRF, and final context
+  counts.
 - Required account login with PostgreSQL-backed chat sessions per user and an
   admin UI for user/data management.
 - Admin CSV import for batch user creation with strict `email,passwd` format
@@ -56,7 +57,7 @@ IntentRouter
    |-- configured LLM zero-shot fallback for ambiguous cases
    |
 RAGPipeline or Direct Chat
-   |-- optional SentenceTransformers -> Qdrant vector recall
+   |-- BM25 keyword recall + Qdrant vector recall -> RRF fusion
    |-- optional Jina cross-encoder reranking
    |-- OpenAI-compatible or Anthropic LLM API
    |
@@ -72,11 +73,12 @@ Main modules:
 - `app/session_store.py`: PostgreSQL-backed users, login tokens, chat sessions,
   messages, and compacted conversation summaries.
 - `app/intent_router.py`: keyword, embedding, and LLM fallback routing.
-- `app/rag.py`: recall, reranking, prompt construction, and history compaction.
+- `app/rag.py`: hybrid recall, RRF fusion, reranking, prompt construction, and
+  history compaction.
 - `app/reranker.py`: startup-preloaded Jina cross-encoder reranking for
   recalled chunks.
-- `app/vector_store.py`: Markdown chunking, embeddings, Qdrant collection
-  management, and search.
+- `app/vector_store.py`: Markdown chunking, embeddings, BM25 indexing, Qdrant
+  collection management, vector search, and RRF fusion.
 - `app/llm_client.py`: provider-aware client for cloud APIs or local vLLM.
 - `scripts/`: manual service, ingest, and retrieval smoke-test commands.
 - `data/docs/`: replaceable Markdown documents ingested into Qdrant.
@@ -249,7 +251,9 @@ SESSION_TITLE_MAX_CHARS=80
 
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 QDRANT_COLLECTION=tech_docs
-RECALL_TOP_K=200
+BM25_TOP_K=100
+RECALL_TOP_K=100
+RRF_TOP_K=100
 RETRIEVE_TOP_K=5
 RETRIEVE_SCORE_THRESHOLD=0
 CHUNK_SIZE=800
@@ -296,16 +300,21 @@ LLM chat requests retry transient provider errors (`429`, `502`, `503`, `504`)
 with exponential backoff. Keep `DEBUG=0` outside local development so API errors
 return generic messages while details stay in server logs.
 
-When intent routing chooses RAG, the pipeline first recalls `RECALL_TOP_K`
-chunks from Qdrant, reranks those candidates with the multilingual
+When intent routing chooses RAG, the pipeline now performs hybrid recall before
+reranking. It recalls `BM25_TOP_K` keyword candidates from the local Markdown
+chunks with BM25, recalls `RECALL_TOP_K` cosine-similarity candidates from
+Qdrant, fuses both ranked lists with reciprocal rank fusion, keeps
+`RRF_TOP_K` fused candidates, reranks those candidates with the multilingual
 `jinaai/jina-reranker-v3` cross-encoder, then keeps `RETRIEVE_TOP_K` chunks for
-the LLM prompt and response references. The browser UI exposes both values as
-`Recall K` and `Rerank K`; defaults are `200` and `5`. Set
-`RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector results before
-reranking. With `CUDA=TRUE` (the default), the BGE embedding model and Jina
-reranker prefer CUDA when PyTorch can see a compatible NVIDIA GPU; if CUDA is
-not visible or model placement fails, they log the fallback and continue on
-CPU. Set `CUDA=FALSE` to force CPU. With `RERANKER_PRELOAD=1`, the API loads
+the LLM prompt and response references. The browser UI exposes these values as
+`BM25 K`, `Cosine K`, `RRF K`, and `Final K`; defaults are `100`, `100`, `100`,
+and `5`. Set `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector
+results before fusion. `/health/details` returns the active defaults so the UI
+can initialize all four controls after login. With `CUDA=TRUE` (the default),
+the BGE embedding model and Jina reranker prefer CUDA when PyTorch can see a
+compatible NVIDIA GPU; if CUDA is not visible or model placement fails, they
+log the fallback and continue on CPU. Set `CUDA=FALSE` to force CPU. With
+`RERANKER_PRELOAD=1`, the API loads
 and warms the reranker during startup through Jina's native
 `AutoModel.rerank()` interface, so model download or load failures happen
 before the service accepts requests.
@@ -467,7 +476,9 @@ curl http://localhost:8080/rag \
   -d "{
     \"session_id\": \"${SESSION_ID}\",
     \"question\": \"When should I choose DuckDB over ClickHouse?\",
-    \"recall_top_k\": 200,
+    \"bm25_top_k\": 100,
+    \"recall_top_k\": 100,
+    \"rrf_top_k\": 100,
     \"top_k\": 5
   }"
 ```
@@ -475,13 +486,22 @@ curl http://localhost:8080/rag \
 Response fields:
 
 - `answer`: generated response.
-- `contexts`: reranked chunks with `source`, `chunk_id`, vector `score`,
-  optional `rerank_score`, `content_type`, `headings`, line bounds, and
-  `h1`/`h2`/`h3` metadata.
+- `contexts`: reranked chunks with `source`, `chunk_id`, fused `score`,
+  optional `rerank_score`, `vector_score`, `bm25_score`, `rrf_score`,
+  `retrieval_source`, `content_type`, `headings`, line bounds, and `h1`/`h2`/`h3`
+  metadata.
 - `conversation_summary`: compact memory for future turns.
 - `compacted_history_messages`: number of old messages merged into memory.
-- `used_rag`: whether Qdrant retrieval was used for this answer.
+- `used_rag`: whether RAG retrieval was used for this answer.
 - `route` and `route_reason`: intent-router decision metadata.
+
+The same `contexts` payload is stored with assistant messages in PostgreSQL, so
+it is the most reliable way to verify which retrieval stages were used. A
+`retrieval_source` of `hybrid` has both `vector_score` and `bm25_score`; a pure
+vector or BM25 hit has only the corresponding score. `rrf_score` confirms RRF
+fusion, and `rerank_score` confirms the cross-encoder reranker ran. Docker logs
+may not show these INFO-level retrieval events unless the Python logging level
+is configured to emit application INFO logs.
 
 ## Manual Development
 
@@ -584,8 +604,8 @@ files cover a generated Chinese restaurant/business case: company overview,
 FAQ, menu and pricing, customer reviews, Bilibili comments, social-media
 archives, financial simulation, a timeline, a profile of 朱剑秋, the Yongge
 livestream incident, the 巨大历史机遇/巨大历史鲫鱼 meme document, and a song
-document. Retrieval uses vector recall plus
-optional reranking; no BM25 keyword index is currently included.
+document. Retrieval uses BM25 keyword recall plus Qdrant vector recall, RRF
+fusion, and optional reranking.
 
 The keyword intent layer contains domain hints for this bundled corpus in
 `app/intent_router.py`. Those hints only decide whether to use RAG; they do not

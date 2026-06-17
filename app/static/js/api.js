@@ -1,7 +1,7 @@
 // Thin HTTP layer. Attaches the bearer token, surfaces 401/403 as events,
 // and returns parsed JSON (throwing on non-OK with the server's detail).
 
-import { state, loadToken, emit } from "./store.js";
+import { state, loadToken, emit } from "./store.js?v=20260617-hybrid-retrieval";
 
 async function raw(path, options = {}, { auth = true } = {}) {
   const headers = { ...(options.headers || {}) };

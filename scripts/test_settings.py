@@ -28,7 +28,9 @@ def assert_api_limits() -> None:
         api_question_max_chars=456,
         api_summary_max_chars=789,
         api_history_max_messages=10,
+        bm25_top_k=111,
         recall_top_k=200,
+        rrf_top_k=222,
         retrieve_top_k=5,
     )
 
@@ -36,8 +38,12 @@ def assert_api_limits() -> None:
         raise AssertionError("API top_k max should be configurable.")
     if config.api_recall_top_k_max != 321:
         raise AssertionError("API recall top_k max should be configurable.")
+    if config.bm25_top_k != 111:
+        raise AssertionError("BM25 top_k should be configurable.")
     if config.recall_top_k != 200:
         raise AssertionError("Recall top_k should be configurable.")
+    if config.rrf_top_k != 222:
+        raise AssertionError("RRF top_k should be configurable.")
     if config.retrieve_top_k != 5:
         raise AssertionError("Final top_k should be configurable.")
     if config.api_message_max_chars != 123:
@@ -365,14 +371,18 @@ def assert_rag_endpoint_accepts_original_body_shape() -> None:
     request = RAGRequest(
         question="Hello",
         top_k=1,
+        bm25_top_k=9,
         recall_top_k=10,
+        rrf_top_k=8,
         history=[],
         conversation_summary="",
     )
     if (
         request.question != "Hello"
         or request.top_k != 1
+        or request.bm25_top_k != 9
         or request.recall_top_k != 10
+        or request.rrf_top_k != 8
         or request.history != []
         or request.conversation_summary != ""
     ):
@@ -474,7 +484,9 @@ def assert_invalid_settings_rejected() -> None:
         {"api_top_k_max": 0},
         {"api_recall_top_k_max": 0},
         {"retrieve_score_threshold": -0.1},
+        {"bm25_top_k": 0},
         {"recall_top_k": 0},
+        {"rrf_top_k": 0},
         {"reranker_model": ""},
         {"reranker_dtype": ""},
         {"reranker_max_documents_per_call": 0},

@@ -8,12 +8,13 @@ configurable LLM provider.
 
 - `app/`: application code. `main.py` exposes the FastAPI app and routes,
   `static/` contains the browser UI, `intent_router.py` chooses RAG vs direct
-  chat, `rag.py` coordinates recall, reranking, prompts, generation, and
-  history compaction, `reranker.py` loads and runs the Jina cross-encoder,
-  `vector_store.py` manages Markdown chunking and Qdrant, `session_store.py`
-  manages PostgreSQL-backed users, auth sessions, chat sessions, messages, and
-  summaries, `llm_client.py` calls cloud or local LLM APIs, and `config.py`
-  reads environment settings.
+  chat, `rag.py` coordinates BM25/vector recall, RRF fusion, reranking,
+  prompts, generation, and history compaction, `reranker.py` loads and runs the
+  Jina cross-encoder, `vector_store.py` manages Markdown chunking, BM25
+  indexing, Qdrant vector search, and RRF fusion, `session_store.py` manages
+  PostgreSQL-backed users, auth sessions, chat sessions, messages, retrieved
+  references, and summaries, `llm_client.py` calls cloud or local LLM APIs, and
+  `config.py` reads environment settings.
 - `scripts/`: operational and smoke-test scripts for local services,
   ingestion, retrieval, routing, prompt budgeting, settings, and session
   helpers.
@@ -44,12 +45,12 @@ configurable LLM provider.
   manual local development, including optional local vLLM dependencies.
 - `python scripts/ingest_docs.py --recreate`: rebuild the Qdrant collection
   from `data/docs/**/*.md`.
-- `python scripts/test_retrieve.py`: smoke-test vector retrieval against a
-  running Qdrant collection.
+- `python scripts/test_retrieve.py`: smoke-test retrieval against a running
+  Qdrant collection.
 - `python scripts/test_chunking.py`: validate Markdown-aware chunk boundaries.
 - `python scripts/test_vector_store.py`: validate lazy loading, recursive
-  ingest, payload indexes, score thresholds, and incremental document
-  replacement.
+  ingest, payload indexes, score thresholds, BM25 keyword recall, RRF fusion,
+  and incremental document replacement.
 - `python scripts/test_session_store.py`: validate login/session helper
   behavior without a live PostgreSQL service.
 - `python scripts/test_intent_router.py`: smoke-test routing for RAG vs
@@ -75,10 +76,12 @@ provider names, model names, or limits.
 
 There is no formal pytest suite yet. Use the script-style smoke tests above and
 at minimum run `python -m compileall app scripts` for code changes. For
-retrieval or deployment changes, also validate with `python scripts/test_retrieve.py`,
-`curl http://localhost:8080/health`, login through `/auth/login`, and a
-token-authenticated `POST /rag` request. Add future automated tests under
-`tests/` using `test_*.py` naming.
+retrieval or deployment changes, also validate with
+`python scripts/test_retrieve.py`, `curl http://localhost:8080/health`, login
+through `/auth/login`, and a token-authenticated `POST /rag` request. Inspect
+the returned or stored `contexts` for `retrieval_source`, `vector_score`,
+`bm25_score`, `rrf_score`, and `rerank_score` when checking hybrid retrieval.
+Add future automated tests under `tests/` using `test_*.py` naming.
 
 ## Commit & Pull Request Guidelines
 
@@ -117,9 +120,14 @@ features.
 For restricted networks, configure runtime proxy or mirror values in `.env`.
 Docker daemon proxy settings only affect image pulls, not running containers.
 
-RAG retrieval is two-stage when reranking is enabled: Qdrant recalls
-`RECALL_TOP_K` candidates, `jinaai/jina-reranker-v3` reranks them through its
-native `AutoModel.rerank()` interface, and only `RETRIEVE_TOP_K` chunks enter
-the prompt. The API preloads and warms the reranker during startup by default
-with `RERANKER_PRELOAD=1`; keep Hugging Face cache, mirror, or proxy settings
-ready before rebuilding containers.
+RAG retrieval uses hybrid recall before reranking: BM25 recalls `BM25_TOP_K`
+keyword candidates from the Markdown chunks, Qdrant recalls `RECALL_TOP_K`
+cosine-similarity candidates, reciprocal rank fusion keeps `RRF_TOP_K`
+candidates, `jinaai/jina-reranker-v3` reranks them through its native
+`AutoModel.rerank()` interface, and only `RETRIEVE_TOP_K` chunks enter the
+prompt. The API preloads and warms the reranker during startup by default with
+`RERANKER_PRELOAD=1`; keep Hugging Face cache, mirror, or proxy settings ready
+before rebuilding containers. The browser exposes these limits as `BM25 K`,
+`Cosine K`, `RRF K`, and `Final K`, defaulting to `100`, `100`, `100`, and `5`.
+If Docker logs do not show INFO-level retrieval messages, use the response or
+PostgreSQL-stored `contexts` scores to confirm which stages ran.

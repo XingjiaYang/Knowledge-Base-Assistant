@@ -149,11 +149,19 @@
             <div id="settingsPopover" class="popover" hidden>
               <div class="popover-title">Retrieval</div>
               <label class="field field-row">
-                <span class="field-label">Recall K</span>
+                <span class="field-label">BM25 K</span>
+                <input id="bm25TopK" type="number" min="1" inputmode="numeric">
+              </label>
+              <label class="field field-row">
+                <span class="field-label">Cosine K</span>
                 <input id="recallTopK" type="number" min="1" inputmode="numeric">
               </label>
               <label class="field field-row">
-                <span class="field-label">Rerank K</span>
+                <span class="field-label">RRF K</span>
+                <input id="rrfTopK" type="number" min="1" inputmode="numeric">
+              </label>
+              <label class="field field-row">
+                <span class="field-label">Final K</span>
                 <input id="topK" type="number" min="1" inputmode="numeric">
               </label>
               <div class="popover-divider"></div>
@@ -258,6 +266,6 @@
     </div>
   </main>
 
-  <script type="module" src="/static/js/main.js"></script>
+  <script type="module" src="/static/js/main.js?v=20260617-hybrid-retrieval"></script>
 </body>
 </html>

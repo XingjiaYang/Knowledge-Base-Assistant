@@ -4,11 +4,11 @@ Knowledge Base Assistant 是一个通用知识库问答应用，用于查询可�
 Markdown 文档库。系统会通过意图路由判断问题是否需要检索：需要文档依据时走
 RAG，不需要检索的请求走直接对话。
 
-Qdrant 负责向量检索，PostgreSQL 负责必需的用户账号、登录 token、用户会话、
-消息和压缩后的对话记忆，SentenceTransformers 负责本地 embedding，FastAPI
-同时提供 API 和浏览器界面。生成模型通过环境变量配置，默认使用
-OpenAI-compatible API，也支持 Anthropic；本地 vLLM 作为可选 Docker Compose
-profile 保留。
+Qdrant 负责向量检索，本地 BM25 索引负责关键词召回，PostgreSQL 负责必需的用户
+账号、登录 token、用户会话、消息和压缩后的对话记忆，SentenceTransformers 负责
+本地 embedding，FastAPI 同时提供 API 和浏览器界面。生成模型通过环境变量配置，
+默认使用 OpenAI-compatible API，也支持 Anthropic；本地 vLLM 作为可选 Docker
+Compose profile 保留。
 
 仓库当前自带一组由 Kimi 生成的餐饮创业案例 Markdown 语料，围绕家是本、
 朱剑秋、勇哥连线、菜单定价、顾客评价、社交媒体反应、财务模拟以及
@@ -27,7 +27,7 @@ profile 保留。
 - 管理员可以上传 CSV 批量创建用户；CSV 必须只有两列，表头必须为 `email,passwd`。
 - 支持 OpenAI-compatible、Anthropic 和可选本地 vLLM。
 - Markdown 语料可替换，当前语料的关键词提示集中在意图路由 keyword 层。
-- 前端支持多会话、召回数量和重排后引用数量调整、引用展示和路由结果展示。
+- 前端支持多会话、BM25 K、Cosine K、RRF K、Final K 调整、引用展示和路由结果展示。
 - 对话历史保存在后端，旧消息会压缩成 summary 后继续参与后续回答。
 - 支持 Hugging Face cache、离线模型目录、镜像和容器运行时代理配置。
 
@@ -45,7 +45,7 @@ IntentRouter
    |-- configured LLM zero-shot fallback for ambiguous cases
    |
 RAGPipeline or Direct Chat
-   |-- optional SentenceTransformers -> Qdrant vector recall
+   |-- BM25 keyword recall + Qdrant vector recall -> RRF fusion
    |-- optional Jina cross-encoder reranking
    |-- OpenAI-compatible or Anthropic LLM API
    |
@@ -58,9 +58,10 @@ Answer + retrieved references + compacted conversation memory
 - `app/static/index.html`：浏览器聊天界面和管理员界面。
 - `app/session_store.py`：PostgreSQL 用户、登录 token、会话、消息和 summary。
 - `app/intent_router.py`：关键词、embedding 和 LLM fallback 意图路由。
-- `app/rag.py`：召回、重排、prompt 构造、历史压缩。
+- `app/rag.py`：混合召回、RRF 融合、重排、prompt 构造、历史压缩。
 - `app/reranker.py`：启动时预加载 Jina cross-encoder，并对召回 chunk 重排。
-- `app/vector_store.py`：Markdown 切块、embedding、Qdrant collection 管理和搜索。
+- `app/vector_store.py`：Markdown 切块、embedding、BM25 索引、Qdrant collection
+  管理、向量搜索和 RRF 融合。
 - `app/llm_client.py`：不同 LLM provider 的请求封装。
 - `scripts/`：ingest、服务启动和 smoke test 脚本。
 - `data/docs/`：被 ingest 到 Qdrant 的 Markdown 语料。
@@ -175,7 +176,9 @@ AUTH_BOOTSTRAP_USERS=
 
 QDRANT_COLLECTION=tech_docs
 EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
-RECALL_TOP_K=200
+BM25_TOP_K=100
+RECALL_TOP_K=100
+RRF_TOP_K=100
 RETRIEVE_TOP_K=5
 CHUNK_SIZE=800
 CHUNK_OVERLAP=120
@@ -191,10 +194,13 @@ RECREATE_COLLECTION=0
 WAIT_FOR_LLM=0
 ```
 
-当意图路由判断需要 RAG 时，系统会先从 Qdrant 召回 `RECALL_TOP_K`
-个候选 chunk，再使用多语言 `jinaai/jina-reranker-v3` cross-encoder
-重排，最后只保留 `RETRIEVE_TOP_K` 个 chunk 进入 LLM prompt 和引用列表。
-前端对应控件为 `Recall K` 和 `Rerank K`，默认分别为 `200` 和 `5`。
+当意图路由判断需要 RAG 时，系统会先用 BM25 从本地 Markdown chunk 召回
+`BM25_TOP_K` 个关键词候选，再从 Qdrant 召回 `RECALL_TOP_K` 个余弦相似度候选，
+然后用 RRF（reciprocal rank fusion）融合两路排序并保留 `RRF_TOP_K` 个候选，
+再使用多语言 `jinaai/jina-reranker-v3` cross-encoder 重排，最后只保留
+`RETRIEVE_TOP_K` 个 chunk 进入 LLM prompt 和引用列表。前端对应控件为 `BM25 K`、
+`Cosine K`、`RRF K` 和 `Final K`，默认分别为 `100`、`100`、`100` 和 `5`。
+`/health/details` 会返回当前生效的默认值，前端登录后用这些值初始化四个控件。
 `CUDA=TRUE` 是默认值，BGE embedding 模型和 Jina reranker 会在 PyTorch 能看到
 兼容 NVIDIA GPU 时优先使用 CUDA；如果 CUDA 不可见或模型迁移到 GPU 失败，会
 记录日志并回退到 CPU。设置 `CUDA=FALSE` 可强制全部使用 CPU。
@@ -245,7 +251,7 @@ OpenAI-compatible 使用 `GET /models`，Anthropic 使用
 餐饮创业案例，包含公司概览、FAQ、菜单与定价、顾客评价、B站评论、社交媒体
 存档、财务模拟、时间线、朱剑秋人物侧写、勇哥连线事件、“巨大历史机遇/巨大历史
 鲫鱼”梗文档和歌曲文档。检索链路
-使用向量召回加可选 reranker，目前没有 BM25 关键词索引。
+使用 BM25 关键词召回、Qdrant 向量召回、RRF 融合和可选 reranker。
 
 替换知识库步骤：
 
@@ -306,13 +312,21 @@ curl http://localhost:8080/rag \
   -d "{
     \"session_id\": \"${SESSION_ID}\",
     \"question\": \"When should I choose DuckDB over ClickHouse?\",
-    \"recall_top_k\": 200,
+    \"bm25_top_k\": 100,
+    \"recall_top_k\": 100,
+    \"rrf_top_k\": 100,
     \"top_k\": 5
   }"
 ```
 
 `/rag` 的历史由服务端根据 `session_id` 从 PostgreSQL 管理，客户端不需要传完整
 history。
+
+返回的 `contexts` 会同时写入 PostgreSQL 的 assistant 消息，是验证检索链路最可靠
+的位置。`retrieval_source=hybrid` 表示同一个 chunk 同时被 BM25 和向量召回命中；
+纯向量或纯 BM25 命中只会有对应的 `vector_score` 或 `bm25_score`。`rrf_score`
+表示已经经过 RRF 融合，`rerank_score` 表示 Jina cross-encoder reranker 已运行。
+Docker logs 默认未必显示这些 INFO 级业务日志，除非运行时日志级别打开应用 INFO。
 
 ## 本地开发
 
