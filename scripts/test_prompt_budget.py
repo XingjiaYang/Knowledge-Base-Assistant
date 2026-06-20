@@ -118,27 +118,45 @@ def assert_search_query_budget() -> None:
 
 
 def assert_compaction_threshold() -> None:
-    config = Settings(history_recent_turns=2, history_compact_after_turns=4)
+    config = Settings(
+        history_recent_turns=2,
+        history_max_messages=0,
+        llm_context_max_tokens=100000,
+    )
     pipeline = make_pipeline(config)
     history = [
         ChatMessage("user" if idx % 2 == 0 else "assistant", f"message {idx}")
-        for idx in range(8)
+        for idx in range(82)
     ]
 
     summary, recent, compacted_count = pipeline._compact_history(history, "")
-    if summary or len(recent) != 8 or compacted_count != 0:
-        raise AssertionError("History should not compact before threshold.")
+    if summary or len(recent) != 82 or compacted_count != 0:
+        raise AssertionError("History should not compact only because turns are old.")
 
-    history.append(ChatMessage("user", "message 8"))
+    config = Settings(
+        history_recent_turns=2,
+        llm_context_max_tokens=5000,
+        llm_context_safety_margin_tokens=0,
+        llm_context_prompt_overhead_tokens=0,
+        llm_max_tokens=1,
+        retrieve_top_k=1,
+        chunk_size=20,
+        chunk_overlap=0,
+    )
+    pipeline = make_pipeline(config)
+    history = [
+        ChatMessage("user" if idx % 2 == 0 else "assistant", "历史" * 1000)
+        for idx in range(10)
+    ]
     summary, recent, compacted_count = pipeline._compact_history(history, "")
     if summary != "summary":
-        raise AssertionError("History should summarize after threshold.")
+        raise AssertionError("History should summarize when context budget is tight.")
     if len(recent) != 4:
         raise AssertionError("Compaction should preserve configured recent turns.")
-    if compacted_count != 5:
+    if compacted_count != 6:
         raise AssertionError("Compacted count should include older messages.")
 
-    print("Compaction threshold -> ok")
+    print("Context-budget compaction threshold -> ok")
 
 
 def main() -> None:

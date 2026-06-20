@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import math
+import re
 from typing import Literal
 
 from app.config import Settings, settings
@@ -13,6 +15,7 @@ from app.vector_store import SearchResult, VectorStore
 
 
 logger = logging.getLogger(__name__)
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,8 @@ class RAGPipeline:
         summary, recent_history, compacted_count = self._compact_history(
             clean_history,
             conversation_summary or "",
+            question,
+            top_k=top_k,
         )
         intent = self.intent_router.route(question, recent_history, summary)
         logger.info(
@@ -196,16 +201,75 @@ class RAGPipeline:
         self,
         history: list[ChatMessage],
         conversation_summary: str,
+        question: str = "",
+        top_k: int | None = None,
     ) -> tuple[str, list[ChatMessage], int]:
         recent_limit = max(0, self.config.history_recent_turns * 2)
-        compact_after = max(recent_limit, self.budget.history_compact_after_turns * 2)
-        if not recent_limit or len(history) <= compact_after:
-            return self._trim_summary(conversation_summary), history, 0
+        summary = self._trim_summary(conversation_summary)
+        if not recent_limit or not history:
+            return summary, history, 0
+        if not self._should_compact_history(history, summary, question, top_k):
+            return summary, history, 0
 
         older_history = history[:-recent_limit]
         recent_history = history[-recent_limit:]
-        summary = self._summarize_history(conversation_summary, older_history)
+        if not older_history:
+            return summary, history, 0
+
+        summary = self._summarize_history(summary, older_history)
         return summary, recent_history, len(older_history)
+
+    def _should_compact_history(
+        self,
+        history: list[ChatMessage],
+        conversation_summary: str,
+        question: str,
+        top_k: int | None,
+    ) -> bool:
+        runtime_settings = self._runtime_settings()
+        context_limit = max(1, runtime_settings.llm_context_max_tokens)
+        output_reserve = max(0, runtime_settings.llm_max_tokens)
+        reserved_tokens = (
+            max(0, self.config.llm_context_safety_margin_tokens)
+            + max(0, self.config.llm_context_prompt_overhead_tokens)
+            + output_reserve
+            + self._expected_reference_tokens(top_k)
+            + self._estimate_tokens(question)
+        )
+        available_tokens = context_limit - reserved_tokens
+        if available_tokens <= 0:
+            return True
+
+        history_tokens = self._estimate_tokens(conversation_summary)
+        history_tokens += self._estimate_tokens(self._format_history(history))
+        should_compact = history_tokens > available_tokens
+        logger.info(
+            "History compaction budget: history_tokens=%s available_tokens=%s "
+            "context_limit=%s reserved_tokens=%s compact=%s",
+            history_tokens,
+            available_tokens,
+            context_limit,
+            reserved_tokens,
+            should_compact,
+        )
+        return should_compact
+
+    def _runtime_settings(self) -> object:
+        if hasattr(self.llm_client, "runtime_settings"):
+            return self.llm_client.runtime_settings()
+        return self.config
+
+    def _expected_reference_tokens(self, top_k: int | None) -> int:
+        per_context_tokens = max(1, self.config.chunk_size + 256)
+        return self._final_top_k(top_k) * per_context_tokens
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        if not text:
+            return 0
+        cjk_chars = len(_CJK_CHAR_RE.findall(text))
+        non_cjk_chars = max(0, len(text) - cjk_chars)
+        return cjk_chars + math.ceil(non_cjk_chars / 4)
 
     def _summarize_history(
         self,

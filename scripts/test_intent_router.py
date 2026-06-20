@@ -101,6 +101,7 @@ class FakeClassifierLLM:
     def __init__(self, response: str) -> None:
         self.response = response
         self.calls: list[list[dict[str, str]]] = []
+        self.max_tokens: list[int | None] = []
 
     def chat(
         self,
@@ -110,6 +111,7 @@ class FakeClassifierLLM:
         max_tokens: int | None = None,
     ) -> str:
         self.calls.append(messages)
+        self.max_tokens.append(max_tokens)
         return self.response
 
 
@@ -188,6 +190,7 @@ def assert_route(
             f"expected {expected_route}. Decision: {decision}"
         )
     print(f"{question!r} -> {decision.route}: {decision.reason}")
+    return decision
 
 
 def assert_pipeline_search_behavior() -> None:
@@ -266,6 +269,31 @@ def assert_embedding_context_behavior() -> None:
     )
 
 
+def assert_classification_text_prioritizes_current_question() -> None:
+    router = IntentRouter(
+        Settings(
+            intent_embedding_history_max_chars=120,
+            intent_embedding_summary_max_chars=120,
+            intent_embedding_text_max_chars=180,
+        )
+    )
+    text = router._classification_text(
+        "What is the current routing question?",
+        [
+            Message("user", "Earlier user context " + ("x" * 200)),
+            Message("assistant", "Earlier assistant context " + ("y" * 200)),
+        ],
+        "Long compact summary " + ("z" * 400),
+    )
+
+    if not text.startswith("Current question:\nWhat is the current routing question?"):
+        raise AssertionError("Intent embedding text should prioritize current question.")
+    if len(text) > 180:
+        raise AssertionError("Intent embedding text should respect total budget.")
+
+    print("Classification text current-question priority -> ok")
+
+
 def assert_direct_task_matching_is_case_insensitive() -> None:
     router = IntentRouter(Settings(), embedder=None, llm_client=None)
     assert_route(
@@ -306,21 +334,36 @@ def assert_anchor_vectors_initialize_once_under_concurrency() -> None:
 
 def assert_llm_fallback_behavior() -> None:
     classifier = FakeClassifierLLM(
-        '{"use_rag": "true", "reason": "knowledge-base follow-up"}'
+        (
+            "<think>The question is an ambiguous follow-up to documented policy."
+            "</think><answer>{\"use_rag\": \"true\", "
+            "\"reason\": \"knowledge-base follow-up\"}</answer>"
+        )
     )
     rag_router = IntentRouter(
         Settings(),
         embedder=None,
         llm_client=classifier,
     )
-    assert_route(
+    decision = assert_route(
         rag_router,
         "那审批时限呢？",
         True,
         history=[Message("assistant", "We reviewed the vacation policy.")],
         expected_route="llm_rag",
     )
+    if decision.reason != "knowledge-base follow-up":
+        raise AssertionError("LLM route reason should come from <answer> JSON.")
+    system_prompt = classifier.calls[-1][0]["content"]
     fallback_prompt = classifier.calls[-1][-1]["content"]
+    if "<think>" not in system_prompt or "<answer>" not in system_prompt:
+        raise AssertionError("LLM classifier should allow tagged judgement output.")
+    if "THINK_AND_JUDGEMENT" not in fallback_prompt or "JSON_ANS" not in fallback_prompt:
+        raise AssertionError("LLM fallback prompt should specify tagged output format.")
+    if classifier.max_tokens[-1] != 512:
+        raise AssertionError("LLM classifier output budget should allow tagged output.")
+    if fallback_prompt.find("Current question:") > fallback_prompt.find("Compact memory:"):
+        raise AssertionError("LLM fallback prompt should prioritize current question.")
     if "家是本" not in fallback_prompt or "朱剑秋" not in fallback_prompt:
         raise AssertionError("LLM fallback prompt should describe the local corpus.")
     if "巨大历史机遇" not in fallback_prompt or "巨大历史鲫鱼" not in fallback_prompt:
@@ -334,7 +377,8 @@ def assert_llm_fallback_behavior() -> None:
         Settings(),
         embedder=None,
         llm_client=FakeClassifierLLM(
-            '{"use_rag": "false", "reason": "general chat"}'
+            '<think>Unrelated request.</think><answer>{"use_rag": "false", '
+            '"reason": "general chat"}</answer>'
         ),
     )
     assert_route(
@@ -343,6 +387,37 @@ def assert_llm_fallback_behavior() -> None:
         False,
         expected_route="llm_direct",
     )
+
+    slash_tag_router = IntentRouter(
+        Settings(),
+        embedder=None,
+        llm_client=FakeClassifierLLM(
+            '</think>Unrelated request.</think></answer>{"use_rag": false, '
+            '"reason": "slash-style answer tag"}</answer>'
+        ),
+    )
+    assert_route(
+        slash_tag_router,
+        "今晚吃什么？",
+        False,
+        expected_route="llm_direct",
+    )
+
+    legacy_json_router = IntentRouter(
+        Settings(),
+        embedder=None,
+        llm_client=FakeClassifierLLM(
+            '{"use_rag": true, "reason": "legacy bare JSON"}'
+        ),
+    )
+    decision = assert_route(
+        legacy_json_router,
+        "审批材料呢？",
+        True,
+        expected_route="llm_rag",
+    )
+    if decision.reason != "legacy bare JSON":
+        raise AssertionError("LLM classifier should still accept bare JSON output.")
 
 
 def main() -> None:
@@ -428,6 +503,7 @@ def main() -> None:
     )
     assert_direct_task_matching_is_case_insensitive()
     assert_embedding_context_behavior()
+    assert_classification_text_prioritizes_current_question()
     assert_anchor_vectors_initialize_once_under_concurrency()
     assert_llm_fallback_behavior()
     assert_pipeline_search_behavior()

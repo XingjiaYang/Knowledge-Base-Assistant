@@ -45,6 +45,7 @@ class LLMRuntimeSettings:
     llm_base_url: str
     llm_api_key: str
     llm_model: str
+    llm_context_max_tokens: int
     llm_temperature: float
     llm_top_p: float
     llm_max_tokens: int
@@ -65,12 +66,19 @@ class LLMRuntimeSettings:
         base_url: str | None = None,
         api_key: str | None = None,
         model: str | None = None,
+        context_max_tokens: int | str | None = None,
     ) -> "LLMRuntimeSettings":
+        context_tokens = (
+            config.llm_context_max_tokens
+            if context_max_tokens is None
+            else int(context_max_tokens)
+        )
         return cls(
             llm_provider=normalize_llm_provider(provider or config.llm_provider),
             llm_base_url=(base_url or config.llm_base_url).strip(),
             llm_api_key=config.llm_api_key if api_key is None else api_key,
             llm_model=(model or config.llm_model).strip(),
+            llm_context_max_tokens=context_tokens,
             llm_temperature=config.llm_temperature,
             llm_top_p=config.llm_top_p,
             llm_max_tokens=config.llm_max_tokens,
@@ -89,6 +97,8 @@ class LLMRuntimeSettings:
             raise ValueError("LLM base URL must not be empty.")
         if not self.llm_model.strip():
             raise ValueError("LLM model must not be empty.")
+        if self.llm_context_max_tokens <= 0:
+            raise ValueError("LLM context max tokens must be greater than 0.")
         return self
 
 
@@ -100,9 +110,19 @@ class Settings:
     docs_dir: Path = PROJECT_ROOT / "data" / "docs"
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     collection_name: str = os.getenv("QDRANT_COLLECTION", "tech_docs")
-    embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-    chunk_size: int = _env_int("CHUNK_SIZE", 800)
-    chunk_overlap: int = _env_int("CHUNK_OVERLAP", 120)
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "jinaai/jina-embeddings-v3")
+    embedding_trust_remote_code: bool = _env_bool("EMBEDDING_TRUST_REMOTE_CODE", True)
+    embedding_query_task: str = os.getenv("EMBEDDING_QUERY_TASK", "retrieval.query")
+    embedding_passage_task: str = os.getenv(
+        "EMBEDDING_PASSAGE_TASK",
+        "retrieval.passage",
+    )
+    embedding_classification_task: str = os.getenv(
+        "EMBEDDING_CLASSIFICATION_TASK",
+        "classification",
+    )
+    chunk_size: int = _env_int("CHUNK_SIZE", 2000)
+    chunk_overlap: int = _env_int("CHUNK_OVERLAP", 300)
     bm25_top_k: int = _env_int("BM25_TOP_K", 100)
     recall_top_k: int = _env_int("RECALL_TOP_K", 100)
     rrf_top_k: int = _env_int("RRF_TOP_K", 100)
@@ -127,6 +147,15 @@ class Settings:
     llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
     llm_api_key: str = os.getenv("LLM_API_KEY", "")
     llm_model: str = os.getenv("LLM_MODEL", "gpt-4o-mini")
+    llm_context_max_tokens: int = _env_int("LLM_CONTEXT_MAX_TOKENS", 256000)
+    llm_context_safety_margin_tokens: int = _env_int(
+        "LLM_CONTEXT_SAFETY_MARGIN_TOKENS",
+        8192,
+    )
+    llm_context_prompt_overhead_tokens: int = _env_int(
+        "LLM_CONTEXT_PROMPT_OVERHEAD_TOKENS",
+        2048,
+    )
     llm_temperature: float = _env_float("LLM_TEMPERATURE", 0.2)
     llm_top_p: float = _env_float("LLM_TOP_P", 0.9)
     llm_max_tokens: int = _env_int("LLM_MAX_TOKENS", 4096)
@@ -173,38 +202,38 @@ class Settings:
 
     history_recent_turns: int = _env_int("HISTORY_RECENT_TURNS", 16)
     history_compact_after_turns: int = _env_int("HISTORY_COMPACT_AFTER_TURNS", 40)
-    history_max_messages: int = _env_int("HISTORY_MAX_MESSAGES", 120)
+    history_max_messages: int = _env_int("HISTORY_MAX_MESSAGES", 0)
     message_max_chars: int = _env_int("MESSAGE_MAX_CHARS", 8000)
     conversation_summary_max_chars: int = _env_int(
         "CONVERSATION_SUMMARY_MAX_CHARS",
-        6000,
+        256000,
     )
-    summary_history_max_chars: int = _env_int("SUMMARY_HISTORY_MAX_CHARS", 20000)
-    summary_max_tokens: int = _env_int("SUMMARY_MAX_TOKENS", 1200)
+    summary_history_max_chars: int = _env_int("SUMMARY_HISTORY_MAX_CHARS", 200000)
+    summary_max_tokens: int = _env_int("SUMMARY_MAX_TOKENS", 4096)
     search_query_max_chars: int = _env_int("SEARCH_QUERY_MAX_CHARS", 3000)
 
     intent_router_enabled: bool = _env_bool("INTENT_ROUTER_ENABLED", True)
     intent_llm_fallback: bool = _env_bool("INTENT_LLM_FALLBACK", True)
     intent_llm_history_max_chars: int = _env_int(
         "INTENT_LLM_HISTORY_MAX_CHARS",
-        4000,
+        12000,
     )
     intent_llm_summary_max_chars: int = _env_int(
         "INTENT_LLM_SUMMARY_MAX_CHARS",
-        2500,
+        32000,
     )
-    intent_llm_max_tokens: int = _env_int("INTENT_LLM_MAX_TOKENS", 120)
+    intent_llm_max_tokens: int = _env_int("INTENT_LLM_MAX_TOKENS", 512)
     intent_embedding_history_max_chars: int = _env_int(
         "INTENT_EMBEDDING_HISTORY_MAX_CHARS",
-        5000,
+        8000,
     )
     intent_embedding_summary_max_chars: int = _env_int(
         "INTENT_EMBEDDING_SUMMARY_MAX_CHARS",
-        2500,
+        8000,
     )
     intent_embedding_text_max_chars: int = _env_int(
         "INTENT_EMBEDDING_TEXT_MAX_CHARS",
-        7000,
+        12000,
     )
     intent_embedding_rag_threshold: float = _env_float(
         "INTENT_EMBEDDING_RAG_THRESHOLD",
@@ -228,6 +257,8 @@ class Settings:
             raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE.")
         if self.chunk_overlap and self.chunk_overlap >= self.chunk_size - 1:
             raise ValueError("CHUNK_OVERLAP must leave room for new chunk content.")
+        if not self.embedding_model.strip():
+            raise ValueError("EMBEDDING_MODEL must not be empty.")
         if self.retrieve_top_k <= 0:
             raise ValueError("RETRIEVE_TOP_K must be greater than 0.")
         if self.bm25_top_k <= 0:
@@ -267,6 +298,16 @@ class Settings:
             )
         if self.llm_max_tokens <= 0:
             raise ValueError("LLM_MAX_TOKENS must be greater than 0.")
+        if self.llm_context_max_tokens <= 0:
+            raise ValueError("LLM_CONTEXT_MAX_TOKENS must be greater than 0.")
+        if self.llm_context_safety_margin_tokens < 0:
+            raise ValueError(
+                "LLM_CONTEXT_SAFETY_MARGIN_TOKENS must be greater than or equal to 0."
+            )
+        if self.llm_context_prompt_overhead_tokens < 0:
+            raise ValueError(
+                "LLM_CONTEXT_PROMPT_OVERHEAD_TOKENS must be greater than or equal to 0."
+            )
         if self.api_message_max_chars <= 0:
             raise ValueError("API_MESSAGE_MAX_CHARS must be greater than 0.")
         if self.api_question_max_chars <= 0:
@@ -294,6 +335,8 @@ class Settings:
             raise ValueError("SESSION_LIST_LIMIT must be greater than 0.")
         if self.session_title_max_chars <= 0:
             raise ValueError("SESSION_TITLE_MAX_CHARS must be greater than 0.")
+        if self.intent_llm_max_tokens <= 0:
+            raise ValueError("INTENT_LLM_MAX_TOKENS must be greater than 0.")
 
 
 settings = Settings()

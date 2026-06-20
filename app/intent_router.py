@@ -361,18 +361,24 @@ class IntentRouter:
             "SQL/database questions, greetings, casual conversation, creative "
             "writing, translation, or requests that explicitly do not need "
             "documents.\n\n"
-            f"Compact memory:\n{summary_text}\n\n"
-            f"Recent conversation:\n{history_text or 'None'}\n\n"
             f"Current question:\n{question}\n\n"
+            f"Recent conversation:\n{history_text or 'None'}\n\n"
+            f"Compact memory:\n{summary_text}\n\n"
             "Decide whether answering should use the knowledge-base vector "
-            "store. Return only JSON with keys use_rag and reason."
+            "store. Return exactly "
+            "<think>THINK_AND_JUDGEMENT</think>"
+            "<answer>JSON_ANS</answer>, where JSON_ANS is compact JSON "
+            "with keys use_rag and reason."
         )
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are an intent classifier. Return only compact JSON, "
-                    "for example {\"use_rag\": true, \"reason\": \"...\"}."
+                    "You are an intent classifier. Write a brief judgement in "
+                    "<think>...</think>, then write only the route JSON in "
+                    "<answer>...</answer>. Do not write anything outside those "
+                    "tags. Example: <think>local-corpus follow-up</think>"
+                    "<answer>{\"use_rag\": true, \"reason\": \"...\"}</answer>."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -442,9 +448,9 @@ class IntentRouter:
             strategy="middle",
         )
         parts = [
-            f"Compact memory:\n{summary_text}" if summary_text else "",
-            f"Recent conversation:\n{history_text}" if history_text else "",
             f"Current question:\n{question.strip()}",
+            f"Recent conversation:\n{history_text}" if history_text else "",
+            f"Compact memory:\n{summary_text}" if summary_text else "",
         ]
         return self.budget.trim_text(
             "\n\n".join(part for part in parts if part),
@@ -461,13 +467,19 @@ class IntentRouter:
         return self.budget.format_history(history, max_chars, strategy=strategy)
 
     def _parse_llm_decision(self, raw: str) -> tuple[bool, str] | None:
-        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        candidate = match.group(0) if match else raw.strip()
+        answer_match = re.search(
+            r"</?answer>\s*(.*?)\s*</answer>",
+            raw,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        source = answer_match.group(1) if answer_match else raw
+        json_match = re.search(r"\{.*\}", source, flags=re.DOTALL)
+        candidate = json_match.group(0) if json_match else source.strip()
 
         try:
             data = json.loads(candidate)
         except json.JSONDecodeError:
-            lowered = raw.lower()
+            lowered = source.lower()
             if "true" in lowered and "false" not in lowered:
                 return True, "LLM classifier returned true."
             if "false" in lowered and "true" not in lowered:

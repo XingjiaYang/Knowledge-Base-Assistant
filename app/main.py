@@ -284,6 +284,7 @@ class AdminLLMSettingsResponse(BaseModel):
     provider: str
     base_url: str
     model: str
+    context_max_tokens: int
     api_key_configured: bool
     source: str
 
@@ -293,6 +294,7 @@ class AdminLLMSettingsResponse(BaseModel):
             provider=record.provider,
             base_url=record.base_url,
             model=record.model,
+            context_max_tokens=record.context_max_tokens,
             api_key_configured=record.api_key_configured,
             source=record.source,
         )
@@ -302,6 +304,7 @@ class AdminLLMSettingsUpdateRequest(BaseModel):
     provider: Literal["openai_compatible", "anthropic"]
     base_url: str = Field(..., min_length=1, max_length=2000)
     model: str = Field(..., min_length=1, max_length=300)
+    context_max_tokens: int | None = Field(default=None, ge=4096, le=2_000_000)
     api_key: str | None = Field(default=None, max_length=10000)
 
 
@@ -668,6 +671,7 @@ async def admin_update_llm_settings(
             update_request.base_url,
             update_request.model,
             update_request.api_key,
+            update_request.context_max_tokens,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -771,10 +775,17 @@ async def health_details(request: Request) -> dict[str, object]:
         "llm_provider": llm_settings.provider,
         "llm_base_url": llm_settings.base_url,
         "llm_model": llm_settings.model,
+        "llm_context_max_tokens": llm_settings.context_max_tokens,
+        "llm_context_safety_margin_tokens": settings.llm_context_safety_margin_tokens,
+        "llm_context_prompt_overhead_tokens": settings.llm_context_prompt_overhead_tokens,
         "llm_api_key_configured": llm_settings.api_key_configured,
         "llm_settings_source": llm_settings.source,
         "llm_max_tokens": settings.llm_max_tokens,
         "cuda_enabled": settings.cuda_enabled,
+        "embedding_model": settings.embedding_model,
+        "embedding_query_task": settings.embedding_query_task,
+        "embedding_passage_task": settings.embedding_passage_task,
+        "embedding_classification_task": settings.embedding_classification_task,
         "bm25_top_k": settings.bm25_top_k,
         "recall_top_k": settings.recall_top_k,
         "rrf_top_k": settings.rrf_top_k,

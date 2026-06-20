@@ -275,6 +275,8 @@
             <input id="adminLlmBaseUrl" placeholder="https://api.openai.com/v1" autocomplete="off">
             <label class="field-label" for="adminLlmModel">Model</label>
             <input id="adminLlmModel" placeholder="gpt-4o-mini" autocomplete="off">
+            <label class="field-label" for="adminLlmContextMaxTokens">Context max tokens</label>
+            <input id="adminLlmContextMaxTokens" type="number" min="4096" max="2000000" step="1024" placeholder="256000" autocomplete="off">
             <label class="field-label" for="adminLlmApiKey">API key</label>
             <input id="adminLlmApiKey" type="password" placeholder="Leave blank to keep current key" autocomplete="new-password">
             <button id="adminLlmSaveButton" class="btn btn-primary btn-block" type="submit">Save LLM settings</button>

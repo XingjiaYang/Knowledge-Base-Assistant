@@ -451,6 +451,7 @@ class VectorStore:
                         self._model = SentenceTransformer(
                             self.config.embedding_model,
                             device=device,
+                            trust_remote_code=self.config.embedding_trust_remote_code,
                         )
                         self._model_device = device
                     except Exception as exc:
@@ -464,6 +465,7 @@ class VectorStore:
                         self._model = SentenceTransformer(
                             self.config.embedding_model,
                             device="cpu",
+                            trust_remote_code=self.config.embedding_trust_remote_code,
                         )
                         self._model_device = "cpu"
         return self._model
@@ -760,6 +762,7 @@ class VectorStore:
         embeddings = self._encode(
             [chunk.embedding_text for chunk in chunks],
             normalize_embeddings=True,
+            task=self.config.embedding_passage_task,
         )
         points: list[PointStruct] = []
         source_key = self._source_key(file_path)
@@ -837,25 +840,37 @@ class VectorStore:
             return source_path.name
 
     def _embed_one(self, text: str) -> list[float]:
-        embedding = self._encode(text, normalize_embeddings=True)
+        embedding = self._encode(
+            text,
+            normalize_embeddings=True,
+            task=self.config.embedding_query_task,
+        )
         return embedding.tolist()
 
     def encode(
         self,
         texts: str | Sequence[str],
         normalize_embeddings: bool = True,
+        task: str | None = None,
     ) -> object:
-        return self._encode(texts, normalize_embeddings=normalize_embeddings)
+        return self._encode(
+            texts,
+            normalize_embeddings=normalize_embeddings,
+            task=task or self.config.embedding_classification_task,
+        )
 
     def _encode(
         self,
         texts: str | Sequence[str],
         normalize_embeddings: bool = True,
+        task: str | None = None,
     ) -> object:
+        encode_kwargs = self._encode_kwargs(task)
         try:
             return self.model.encode(
                 texts,
                 normalize_embeddings=normalize_embeddings,
+                **encode_kwargs,
             )
         except Exception as exc:
             if self._model_device != "cuda":
@@ -868,7 +883,15 @@ class VectorStore:
             return self.model.encode(
                 texts,
                 normalize_embeddings=normalize_embeddings,
+                **encode_kwargs,
             )
+
+    @staticmethod
+    def _encode_kwargs(task: str | None) -> dict[str, str]:
+        task = (task or "").strip()
+        if not task:
+            return {}
+        return {"task": task, "prompt_name": task}
 
     def _move_model_to_cpu(self) -> None:
         if self._model is not None and hasattr(self._model, "to"):

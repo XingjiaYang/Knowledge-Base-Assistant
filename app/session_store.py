@@ -79,6 +79,7 @@ class LLMSettingsRecord:
     provider: str
     base_url: str
     model: str
+    context_max_tokens: int
     api_key_configured: bool
     source: str
 
@@ -623,6 +624,7 @@ class SessionStore:
                 "llm_base_url",
                 "llm_api_key",
                 "llm_model",
+                "llm_context_max_tokens",
             ]
         )
         return LLMRuntimeSettings.from_settings(
@@ -631,6 +633,7 @@ class SessionStore:
             base_url=values.get("llm_base_url"),
             api_key=values.get("llm_api_key"),
             model=values.get("llm_model"),
+            context_max_tokens=values.get("llm_context_max_tokens"),
         ).validate()
 
     def get_llm_settings_record(self) -> LLMSettingsRecord:
@@ -640,6 +643,7 @@ class SessionStore:
                 "llm_base_url",
                 "llm_api_key",
                 "llm_model",
+                "llm_context_max_tokens",
             ]
         )
         runtime = LLMRuntimeSettings.from_settings(
@@ -648,11 +652,13 @@ class SessionStore:
             base_url=values.get("llm_base_url"),
             api_key=values.get("llm_api_key"),
             model=values.get("llm_model"),
+            context_max_tokens=values.get("llm_context_max_tokens"),
         ).validate()
         return LLMSettingsRecord(
             provider=runtime.llm_provider,
             base_url=runtime.llm_base_url,
             model=runtime.llm_model,
+            context_max_tokens=runtime.llm_context_max_tokens,
             api_key_configured=bool(runtime.llm_api_key),
             source="database" if values else ".env",
         )
@@ -663,6 +669,7 @@ class SessionStore:
         base_url: str,
         model: str,
         api_key: str | None = None,
+        context_max_tokens: int | None = None,
     ) -> LLMSettingsRecord:
         provider = normalize_llm_provider(provider)
         base_url = base_url.strip()
@@ -674,12 +681,18 @@ class SessionStore:
             base_url=base_url,
             api_key=current.llm_api_key if api_key is None else api_key.strip(),
             model=model,
+            context_max_tokens=(
+                current.llm_context_max_tokens
+                if context_max_tokens is None
+                else context_max_tokens
+            ),
         ).validate()
 
         values = {
             "llm_provider": runtime.llm_provider,
             "llm_base_url": runtime.llm_base_url,
             "llm_model": runtime.llm_model,
+            "llm_context_max_tokens": str(runtime.llm_context_max_tokens),
         }
         if api_key is not None:
             values["llm_api_key"] = runtime.llm_api_key
