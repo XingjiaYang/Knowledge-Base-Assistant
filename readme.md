@@ -27,6 +27,9 @@ boundaries that should be updated when `data/docs/` is replaced.
 
 - Docker Compose deployment for PostgreSQL, Qdrant, document ingestion, and FastAPI.
 - Configurable cloud LLM providers with an optional local vLLM profile.
+- Jina embeddings v3 by default, with separate retrieval-query,
+  retrieval-passage, and classification tasks for bilingual retrieval and
+  intent routing.
 - Replaceable Markdown corpus with isolated keyword hints for the bundled
   domain.
 - Chat-style web UI at `/` with adjustable BM25, cosine, RRF, and final context
@@ -37,9 +40,11 @@ boundaries that should be updated when `data/docs/` is replaced.
   validation.
 - Intent routing avoids vector search for clear direct-chat questions.
 - Source references are shown when retrieval is used.
-- Conversation history is stored server-side and older turns are compacted into
-  a reusable summary.
+- Conversation history is stored server-side and compacted only when estimated
+  prompt pressure approaches the active LLM context window.
 - Runtime configuration is environment-driven through `.env`.
+- The startup superuser can update the LLM provider, base URL, model, API key,
+  and context-window size from the Admin UI without rebuilding containers.
 - Supports Hugging Face cache volumes, local model directories, mirrors, and
   host-side HTTP proxy settings for restricted networks.
 
@@ -71,17 +76,21 @@ Main modules:
   ES modules under `js/` (`store`, `api`, `dom`, `markdown`, and `views/`).
   Served directly by FastAPI with no build step.
 - `app/session_store.py`: PostgreSQL-backed users, login tokens, chat sessions,
-  messages, and compacted conversation summaries.
-- `app/intent_router.py`: keyword, embedding, and LLM fallback routing.
+  messages, runtime LLM settings, route metadata, and compacted conversation
+  summaries.
+- `app/intent_router.py`: keyword, Jina-classification embedding, and tagged
+  LLM fallback routing.
 - `app/rag.py`: hybrid recall, RRF fusion, reranking, prompt construction, and
-  history compaction.
+  context-budget-aware history compaction.
 - `app/reranker.py`: startup-preloaded Jina cross-encoder reranking for
   recalled chunks.
-- `app/vector_store.py`: Markdown chunking, embeddings, BM25 indexing, Qdrant
-  collection management, vector search, and RRF fusion.
+- `app/vector_store.py`: Markdown chunking, Jina embeddings v3 task routing,
+  BM25 indexing, Qdrant collection management, vector search, and RRF fusion.
 - `app/llm_client.py`: provider-aware client for cloud APIs or local vLLM.
-- `scripts/`: manual service, ingest, and retrieval smoke-test commands.
+- `scripts/`: manual service, ingest, retrieval smoke-test, and intent-router
+  A/B evaluation commands.
 - `data/docs/`: replaceable Markdown documents ingested into Qdrant.
+- `data/eval/`: labeled intent-routing cases, including bilingual slices.
 
 ## Repository Contents
 
@@ -91,7 +100,8 @@ committed project should include:
 - Source code under `app/`, `scripts/`, and `docker/`.
 - Deployment files: `Dockerfile`, `compose.yaml`, `compose.cpu.yaml`,
   `.env.example`, and dependency files.
-- Markdown corpus files under `data/docs/`.
+- Markdown corpus files under `data/docs/` and labeled routing evaluation
+  cases under `data/eval/`.
 - Contributor/project docs such as `readme.md` and `AGENTS.md`.
 
 The repository should not include `.env`, model weights, Hugging Face caches,
@@ -223,12 +233,16 @@ LLM_API_KEY=
 LLM_TEMPERATURE=0.2
 LLM_TOP_P=0.9
 LLM_MAX_TOKENS=4096
+LLM_CONTEXT_MAX_TOKENS=256000
+LLM_CONTEXT_SAFETY_MARGIN_TOKENS=8192
+LLM_CONTEXT_PROMPT_OVERHEAD_TOKENS=2048
 LLM_TIMEOUT_SECONDS=300
 LLM_RETRY_ATTEMPTS=3
 LLM_RETRY_BACKOFF_SECONDS=1
 LLM_RETRY_BACKOFF_MAX_SECONDS=10
 LLM_HEALTH_CHECK_ENABLED=0
 LLM_HEALTH_PATH=
+LLM_ANTHROPIC_VERSION=2023-06-01
 
 API_TOP_K_MAX=20
 API_RECALL_TOP_K_MAX=1000
@@ -249,15 +263,19 @@ AUTH_SESSION_TTL_SECONDS=604800
 SESSION_LIST_LIMIT=50
 SESSION_TITLE_MAX_CHARS=80
 
-EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 QDRANT_COLLECTION=tech_docs
+EMBEDDING_MODEL=jinaai/jina-embeddings-v3
+EMBEDDING_TRUST_REMOTE_CODE=1
+EMBEDDING_QUERY_TASK=retrieval.query
+EMBEDDING_PASSAGE_TASK=retrieval.passage
+EMBEDDING_CLASSIFICATION_TASK=classification
 BM25_TOP_K=100
 RECALL_TOP_K=100
 RRF_TOP_K=100
 RETRIEVE_TOP_K=5
 RETRIEVE_SCORE_THRESHOLD=0
-CHUNK_SIZE=800
-CHUNK_OVERLAP=120
+CHUNK_SIZE=2000
+CHUNK_OVERLAP=300
 RERANKER_ENABLED=1
 RERANKER_MODEL=jinaai/jina-reranker-v3
 RERANKER_PRELOAD=1
@@ -267,21 +285,21 @@ RERANKER_MAX_DOCUMENTS_PER_CALL=64
 
 HISTORY_RECENT_TURNS=16
 HISTORY_COMPACT_AFTER_TURNS=40
-HISTORY_MAX_MESSAGES=120
+HISTORY_MAX_MESSAGES=0
 MESSAGE_MAX_CHARS=8000
-CONVERSATION_SUMMARY_MAX_CHARS=6000
-SUMMARY_HISTORY_MAX_CHARS=20000
-SUMMARY_MAX_TOKENS=1200
+CONVERSATION_SUMMARY_MAX_CHARS=256000
+SUMMARY_HISTORY_MAX_CHARS=200000
+SUMMARY_MAX_TOKENS=4096
 SEARCH_QUERY_MAX_CHARS=3000
 
 INTENT_ROUTER_ENABLED=1
 INTENT_LLM_FALLBACK=1
-INTENT_LLM_HISTORY_MAX_CHARS=4000
-INTENT_LLM_SUMMARY_MAX_CHARS=2500
-INTENT_LLM_MAX_TOKENS=120
-INTENT_EMBEDDING_HISTORY_MAX_CHARS=5000
-INTENT_EMBEDDING_SUMMARY_MAX_CHARS=2500
-INTENT_EMBEDDING_TEXT_MAX_CHARS=7000
+INTENT_LLM_HISTORY_MAX_CHARS=12000
+INTENT_LLM_SUMMARY_MAX_CHARS=32000
+INTENT_LLM_MAX_TOKENS=512
+INTENT_EMBEDDING_HISTORY_MAX_CHARS=8000
+INTENT_EMBEDDING_SUMMARY_MAX_CHARS=8000
+INTENT_EMBEDDING_TEXT_MAX_CHARS=12000
 INTENT_EMBEDDING_RAG_THRESHOLD=0.38
 INTENT_EMBEDDING_DIRECT_THRESHOLD=0.40
 INTENT_EMBEDDING_MARGIN=0.06
@@ -300,6 +318,24 @@ LLM chat requests retry transient provider errors (`429`, `502`, `503`, `504`)
 with exponential backoff. Keep `DEBUG=0` outside local development so API errors
 return generic messages while details stay in server logs.
 
+The default embedding model is `jinaai/jina-embeddings-v3` with
+`trust_remote_code` enabled. Document chunks are encoded with
+`retrieval.passage`, search queries with `retrieval.query`, and the second
+intent-router layer with the `classification` task. Because the model has a
+finite token window, the intent layer uses bounded recent history and summary
+views rather than the full API-scale conversation summary. These intent budgets
+are character-based safeguards; if the encoder still raises, the router falls
+through to the LLM classifier instead of failing the request.
+
+Conversation memory is sized for large API-context models. The default context
+window is `256000` tokens, with an `8192` token safety margin and `2048` token
+prompt-overhead reserve. History is not count-truncated before compaction
+(`HISTORY_MAX_MESSAGES=0`); instead, `RAGPipeline` estimates summary plus
+uncompressed history and compacts only when that estimate would exceed the
+active context window after reserving output, the current question, safety,
+prompt overhead, and expected retrieved references. The superuser can override
+the runtime LLM context-window size from the Admin UI.
+
 When intent routing chooses RAG, the pipeline now performs hybrid recall before
 reranking. It recalls `BM25_TOP_K` keyword candidates from the local Markdown
 chunks with BM25, recalls `RECALL_TOP_K` cosine-similarity candidates from
@@ -311,7 +347,7 @@ the LLM prompt and response references. The browser UI exposes these values as
 and `5`. Set `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector
 results before fusion. `/health/details` returns the active defaults so the UI
 can initialize all four controls after login. With `CUDA=TRUE` (the default),
-the BGE embedding model and Jina reranker prefer CUDA when PyTorch can see a
+the Jina embedding model and Jina reranker prefer CUDA when PyTorch can see a
 compatible NVIDIA GPU; if CUDA is not visible or model placement fails, they
 log the fallback and continue on CPU. Set `CUDA=FALSE` to force CPU. With
 `RERANKER_PRELOAD=1`, the API loads
@@ -359,10 +395,12 @@ Change `AUTH_DEFAULT_ADMIN_PASSWORD` before exposing the app beyond local
 development. Existing users are not overwritten on restart. The startup-created
 default administrator is also the single superuser. Only this superuser can
 edit runtime LLM settings from the Admin panel: provider format
-(`openai_compatible` or `anthropic`), API base URL, model name, and API key.
+(`openai_compatible` or `anthropic`), API base URL, model name, context-window
+size, and API key.
 These runtime values are stored in PostgreSQL and override the `.env` LLM
 defaults without rebuilding the container; `.env` remains the bootstrap
-fallback. API keys are never returned to the browser, and leaving the key field
+fallback. History compaction reads the runtime context-window value before every
+answer. API keys are never returned to the browser, and leaving the key field
 blank keeps the current key. You can also add non-admin initial users through
 `AUTH_BOOTSTRAP_USERS`, for example:
 
@@ -396,10 +434,12 @@ To use another subject:
 1. Replace or edit the Markdown files under `data/docs/`.
 2. Rebuild the Qdrant collection with `python scripts/ingest_docs.py --recreate`.
 3. Update the corpus keyword hints in `app/intent_router.py`
-   (`DOMAIN_RAG_PHRASES` and `DOMAIN_RAG_PATTERNS`) and the LLM fallback
-   corpus description if first-pass and fallback intent routing should
-   recognize the new topic.
-4. Ask questions about the new corpus through the same UI or `/rag` API.
+   (`DOMAIN_RAG_PHRASES` and `DOMAIN_RAG_PATTERNS`), the LLM fallback corpus
+   description, and `data/eval/intent_router_cases.jsonl` if first-pass,
+   embedding, and fallback intent routing should recognize the new topic.
+4. Run `python scripts/intent_router_ab.py --fake-embedder`; when model weights
+   are available, run a real encoder comparison.
+5. Ask questions about the new corpus through the same UI or `/rag` API.
 
 ## Restricted Network Setup
 
@@ -429,14 +469,15 @@ You can mount local model directories through `./models:/models:ro`:
 
 ```text
 models/
-  bge-small-en-v1.5/
+  jina-embeddings-v3/
   qwen2.5-7b-instruct/
 ```
 
 Then configure:
 
 ```bash
-EMBEDDING_MODEL=/models/bge-small-en-v1.5
+EMBEDDING_MODEL=/models/jina-embeddings-v3
+EMBEDDING_TRUST_REMOTE_CODE=1
 VLLM_MODEL=/models/qwen2.5-7b-instruct
 LLM_MODEL=qwen2.5-7b-instruct
 ```
@@ -574,6 +615,15 @@ Smoke-test intent routing:
 python scripts/test_intent_router.py
 ```
 
+Run offline intent-router A/B evaluation:
+
+```bash
+python scripts/intent_router_ab.py --fake-embedder
+python scripts/intent_router_ab.py \
+  --model-variant old_bge=BAAI/bge-small-en-v1.5,,0 \
+  --json-report /tmp/intent_router_ab_report.json
+```
+
 Smoke-test cross-encoder reranker ordering with a fake model:
 
 ```bash
@@ -616,7 +666,9 @@ fusion, and optional reranking.
 
 The keyword intent layer contains domain hints for this bundled corpus in
 `app/intent_router.py`. Those hints only decide whether to use RAG; they do not
-rank documents. Replace them when swapping in a different corpus.
+rank documents. Replace them when swapping in a different corpus, and update
+`data/eval/intent_router_cases.jsonl` so encoder and threshold changes are
+checked against representative routing examples.
 
 Chunking is Markdown-aware and metadata-driven: Markdown blocks are parsed,
 headings are stored as `h1`/`h2`/`h3` payload metadata, and text, code, and
