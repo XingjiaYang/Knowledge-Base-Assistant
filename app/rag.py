@@ -7,7 +7,7 @@ import re
 from typing import Literal
 
 from app.config import Settings, settings
-from app.intent_router import IntentRouter
+from app.intent_router import IntentDecision, IntentRouter
 from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget, TrimStrategy
 from app.reranker import Reranker
@@ -80,6 +80,7 @@ class RAGPipeline:
         rrf_top_k: int | None = None,
         history: list[ChatMessage] | None = None,
         conversation_summary: str | None = None,
+        rag_only: bool = False,
     ) -> RAGAnswer:
         clean_history = self._normalize_history(history or [])
         summary, recent_history, compacted_count = self._compact_history(
@@ -88,7 +89,14 @@ class RAGPipeline:
             question,
             top_k=top_k,
         )
-        intent = self.intent_router.route(question, recent_history, summary)
+        if rag_only:
+            intent = IntentDecision(
+                True,
+                "rag_only",
+                "RAG-only mode enabled by the user.",
+            )
+        else:
+            intent = self.intent_router.route(question, recent_history, summary)
         logger.info(
             "RAG request routed: route=%s use_rag=%s bm25_top_k=%s "
             "vector_top_k=%s rrf_top_k=%s final_top_k=%s history=%s "

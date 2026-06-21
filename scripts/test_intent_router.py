@@ -266,6 +266,22 @@ def assert_pipeline_search_behavior() -> None:
     if direct_answer.used_rag or vector_store.search_calls != 0 or reranker.calls:
         raise AssertionError("Direct route should not call vector search.")
 
+    forced_vector_store = FakeVectorStore()
+    forced_reranker = FakeReranker()
+    forced_answer = RAGPipeline(
+        config,
+        vector_store=forced_vector_store,
+        llm_client=llm_client,
+        intent_router=router,
+        reranker=forced_reranker,
+    ).answer("写一首短诗", top_k=1, rag_only=True)
+    if not forced_answer.used_rag or forced_answer.route != "rag_only":
+        raise AssertionError("RAG-only mode should force retrieval.")
+    if forced_vector_store.search_calls != 1:
+        raise AssertionError("RAG-only mode should call retrieval even for direct tasks.")
+    if [context.chunk_id for context in forced_answer.contexts] != [2]:
+        raise AssertionError("RAG-only mode should return retrieved contexts.")
+
     rag_answer = pipeline.answer(
         "新员工如何申请开发设备？",
         top_k=2,

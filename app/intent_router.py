@@ -15,6 +15,7 @@ from app.prompt_budget import PromptBudget, TrimStrategy
 
 RouteName = Literal[
     "disabled",
+    "rag_only",
     "keyword_rag",
     "keyword_direct",
     "state_rag",

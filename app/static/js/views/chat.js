@@ -1,10 +1,10 @@
 // Chat column: message log, composer, and the references panel rendering.
 
-import { state, on, emit } from "../store.js?v=20260620-degraded-retrieval";
-import { api } from "../api.js?v=20260620-degraded-retrieval";
-import { byId, el, clear, icon } from "../dom.js?v=20260620-degraded-retrieval";
-import { renderMarkdown } from "../markdown.js?v=20260620-degraded-retrieval";
-import { createSession, reloadSessions } from "./sessions.js?v=20260620-degraded-retrieval";
+import { state, on, emit } from "../store.js?v=20260620-rag-only";
+import { api } from "../api.js?v=20260620-rag-only";
+import { byId, el, clear, icon } from "../dom.js?v=20260620-rag-only";
+import { renderMarkdown } from "../markdown.js?v=20260620-rag-only";
+import { createSession, reloadSessions } from "./sessions.js?v=20260620-rag-only";
 
 let els = {};
 
@@ -89,6 +89,7 @@ async function ask(question) {
       recall_top_k: state.recallTopK ?? null,
       rrf_top_k: state.rrfTopK ?? null,
       top_k: state.topK ?? null,
+      rag_only: Boolean(state.ragOnly),
     });
 
     if (data.session_id) state.activeSessionId = data.session_id;

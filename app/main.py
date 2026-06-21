@@ -143,6 +143,7 @@ class RAGRequest(BaseModel):
         ge=1,
         le=settings.api_recall_top_k_max,
     )
+    rag_only: bool = False
     history: list[ChatMessageRequest] = Field(
         default_factory=list,
         max_length=settings.api_history_max_messages,
@@ -853,6 +854,7 @@ async def rag(
             rrf_top_k=rag_request.rrf_top_k,
             history=history,
             conversation_summary=conversation_summary,
+            rag_only=rag_request.rag_only,
         )
     except UnexpectedResponse as exc:
         logger.exception("Vector store request failed during RAG.")

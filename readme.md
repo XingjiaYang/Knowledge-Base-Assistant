@@ -339,6 +339,9 @@ classification text against single-intent RAG/direct anchor queries. The third
 LLM classifier receives structured previous-route state and decides ambiguous
 follow-ups with the tagged
 `<think>THINK_AND_JUDGEMENT</think><answer>JSON_ANS</answer>` format.
+All users can enable the browser `RAG-only` switch for a request-level override:
+when enabled, `/rag` receives `rag_only=true`, skips intent routing, and records
+the route as `rag_only`.
 
 Conversation memory is sized for large API-context models. The default context
 window is `256000` tokens, with an `8192` token safety margin and `2048` token

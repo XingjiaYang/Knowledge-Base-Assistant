@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>Knowledge Base Assistant</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/css/styles.css?v=20260620-degraded-retrieval">
+  <link rel="stylesheet" href="/static/css/styles.css?v=20260620-rag-only">
 </head>
 <body>
   <!-- Inline SVG icon sprite: keeps icons local with no external/CDN dependency. -->
@@ -148,6 +148,9 @@
             </button>
             <div id="settingsPopover" class="popover" hidden>
               <div class="popover-title">Retrieval</div>
+              <label class="checkbox">
+                <input id="ragOnlyMode" type="checkbox"> RAG-only
+              </label>
               <label class="field field-row">
                 <span class="field-label">BM25 K</span>
                 <input id="bm25TopK" type="number" min="1" inputmode="numeric">
@@ -287,6 +290,6 @@
     </div>
   </main>
 
-  <script type="module" src="/static/js/main.js?v=20260620-degraded-retrieval"></script>
+  <script type="module" src="/static/js/main.js?v=20260620-rag-only"></script>
 </body>
 </html>

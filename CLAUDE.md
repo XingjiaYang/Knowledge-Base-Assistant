@@ -164,6 +164,10 @@ anchors; the second layer caches their local vectors and scores with NumPy dot
 products. Ambiguous follow-ups should be left for the third layer, which sees
 the previous route state.
 
+The browser exposes a `RAG-only` switch to every signed-in user. Requests with
+`rag_only=true` bypass `IntentRouter` and force retrieval; the stored route is
+`rag_only`.
+
 ### Intent Router Evaluation
 
 Use `scripts/intent_router_ab.py` before changing intent thresholds or

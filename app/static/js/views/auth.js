@@ -2,9 +2,9 @@
 // top-level screen is visible. Auth actions emit events that main.js wires
 // to data loading (sessions, health, admin) — avoiding cross-view imports.
 
-import { state, emit, on, saveToken, clearToken, resetState, setStatus } from "../store.js?v=20260620-degraded-retrieval";
-import { api } from "../api.js?v=20260620-degraded-retrieval";
-import { byId } from "../dom.js?v=20260620-degraded-retrieval";
+import { state, emit, on, saveToken, clearToken, resetState, setStatus } from "../store.js?v=20260620-rag-only";
+import { api } from "../api.js?v=20260620-rag-only";
+import { byId } from "../dom.js?v=20260620-rag-only";
 
 let els = {};
 

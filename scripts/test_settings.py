@@ -444,6 +444,7 @@ def assert_rag_endpoint_accepts_original_body_shape() -> None:
         bm25_top_k=9,
         recall_top_k=10,
         rrf_top_k=8,
+        rag_only=True,
         history=[],
         conversation_summary="",
     )
@@ -453,6 +454,7 @@ def assert_rag_endpoint_accepts_original_body_shape() -> None:
         or request.bm25_top_k != 9
         or request.recall_top_k != 10
         or request.rrf_top_k != 8
+        or request.rag_only is not True
         or request.history != []
         or request.conversation_summary != ""
     ):

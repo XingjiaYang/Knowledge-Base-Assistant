@@ -252,6 +252,8 @@ history 和 summary 视图，不会直接把 256K 级别的主 summary 整段喂
 上一轮 route state，并用
 `<think>THINK_AND_JUDGEMENT</think><answer>JSON_ANS</answer>` 输出格式判断
 模糊追问。
+所有用户都可以在浏览器设置中打开 `RAG-only` 开关。开启后，请求会携带
+`rag_only=true`，后端跳过意图路由并强制检索，route 记录为 `rag_only`。
 
 对话 summary 的默认预算按 API 长上下文模型设置：
 `LLM_CONTEXT_MAX_TOKENS=256000`、安全余量 `8192`、prompt overhead `2048`。

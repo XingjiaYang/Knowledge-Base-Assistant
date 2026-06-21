@@ -1,9 +1,9 @@
 // Sidebar session list: search/filter, select, inline rename, and delete.
 // Also owns the session data actions used by the chat view.
 
-import { state, on, emit } from "../store.js?v=20260620-degraded-retrieval";
-import { api } from "../api.js?v=20260620-degraded-retrieval";
-import { byId, el, clear, icon } from "../dom.js?v=20260620-degraded-retrieval";
+import { state, on, emit } from "../store.js?v=20260620-rag-only";
+import { api } from "../api.js?v=20260620-rag-only";
+import { byId, el, clear, icon } from "../dom.js?v=20260620-rag-only";
 
 let els = {};
 

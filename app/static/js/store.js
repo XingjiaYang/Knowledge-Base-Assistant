@@ -18,6 +18,7 @@ export const state = {
   recallTopK: null,
   rrfTopK: null,
   topK: null,
+  ragOnly: false,
   // auth
   authToken: "",
   currentUser: null,
@@ -86,6 +87,7 @@ export function resetState() {
     recallTopK: null,
     rrfTopK: null,
     topK: null,
+    ragOnly: false,
     authToken: "",
     currentUser: null,
     passwordChangeOpen: false,

@@ -185,3 +185,7 @@ embedding routing, threshold variants, and alternative encoder models before
 changing thresholds or encoders. If Docker logs do not show INFO-level
 retrieval messages, use the response or PostgreSQL-stored `contexts` scores to
 confirm which retrieval stages ran.
+
+All users can enable the browser `RAG-only` switch. That sends `rag_only=true`
+to `/rag`, bypasses the intent router for that request, and stores route
+metadata as `rag_only`.
