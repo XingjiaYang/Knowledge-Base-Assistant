@@ -75,6 +75,36 @@ class FakeVectorStore:
         ]
 
 
+class QdrantFailingVectorStore(FakeVectorStore):
+    def search(self, query: str, top_k: int | None = None) -> list[SearchResult]:
+        raise RuntimeError("qdrant unavailable")
+
+    def search_bm25(
+        self,
+        query: str,
+        top_k: int | None = None,
+    ) -> list[SearchResult]:
+        self.bm25_top_ks.append(top_k)
+        return [
+            SearchResult(
+                text="BM25-only fallback context A.",
+                source="data/docs/fallback.md",
+                chunk_id=10,
+                score=3.0,
+                bm25_score=3.0,
+                retrieval_source="bm25",
+            ),
+            SearchResult(
+                text="BM25-only fallback context B.",
+                source="data/docs/fallback.md",
+                chunk_id=11,
+                score=2.0,
+                bm25_score=2.0,
+                retrieval_source="bm25",
+            ),
+        ][: top_k or 2]
+
+
 class FakeLLMClient:
     def chat(
         self,
@@ -98,6 +128,17 @@ class FakeReranker:
     ) -> list[SearchResult]:
         self.calls.append((query, len(contexts), top_k))
         return list(reversed(contexts))[:top_k or len(contexts)]
+
+
+class FailingReranker(FakeReranker):
+    def rerank(
+        self,
+        query: str,
+        contexts: list[SearchResult],
+        top_k: int | None = None,
+    ) -> list[SearchResult]:
+        self.calls.append((query, len(contexts), top_k))
+        raise RuntimeError("reranker unavailable")
 
 
 class FakeClassifierLLM:
@@ -246,6 +287,48 @@ def assert_pipeline_search_behavior() -> None:
         raise AssertionError("RAG answer should keep reranked final top_k contexts.")
 
     print("Pipeline search behavior -> ok")
+
+
+def assert_pipeline_retrieval_degradation_behavior() -> None:
+    config = Settings()
+    llm_client = FakeLLMClient()
+    qdrant_config = Settings(reranker_enabled=False)
+    qdrant_router = IntentRouter(qdrant_config, embedder=None, llm_client=None)
+
+    qdrant_answer = RAGPipeline(
+        qdrant_config,
+        vector_store=QdrantFailingVectorStore(),
+        llm_client=llm_client,
+        intent_router=qdrant_router,
+        reranker=FakeReranker(),
+    ).answer("新员工如何申请开发设备？", top_k=1, bm25_top_k=4)
+    if not qdrant_answer.retrieval_degraded or not qdrant_answer.qdrant_degraded:
+        raise AssertionError("Qdrant failure should mark retrieval as degraded.")
+    if qdrant_answer.reranker_degraded:
+        raise AssertionError("Working reranker should not be marked degraded.")
+    if [context.chunk_id for context in qdrant_answer.contexts] != [10]:
+        raise AssertionError("Qdrant fallback should use BM25-only contexts.")
+
+    vector_store = FakeVectorStore()
+    failing_reranker = FailingReranker()
+    router = IntentRouter(config, embedder=None, llm_client=None)
+    reranker_answer = RAGPipeline(
+        config,
+        vector_store=vector_store,
+        llm_client=llm_client,
+        intent_router=router,
+        reranker=failing_reranker,
+    ).answer("新员工如何申请开发设备？", top_k=2, rrf_top_k=3)
+    if not reranker_answer.retrieval_degraded or not reranker_answer.reranker_degraded:
+        raise AssertionError("Reranker failure should mark retrieval as degraded.")
+    if reranker_answer.qdrant_degraded:
+        raise AssertionError("Healthy Qdrant recall should not be marked degraded.")
+    if [context.chunk_id for context in reranker_answer.contexts] != [0, 1]:
+        raise AssertionError("Reranker fallback should keep coarse recall top K.")
+    if failing_reranker.calls != [("新员工如何申请开发设备？", 3, 2)]:
+        raise AssertionError("Reranker should receive coarse recall before fallback.")
+
+    print("Retrieval degradation behavior -> ok")
 
 
 def assert_embedding_context_behavior() -> None:
@@ -596,6 +679,7 @@ def main() -> None:
     assert_stateful_referential_routing()
     assert_llm_fallback_behavior()
     assert_pipeline_search_behavior()
+    assert_pipeline_retrieval_degradation_behavior()
 
 
 if __name__ == "__main__":

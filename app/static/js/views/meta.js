@@ -1,8 +1,8 @@
 // Status indicator, health/model metadata, and the retrieval-settings popover.
 
-import { state, on, emit, setStatus } from "../store.js?v=20260617-hybrid-retrieval";
-import { api } from "../api.js?v=20260617-hybrid-retrieval";
-import { byId } from "../dom.js?v=20260617-hybrid-retrieval";
+import { state, on, emit, setStatus } from "../store.js?v=20260620-degraded-retrieval";
+import { api } from "../api.js?v=20260620-degraded-retrieval";
+import { byId } from "../dom.js?v=20260620-degraded-retrieval";
 
 let els = {};
 

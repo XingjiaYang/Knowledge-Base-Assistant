@@ -1,10 +1,10 @@
 // Chat column: message log, composer, and the references panel rendering.
 
-import { state, on, emit } from "../store.js?v=20260617-hybrid-retrieval";
-import { api } from "../api.js?v=20260617-hybrid-retrieval";
-import { byId, el, clear, icon } from "../dom.js?v=20260617-hybrid-retrieval";
-import { renderMarkdown } from "../markdown.js?v=20260617-hybrid-retrieval";
-import { createSession, reloadSessions } from "./sessions.js?v=20260617-hybrid-retrieval";
+import { state, on, emit } from "../store.js?v=20260620-degraded-retrieval";
+import { api } from "../api.js?v=20260620-degraded-retrieval";
+import { byId, el, clear, icon } from "../dom.js?v=20260620-degraded-retrieval";
+import { renderMarkdown } from "../markdown.js?v=20260620-degraded-retrieval";
+import { createSession, reloadSessions } from "./sessions.js?v=20260620-degraded-retrieval";
 
 let els = {};
 
@@ -64,11 +64,20 @@ async function ask(question) {
     usedRag: false,
     route: "",
     routeReason: "",
+    retrievalDegraded: false,
+    qdrantDegraded: false,
+    rerankerDegraded: false,
+    degradationReason: "",
     loading: true,
   };
   state.messages.push({ role: "user", content: question }, assistant);
   emit("messages");
-  state.lastReferences = { contexts: [], usedRag: true };
+  state.lastReferences = {
+    contexts: [],
+    usedRag: true,
+    retrievalDegraded: false,
+    degradationReason: "",
+  };
   emit("references");
   setBusy(true);
 
@@ -88,12 +97,23 @@ async function ask(question) {
     assistant.usedRag = Boolean(data.used_rag);
     assistant.route = data.route || "";
     assistant.routeReason = data.route_reason || "";
+    assistant.retrievalDegraded = Boolean(data.retrieval_degraded);
+    assistant.qdrantDegraded = Boolean(data.qdrant_degraded);
+    assistant.rerankerDegraded = Boolean(data.reranker_degraded);
+    assistant.degradationReason = data.degradation_reason || "";
     assistant.loading = false;
 
     state.conversationSummary = data.conversation_summary || state.conversationSummary;
     state.summarizedMessageCount += data.compacted_history_messages || 0;
-    state.latestRoute = `${assistant.usedRag ? "RAG" : "Direct"} · ${assistant.route || "unknown"}`;
-    state.lastReferences = { contexts: assistant.contexts, usedRag: assistant.usedRag };
+    state.latestRoute = `${assistant.usedRag ? "RAG" : "Direct"} · ${assistant.route || "unknown"}${
+      assistant.retrievalDegraded ? " · Degraded" : ""
+    }`;
+    state.lastReferences = {
+      contexts: assistant.contexts,
+      usedRag: assistant.usedRag,
+      retrievalDegraded: assistant.retrievalDegraded,
+      degradationReason: assistant.degradationReason,
+    };
 
     emit("references");
     emit("meta");
@@ -156,6 +176,9 @@ function renderMessage(message) {
 
   if (message.role === "assistant" && !message.loading && !message.error) {
     wrapper.append(renderRouteMeta(message));
+    if (message.retrievalDegraded) {
+      wrapper.append(renderDegradationNotice(message));
+    }
     if (message.contexts?.length) {
       wrapper.append(renderInlineRefs(message.contexts));
     }
@@ -174,7 +197,31 @@ function renderRouteMeta(message) {
   if (message.routeReason) {
     meta.append(el("span", { text: message.routeReason }));
   }
+  if (message.retrievalDegraded) {
+    meta.append(el("span", { class: "route-pill warn", text: "Degraded" }));
+  }
   return meta;
+}
+
+function renderDegradationNotice(message) {
+  return el("div", {
+    class: "degradation-notice",
+    text: degradationText(message),
+  });
+}
+
+function degradationText(item) {
+  if (item.degradationReason) return item.degradationReason;
+  if (item.qdrantDegraded && item.rerankerDegraded) {
+    return "Qdrant/vector recall and reranker degraded; using BM25-only unre-ranked references.";
+  }
+  if (item.qdrantDegraded) {
+    return "Qdrant/vector recall degraded; using BM25-only references.";
+  }
+  if (item.rerankerDegraded) {
+    return "Reranker degraded; using unre-ranked RRF references.";
+  }
+  return "Retrieval degraded; using fallback references.";
 }
 
 function renderInlineRefs(contexts) {
@@ -188,13 +235,28 @@ function renderInlineRefs(contexts) {
 
 function renderReferences() {
   clear(els.referenceList);
-  const { contexts, usedRag } = state.lastReferences || { contexts: [], usedRag: true };
+  const fallback = {
+    contexts: [],
+    usedRag: true,
+    retrievalDegraded: false,
+    degradationReason: "",
+  };
+  const { contexts, usedRag, retrievalDegraded, degradationReason } =
+    state.lastReferences || fallback;
 
   if (!usedRag) {
     els.referenceList.append(
       el("div", { class: "empty", text: "No retrieval was used for this answer." }),
     );
     return;
+  }
+  if (retrievalDegraded) {
+    els.referenceList.append(
+      el("div", {
+        class: "degradation-notice references",
+        text: degradationReason || "Retrieval degraded; using fallback references.",
+      }),
+    );
   }
   if (!contexts.length) {
     els.referenceList.append(

@@ -264,10 +264,18 @@ summary + 未压缩 history，并在扣除输出、当前 query、安全余量�
 兼容 NVIDIA GPU 时优先使用 CUDA；如果 CUDA 不可见或模型迁移到 GPU 失败，会
 记录日志并回退到 CPU。设置 `CUDA=FALSE` 可强制全部使用 CPU。
 `RERANKER_PRELOAD=1` 时 API 会在启动阶段加载并预热 reranker，模型下载或加载
-错误会在服务接受请求前暴露，而不是第一次用户提问时才失败。代码使用 Jina
-模型原生的 `AutoModel.rerank()` 接口执行重排。
+错误会被记录为显式降级，服务仍会继续启动；运行时 reranker 失败时也会跳过精排，
+把未重排的 RRF 粗排结果按 `Final K` 直接交给 LLM。代码使用 Jina 模型原生的
+`AutoModel.rerank()` 接口执行重排。
 `jina-reranker-v3` 是 listwise reranker；召回数量超过
 `RERANKER_MAX_DOCUMENTS_PER_CALL` 时会分批重排，再按分数全局排序。
+
+检索降级不会 silent failure。Qdrant/vector recall 失败时，回答会降级为本地
+Markdown 的 BM25-only 召回；reranker 失败时，回答会使用 RRF 粗排结果并按
+`Final K` 截断。`/rag` 响应和存储的 assistant 消息会包含
+`retrieval_degraded`、`qdrant_degraded`、`reranker_degraded` 和
+`degradation_reason`；服务端日志也会写出这些布尔值，前端会在回答和引用区显示降级
+提示。
 
 默认 Compose 配置会给 API 容器设置 `gpus: all`，所以普通启动会在 Docker 能提供
 GPU 设备时直接使用 CUDA：

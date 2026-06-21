@@ -365,11 +365,20 @@ compatible NVIDIA GPU; if CUDA is not visible or model placement fails, they
 log the fallback and continue on CPU. Set `CUDA=FALSE` to force CPU. With
 `RERANKER_PRELOAD=1`, the API loads
 and warms the reranker during startup through Jina's native
-`AutoModel.rerank()` interface, so model download or load failures happen
-before the service accepts requests.
+`AutoModel.rerank()` interface. If reranker warmup or runtime reranking fails,
+the service continues and feeds the unre-ranked RRF results to the LLM using
+the same `Final K` limit.
 `jina-reranker-v3` is a listwise reranker, so candidates are reranked in
 batches of `RERANKER_MAX_DOCUMENTS_PER_CALL` when recall returns more than the
 model should process in one call.
+
+Retrieval degrades explicitly instead of failing silently. If Qdrant/vector
+recall fails, the answer falls back to BM25-only recall from local Markdown. If
+the reranker fails, the pipeline skips reranking and uses the coarse RRF result
+list, capped by `Final K`. Responses and stored assistant messages include
+`retrieval_degraded`, `qdrant_degraded`, `reranker_degraded`, and
+`degradation_reason`; server logs write the same booleans, and the browser
+shows a degraded retrieval notice beside the answer and references.
 
 The default Compose configuration exposes all visible NVIDIA GPUs to the API
 container with `gpus: all`, so a plain startup uses CUDA when Docker can provide

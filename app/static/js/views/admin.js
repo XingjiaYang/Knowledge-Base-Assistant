@@ -1,10 +1,10 @@
 // Admin dashboard: list users, create, CSV import, toggle role, reset
 // password, clear chat data, and delete users.
 
-import { state, on, emit } from "../store.js?v=20260617-hybrid-retrieval";
-import { api } from "../api.js?v=20260617-hybrid-retrieval";
-import { byId, el, clear, icon } from "../dom.js?v=20260617-hybrid-retrieval";
-import { loadSessions } from "./sessions.js?v=20260617-hybrid-retrieval";
+import { state, on, emit } from "../store.js?v=20260620-degraded-retrieval";
+import { api } from "../api.js?v=20260620-degraded-retrieval";
+import { byId, el, clear, icon } from "../dom.js?v=20260620-degraded-retrieval";
+import { loadSessions } from "./sessions.js?v=20260620-degraded-retrieval";
 
 let els = {};
 

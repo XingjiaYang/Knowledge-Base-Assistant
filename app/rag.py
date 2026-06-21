@@ -36,6 +36,19 @@ class RAGAnswer:
     used_rag: bool
     route: str
     route_reason: str
+    retrieval_degraded: bool = False
+    qdrant_degraded: bool = False
+    reranker_degraded: bool = False
+    degradation_reason: str = ""
+
+
+@dataclass(frozen=True)
+class RetrievalOutcome:
+    contexts: list[SearchResult]
+    retrieval_degraded: bool = False
+    qdrant_degraded: bool = False
+    reranker_degraded: bool = False
+    degradation_reason: str = ""
 
 
 class RAGPipeline:
@@ -90,15 +103,17 @@ class RAGPipeline:
             compacted_count,
         )
 
+        retrieval_outcome = RetrievalOutcome(contexts=[])
         if intent.use_rag:
             search_query = self._build_search_query(question, recent_history)
-            contexts = self._retrieve_contexts(
+            retrieval_outcome = self._retrieve_contexts(
                 search_query,
                 top_k=top_k,
                 recall_top_k=recall_top_k,
                 bm25_top_k=bm25_top_k,
                 rrf_top_k=rrf_top_k,
             )
+            contexts = retrieval_outcome.contexts
             messages = self._build_rag_messages(
                 question,
                 contexts,
@@ -118,6 +133,10 @@ class RAGPipeline:
             used_rag=intent.use_rag,
             route=intent.route,
             route_reason=intent.reason,
+            retrieval_degraded=retrieval_outcome.retrieval_degraded,
+            qdrant_degraded=retrieval_outcome.qdrant_degraded,
+            reranker_degraded=retrieval_outcome.reranker_degraded,
+            degradation_reason=retrieval_outcome.degradation_reason,
         )
 
     def _retrieve_contexts(
@@ -127,42 +146,151 @@ class RAGPipeline:
         recall_top_k: int | None = None,
         bm25_top_k: int | None = None,
         rrf_top_k: int | None = None,
-    ) -> list[SearchResult]:
+    ) -> RetrievalOutcome:
         final_top_k = self._final_top_k(top_k)
         bm25_limit = self._bm25_top_k(bm25_top_k)
         vector_limit = self._vector_top_k(recall_top_k)
         rrf_limit = self._rrf_top_k(rrf_top_k, top_k)
-        if hasattr(self.vector_store, "hybrid_search"):
-            recalled_contexts = self.vector_store.hybrid_search(
-                search_query,
-                bm25_top_k=bm25_limit,
-                vector_top_k=vector_limit,
-                rrf_top_k=rrf_limit,
-            )
-        else:
-            recalled_contexts = self.vector_store.search(
-                search_query,
-                top_k=vector_limit,
-            )[:rrf_limit]
+        qdrant_degraded = False
+        reranker_degraded = False
+        degradation_reasons: list[str] = []
+
+        recalled_contexts = self._recall_contexts(
+            search_query,
+            bm25_limit=bm25_limit,
+            vector_limit=vector_limit,
+            rrf_limit=rrf_limit,
+            degradation_reasons=degradation_reasons,
+        )
+        qdrant_degraded = bool(degradation_reasons)
+
         logger.info(
             "Hybrid recall returned %s contexts before reranking.",
             len(recalled_contexts),
         )
 
         if not self.config.reranker_enabled or not recalled_contexts:
-            return recalled_contexts[:final_top_k]
+            return RetrievalOutcome(
+                contexts=recalled_contexts[:final_top_k],
+                retrieval_degraded=qdrant_degraded,
+                qdrant_degraded=qdrant_degraded,
+                reranker_degraded=False,
+                degradation_reason="; ".join(degradation_reasons),
+            )
 
-        reranked_contexts = self.reranker.rerank(
-            search_query,
-            recalled_contexts,
-            top_k=final_top_k,
-        )
+        try:
+            reranked_contexts = self.reranker.rerank(
+                search_query,
+                recalled_contexts,
+                top_k=final_top_k,
+            )
+        except Exception:
+            reranker_degraded = True
+            degradation_reasons.append(
+                "Reranker failed; using unre-ranked recall results."
+            )
+            logger.exception(
+                "Retrieval degraded: retrieval_degraded=True "
+                "qdrant_degraded=%s reranker_degraded=True "
+                "fallback=rrf_or_bm25_top_k final_top_k=%s recalled_contexts=%s.",
+                qdrant_degraded,
+                final_top_k,
+                len(recalled_contexts),
+            )
+            return RetrievalOutcome(
+                contexts=recalled_contexts[:final_top_k],
+                retrieval_degraded=True,
+                qdrant_degraded=qdrant_degraded,
+                reranker_degraded=reranker_degraded,
+                degradation_reason="; ".join(degradation_reasons),
+            )
+
         logger.info(
             "Reranker returned %s contexts from %s recalled contexts.",
             len(reranked_contexts),
             len(recalled_contexts),
         )
-        return reranked_contexts
+        return RetrievalOutcome(
+            contexts=reranked_contexts,
+            retrieval_degraded=qdrant_degraded,
+            qdrant_degraded=qdrant_degraded,
+            reranker_degraded=False,
+            degradation_reason="; ".join(degradation_reasons),
+        )
+
+    def _recall_contexts(
+        self,
+        search_query: str,
+        bm25_limit: int,
+        vector_limit: int,
+        rrf_limit: int,
+        degradation_reasons: list[str],
+    ) -> list[SearchResult]:
+        if hasattr(self.vector_store, "search_bm25") and hasattr(
+            self.vector_store,
+            "search",
+        ):
+            bm25_contexts = self.vector_store.search_bm25(
+                search_query,
+                top_k=bm25_limit,
+            )
+            try:
+                vector_contexts = self.vector_store.search(
+                    search_query,
+                    top_k=vector_limit,
+                )
+            except Exception:
+                degradation_reasons.append(
+                    "Qdrant/vector recall failed; using BM25-only retrieval."
+                )
+                logger.exception(
+                    "Retrieval degraded: retrieval_degraded=True "
+                    "qdrant_degraded=True reranker_degraded=False "
+                    "fallback=bm25_only bm25_contexts=%s.",
+                    len(bm25_contexts),
+                )
+                return bm25_contexts
+
+            fused_contexts = VectorStore._rrf_fuse(
+                vector_contexts,
+                bm25_contexts,
+                top_k=rrf_limit,
+            )
+            logger.info(
+                "Hybrid recall fused bm25=%s vector=%s into rrf=%s contexts.",
+                len(bm25_contexts),
+                len(vector_contexts),
+                len(fused_contexts),
+            )
+            return fused_contexts
+
+        if hasattr(self.vector_store, "hybrid_search"):
+            try:
+                return self.vector_store.hybrid_search(
+                    search_query,
+                    bm25_top_k=bm25_limit,
+                    vector_top_k=vector_limit,
+                    rrf_top_k=rrf_limit,
+                )
+            except Exception:
+                if not hasattr(self.vector_store, "search_bm25"):
+                    raise
+                bm25_contexts = self.vector_store.search_bm25(
+                    search_query,
+                    top_k=bm25_limit,
+                )
+                degradation_reasons.append(
+                    "Qdrant/vector recall failed; using BM25-only retrieval."
+                )
+                logger.exception(
+                    "Retrieval degraded: retrieval_degraded=True "
+                    "qdrant_degraded=True reranker_degraded=False "
+                    "fallback=bm25_only bm25_contexts=%s.",
+                    len(bm25_contexts),
+                )
+                return bm25_contexts
+
+        return self.vector_store.search(search_query, top_k=vector_limit)[:rrf_limit]
 
     def _final_top_k(self, top_k: int | None = None) -> int:
         return max(1, top_k or self.config.retrieve_top_k)

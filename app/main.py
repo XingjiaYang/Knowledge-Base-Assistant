@@ -46,7 +46,14 @@ async def lifespan(_app: FastAPI):
     )
     _app.state.reranker = Reranker(settings)
     if settings.reranker_enabled and settings.reranker_preload:
-        await asyncio.to_thread(_app.state.reranker.warmup)
+        try:
+            await asyncio.to_thread(_app.state.reranker.warmup)
+        except Exception:
+            logger.exception(
+                "Startup degraded: retrieval_degraded=True "
+                "qdrant_degraded=False reranker_degraded=True "
+                "fallback=rrf_or_bm25_top_k."
+            )
     _app.state.rag_pipeline = RAGPipeline(
         settings,
         vector_store=_app.state.vector_store,
@@ -195,6 +202,10 @@ class RAGResponse(BaseModel):
     used_rag: bool
     route: str
     route_reason: str
+    retrieval_degraded: bool = False
+    qdrant_degraded: bool = False
+    reranker_degraded: bool = False
+    degradation_reason: str = ""
 
 
 class UserResponse(BaseModel):
@@ -349,6 +360,10 @@ class StoredMessageResponse(BaseModel):
     used_rag: bool | None = None
     route: str = ""
     route_reason: str = ""
+    retrieval_degraded: bool = False
+    qdrant_degraded: bool = False
+    reranker_degraded: bool = False
+    degradation_reason: str = ""
     created_at: str
 
     @classmethod
@@ -361,6 +376,10 @@ class StoredMessageResponse(BaseModel):
             used_rag=message.used_rag,
             route=message.route,
             route_reason=message.route_reason,
+            retrieval_degraded=message.retrieval_degraded,
+            qdrant_degraded=message.qdrant_degraded,
+            reranker_degraded=message.reranker_degraded,
+            degradation_reason=message.degradation_reason,
             created_at=message.created_at.isoformat(),
         )
 
@@ -869,6 +888,10 @@ async def rag(
         result.used_rag,
         result.route,
         result.route_reason,
+        result.retrieval_degraded,
+        result.qdrant_degraded,
+        result.reranker_degraded,
+        result.degradation_reason,
     )
     session = await asyncio.to_thread(
         session_store.update_chat_session_after_answer,
@@ -889,6 +912,10 @@ async def rag(
         used_rag=result.used_rag,
         route=result.route,
         route_reason=result.route_reason,
+        retrieval_degraded=result.retrieval_degraded,
+        qdrant_degraded=result.qdrant_degraded,
+        reranker_degraded=result.reranker_degraded,
+        degradation_reason=result.degradation_reason,
     )
 
 

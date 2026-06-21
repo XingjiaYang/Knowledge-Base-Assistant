@@ -145,9 +145,18 @@ cosine-similarity candidates, reciprocal rank fusion keeps `RRF_TOP_K`
 candidates, `jinaai/jina-reranker-v3` reranks them through its native
 `AutoModel.rerank()` interface, and only `RETRIEVE_TOP_K` chunks enter the
 prompt. The API preloads and warms the reranker during startup by default with
-`RERANKER_PRELOAD=1`; keep Hugging Face cache, mirror, or proxy settings ready
-before rebuilding containers. The browser exposes these limits as `BM25 K`,
-`Cosine K`, `RRF K`, and `Final K`, defaulting to `100`, `100`, `100`, and `5`.
+`RERANKER_PRELOAD=1`; warmup failure is logged as
+`retrieval_degraded=True`/`reranker_degraded=True` but does not prevent startup.
+Keep Hugging Face cache, mirror, or proxy settings ready before rebuilding
+containers. The browser exposes these limits as `BM25 K`, `Cosine K`, `RRF K`,
+and `Final K`, defaulting to `100`, `100`, `100`, and `5`.
+
+Retrieval degradation must be explicit. If Qdrant/vector recall fails, RAG falls
+back to BM25-only recall from local Markdown. If reranking fails, the pipeline
+uses the unre-ranked RRF/BM25 coarse results capped by `Final K`. Responses and
+stored assistant messages include `retrieval_degraded`, `qdrant_degraded`,
+`reranker_degraded`, and `degradation_reason`; the frontend shows the same
+warning, and server logs write the degradation booleans.
 
 Conversation memory defaults to API-scale context windows:
 `LLM_CONTEXT_MAX_TOKENS=256000`, safety margin `8192`, prompt overhead `2048`,

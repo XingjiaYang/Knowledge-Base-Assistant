@@ -191,6 +191,14 @@ matching score. `rrf_score` confirms fusion, and `rerank_score` confirms the
 Jina reranker ran. Docker logs may omit the retrieval `logger.info()` lines
 because the container's Python root logger can run at `WARNING`.
 
+Retrieval degradation is explicit. If Qdrant/vector recall fails, RAG falls
+back to BM25-only local Markdown recall. If the reranker fails, RAG feeds the
+unre-ranked RRF/BM25 coarse results to the LLM using the same `Final K` cap.
+The `/rag` response and stored assistant messages expose
+`retrieval_degraded`, `qdrant_degraded`, `reranker_degraded`, and
+`degradation_reason`; warning/error logs include the same booleans, and the
+browser renders a degraded retrieval notice.
+
 ### Replacing the Corpus
 
 1. Replace/edit `data/docs/**/*.md`.

@@ -71,6 +71,10 @@ class StoredChatMessage:
     used_rag: bool | None
     route: str
     route_reason: str
+    retrieval_degraded: bool
+    qdrant_degraded: bool
+    reranker_degraded: bool
+    degradation_reason: str
     created_at: datetime
 
 
@@ -191,8 +195,36 @@ class SessionStore:
                         used_rag BOOLEAN,
                         route TEXT NOT NULL DEFAULT '',
                         route_reason TEXT NOT NULL DEFAULT '',
+                        retrieval_degraded BOOLEAN NOT NULL DEFAULT FALSE,
+                        qdrant_degraded BOOLEAN NOT NULL DEFAULT FALSE,
+                        reranker_degraded BOOLEAN NOT NULL DEFAULT FALSE,
+                        degradation_reason TEXT NOT NULL DEFAULT '',
                         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                     )
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS retrieval_degraded BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS qdrant_degraded BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS reranker_degraded BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS degradation_reason TEXT NOT NULL DEFAULT ''
                     """
                 )
                 cur.execute(
@@ -850,6 +882,10 @@ class SessionStore:
                        used_rag,
                        route,
                        route_reason,
+                       retrieval_degraded,
+                       qdrant_degraded,
+                       reranker_degraded,
+                       degradation_reason,
                        created_at
                 FROM chat_messages
                 WHERE session_id = %s
@@ -907,6 +943,10 @@ class SessionStore:
         used_rag: bool | None = None,
         route: str = "",
         route_reason: str = "",
+        retrieval_degraded: bool = False,
+        qdrant_degraded: bool = False,
+        reranker_degraded: bool = False,
+        degradation_reason: str = "",
     ) -> StoredChatMessage:
         context_payload = [
             search_result_to_dict(context)
@@ -922,9 +962,13 @@ class SessionStore:
                     contexts,
                     used_rag,
                     route,
-                    route_reason
+                    route_reason,
+                    retrieval_degraded,
+                    qdrant_degraded,
+                    reranker_degraded,
+                    degradation_reason
                 )
-                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id,
                           role,
                           content,
@@ -932,6 +976,10 @@ class SessionStore:
                           used_rag,
                           route,
                           route_reason,
+                          retrieval_degraded,
+                          qdrant_degraded,
+                          reranker_degraded,
+                          degradation_reason,
                           created_at
                 """,
                 (
@@ -942,6 +990,10 @@ class SessionStore:
                     used_rag,
                     route,
                     route_reason,
+                    retrieval_degraded,
+                    qdrant_degraded,
+                    reranker_degraded,
+                    degradation_reason,
                 ),
             ).fetchone()
         return chat_message_from_row(row)
@@ -1155,6 +1207,10 @@ def chat_message_from_row(row: dict[str, Any]) -> StoredChatMessage:
         used_rag=row["used_rag"],
         route=row["route"] or "",
         route_reason=row["route_reason"] or "",
+        retrieval_degraded=bool(row["retrieval_degraded"]),
+        qdrant_degraded=bool(row["qdrant_degraded"]),
+        reranker_degraded=bool(row["reranker_degraded"]),
+        degradation_reason=row["degradation_reason"] or "",
         created_at=row["created_at"],
     )
 

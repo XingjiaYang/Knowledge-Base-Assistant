@@ -1,9 +1,9 @@
 // Sidebar session list: search/filter, select, inline rename, and delete.
 // Also owns the session data actions used by the chat view.
 
-import { state, on, emit } from "../store.js?v=20260617-hybrid-retrieval";
-import { api } from "../api.js?v=20260617-hybrid-retrieval";
-import { byId, el, clear, icon } from "../dom.js?v=20260617-hybrid-retrieval";
+import { state, on, emit } from "../store.js?v=20260620-degraded-retrieval";
+import { api } from "../api.js?v=20260620-degraded-retrieval";
+import { byId, el, clear, icon } from "../dom.js?v=20260620-degraded-retrieval";
 
 let els = {};
 
@@ -95,15 +95,26 @@ function applySessionDetail(session) {
     usedRag: Boolean(m.used_rag),
     route: m.route || "",
     routeReason: m.route_reason || "",
+    retrievalDegraded: Boolean(m.retrieval_degraded),
+    qdrantDegraded: Boolean(m.qdrant_degraded),
+    rerankerDegraded: Boolean(m.reranker_degraded),
+    degradationReason: m.degradation_reason || "",
   }));
 
   const lastAssistant = [...state.messages].reverse().find((m) => m.role === "assistant");
   state.latestRoute = lastAssistant
-    ? `${lastAssistant.usedRag ? "RAG" : "Direct"} · ${lastAssistant.route || "unknown"}`
+    ? `${lastAssistant.usedRag ? "RAG" : "Direct"} · ${lastAssistant.route || "unknown"}${
+        lastAssistant.retrievalDegraded ? " · Degraded" : ""
+      }`
     : "None";
   state.lastReferences = lastAssistant
-    ? { contexts: lastAssistant.contexts || [], usedRag: lastAssistant.usedRag }
-    : { contexts: [], usedRag: true };
+    ? {
+        contexts: lastAssistant.contexts || [],
+        usedRag: lastAssistant.usedRag,
+        retrievalDegraded: lastAssistant.retrievalDegraded,
+        degradationReason: lastAssistant.degradationReason,
+      }
+    : { contexts: [], usedRag: true, retrievalDegraded: false, degradationReason: "" };
 
   emit("sessions");
   emit("messages");
