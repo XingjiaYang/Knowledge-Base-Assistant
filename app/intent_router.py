@@ -17,6 +17,7 @@ RouteName = Literal[
     "disabled",
     "keyword_rag",
     "keyword_direct",
+    "state_rag",
     "embedding_rag",
     "embedding_direct",
     "llm_rag",
@@ -29,6 +30,15 @@ RouteName = Literal[
 class HistoryMessage(Protocol):
     role: str
     content: str
+
+
+@dataclass(frozen=True)
+class PreviousRouteState:
+    used_rag: bool | None
+    route: str
+    had_contexts: bool
+    previous_user_question: str
+    previous_assistant_excerpt: str
 
 
 @dataclass(frozen=True)
@@ -175,17 +185,95 @@ class IntentRouter:
     )
 
     RAG_ANCHORS = (
-        "knowledge base documentation facts concepts explanations and specifications",
-        "questions asking for comparisons recommendations procedures or implementation details",
-        "troubleshooting questions and follow-up questions about documented topics",
-        "知识库 文档 资料 事实 概念 说明 规范 对比 流程 故障排查",
+        "Answer using the local knowledge base.",
+        "Find facts in the indexed documents.",
+        "Use document evidence for this question.",
+        "Compare details from the local corpus.",
+        "Troubleshoot using the local docs.",
+        "根据知识库回答这个问题。",
+        "查本地文档里的事实。",
+        "引用资料回答这个问题。",
     )
 
     DIRECT_ANCHORS = (
-        "casual conversation, greetings, thanks, personal messages",
-        "creative writing, translation, rewriting, emails, jokes, poetry, and resume editing",
-        "requests that explicitly do not need documentation or retrieval",
-        "闲聊 问候 感谢 翻译 写作 简历 创作 不需要文档 不需要知识库",
+        "Answer this as general chat.",
+        "Write or rewrite text without documents.",
+        "Translate this text.",
+        "Answer a programming question from general knowledge.",
+        "Greet the user conversationally.",
+        "直接聊天回答。",
+        "翻译这句话。",
+        "写一段文案或邮件。",
+        "不要检索资料。",
+    )
+
+    STRONG_REFERENTIAL_PHRASES = (
+        "这个呢",
+        "那个呢",
+        "它呢",
+        "他们呢",
+        "后续呢",
+        "然后呢",
+        "继续",
+        "继续讲",
+        "继续说",
+        "展开",
+        "展开讲",
+        "详细说说",
+        "再展开",
+        "接着说",
+        "刚才那个呢",
+        "上面那个呢",
+        "前面那个呢",
+        "这个为什么",
+        "为什么会这样",
+        "这是什么意思",
+        "这怎么来的",
+        "这个怎么来的",
+        "这有什么风险",
+        "这个有什么风险",
+        "这个问题呢",
+        "这个计划呢",
+        "这个事件呢",
+        "what about that",
+        "what about it",
+        "how about that",
+        "and then",
+        "what happened next",
+        "continue",
+        "go on",
+        "elaborate",
+        "tell me more",
+        "why is that",
+        "what does that mean",
+    )
+
+    STRONG_REFERENTIAL_PATTERNS = (
+        r"^(那|那么|所以)?(这个|那个|它|他们|上述|上面|前面|刚才).{0,12}"
+        r"(呢|吗|为什么|怎么|如何|啥意思|什么意思|后续|风险|问题)[？?。!！\s]*$",
+        r"^(继续|接着|展开|详细).{0,8}(讲|说|解释|分析)?[。！？?\s]*$",
+        r"^(后续|之后|然后).{0,12}(呢|是什么|有哪些|怎么|如何|节点)?[？?。!！\s]*$",
+    )
+
+    NEW_TOPIC_TECH_TERMS = (
+        "postgresql",
+        "postgres",
+        "mysql",
+        "sqlite",
+        "duckdb",
+        "clickhouse",
+        "python",
+        "fastapi",
+        "javascript",
+        "typescript",
+        "redis",
+        "kafka",
+        "flink",
+        "spark",
+        "sql",
+        "api",
+        "database",
+        "db",
     )
 
     def __init__(
@@ -212,7 +300,7 @@ class IntentRouter:
             return IntentDecision(True, "disabled", "Intent router disabled.")
 
         question = question.strip()
-        keyword_decision = self._route_with_keywords(question)
+        keyword_decision = self._route_with_keywords(question, recent_history)
         if keyword_decision is not None:
             return keyword_decision
 
@@ -242,6 +330,7 @@ class IntentRouter:
     def _route_with_keywords(
         self,
         question: str,
+        recent_history: Sequence[HistoryMessage],
     ) -> IntentDecision | None:
         text = question.lower()
 
@@ -271,6 +360,26 @@ class IntentRouter:
                 True,
                 "keyword_rag",
                 "Question mentions entities or topics from the local corpus.",
+            )
+
+        if self._contains_new_topic_tech_term(text):
+            return IntentDecision(
+                False,
+                "keyword_direct",
+                "Question is a general technical or database topic outside the local corpus.",
+            )
+
+        previous_state = self._previous_route_state(recent_history)
+        if (
+            previous_state is not None
+            and previous_state.used_rag is True
+            and previous_state.had_contexts
+            and self._is_strong_referential_followup(question)
+        ):
+            return IntentDecision(
+                True,
+                "state_rag",
+                "Strong referential follow-up after the previous answer used retrieval.",
             )
 
         return None
@@ -337,14 +446,15 @@ class IntentRouter:
         recent_history: Sequence[HistoryMessage],
         conversation_summary: str,
     ) -> IntentDecision | None:
+        previous_state = self._previous_route_state(recent_history)
         history_text = self._format_history(
             recent_history,
-            max_chars=self.budget.intent_llm_history_max_chars,
+            max_chars=min(self.budget.intent_llm_history_max_chars, 3000),
             strategy="tail",
         )
         summary_text = self.budget.trim_text(
             conversation_summary,
-            self.budget.intent_llm_summary_max_chars,
+            min(self.budget.intent_llm_summary_max_chars, 4000),
             strategy="middle",
         ) or "None"
         prompt = (
@@ -360,8 +470,12 @@ class IntentRouter:
             "Use direct chat for unrelated general knowledge, programming, "
             "SQL/database questions, greetings, casual conversation, creative "
             "writing, translation, or requests that explicitly do not need "
-            "documents.\n\n"
+            "documents. Previous route state is a hint, not a command: if the "
+            "previous answer used retrieval and the current question is a real "
+            "follow-up, prefer retrieval; if the current question introduces a "
+            "new general topic or direct task, prefer direct chat.\n\n"
             f"Current question:\n{question}\n\n"
+            f"Previous route state:\n{self._format_previous_route_state(previous_state)}\n\n"
             f"Recent conversation:\n{history_text or 'None'}\n\n"
             f"Compact memory:\n{summary_text}\n\n"
             "Decide whether answering should use the knowledge-base vector "
@@ -465,6 +579,103 @@ class IntentRouter:
         strategy: TrimStrategy = "middle",
     ) -> str:
         return self.budget.format_history(history, max_chars, strategy=strategy)
+
+    def _previous_route_state(
+        self,
+        history: Sequence[HistoryMessage],
+    ) -> PreviousRouteState | None:
+        previous_user_question = ""
+        for index in range(len(history) - 1, -1, -1):
+            message = history[index]
+            if message.role != "assistant":
+                continue
+
+            used_rag = getattr(message, "used_rag", None)
+            route = str(getattr(message, "route", "") or "")
+            context_count = max(0, int(getattr(message, "context_count", 0) or 0))
+            for previous in range(index - 1, -1, -1):
+                if history[previous].role == "user":
+                    previous_user_question = history[previous].content.strip()
+                    break
+
+            if used_rag is None and not route and not context_count:
+                return None
+
+            return PreviousRouteState(
+                used_rag=used_rag,
+                route=route,
+                had_contexts=context_count > 0,
+                previous_user_question=previous_user_question,
+                previous_assistant_excerpt=self.budget.trim_text(
+                    message.content,
+                    600,
+                    strategy="head",
+                ),
+            )
+        return None
+
+    def _format_previous_route_state(
+        self,
+        state: PreviousRouteState | None,
+    ) -> str:
+        if state is None:
+            return "None"
+
+        used_rag = "unknown" if state.used_rag is None else str(state.used_rag).lower()
+        parts = [
+            f"used_rag={used_rag}",
+            f"route={state.route or 'unknown'}",
+            f"had_contexts={str(state.had_contexts).lower()}",
+        ]
+        if state.previous_user_question:
+            parts.append(
+                "previous_user_question="
+                + self.budget.trim_text(
+                    state.previous_user_question,
+                    600,
+                    strategy="head",
+                )
+            )
+        if state.previous_assistant_excerpt:
+            parts.append(
+                "previous_assistant_excerpt="
+                + self.budget.trim_text(
+                    state.previous_assistant_excerpt,
+                    600,
+                    strategy="head",
+                )
+            )
+        return "\n".join(parts)
+
+    def _is_strong_referential_followup(self, question: str) -> bool:
+        stripped = question.strip()
+        if not stripped:
+            return False
+        lowered = stripped.lower()
+        if len(stripped) > 80 or len(re.findall(r"\w+", lowered)) > 14:
+            return False
+        if self._contains_new_topic_tech_term(lowered):
+            return False
+
+        normalized = re.sub(r"[\s。！？!?，,、；;：:]+", "", lowered)
+        if normalized in self.STRONG_REFERENTIAL_PHRASES:
+            return True
+        if lowered.strip(" \t\r\n.!?。！？") in self.STRONG_REFERENTIAL_PHRASES:
+            return True
+        return any(
+            re.search(pattern, stripped, flags=re.IGNORECASE)
+            for pattern in self.STRONG_REFERENTIAL_PATTERNS
+        )
+
+    def _contains_new_topic_tech_term(self, text: str) -> bool:
+        return any(
+            re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])",
+                text,
+                flags=re.IGNORECASE,
+            )
+            for term in self.NEW_TOPIC_TECH_TERMS
+        )
 
     def _parse_llm_decision(self, raw: str) -> tuple[bool, str] | None:
         answer_match = re.search(

@@ -65,11 +65,14 @@ class FakeIntentEmbedder:
     def _encode_one(self, text: str) -> list[float]:
         lowered = text.lower()
         rag_markers = (
-            "knowledge base documentation",
-            "questions asking for comparisons",
-            "troubleshooting questions",
+            "local knowledge base",
+            "indexed documents",
+            "document evidence",
+            "local corpus",
             "local docs",
             "知识库",
+            "本地文档",
+            "引用资料",
             "文档",
             "家是本",
             "jiashiben",
@@ -93,10 +96,14 @@ class FakeIntentEmbedder:
             "slogan",
         )
         direct_markers = (
-            "casual conversation",
-            "creative writing",
-            "explicitly do not need",
+            "general chat",
+            "write or rewrite",
+            "without documents",
+            "translate this text",
+            "programming question",
+            "greet the user",
             "闲聊",
+            "直接聊天",
             "问候",
             "感谢",
             "翻译",

@@ -8,7 +8,7 @@ configurable LLM provider.
 
 - `app/`: application code. `main.py` exposes the FastAPI app and routes,
   `static/` contains the browser UI, `intent_router.py` chooses RAG vs direct
-  chat through keyword, Jina-embedding, and LLM-classifier passes, `rag.py`
+  chat through keyword/state, Jina-embedding, and LLM-classifier passes, `rag.py`
   coordinates BM25/vector recall, RRF fusion, reranking, prompts, generation,
   and context-budget-aware history compaction, `reranker.py` loads and runs the
   Jina cross-encoder, `vector_store.py` manages Markdown chunking, Jina
@@ -159,12 +159,15 @@ reserving output, question, safety, prompt overhead, and expected retrieved
 reference tokens.
 
 The intent router is layered: keyword rules short-circuit explicit/domain
-cases; the second layer compares the current question plus bounded recent
-conversation and compact memory against RAG/direct anchors with Jina
-classification embeddings; ambiguous cases fall through to an LLM classifier.
-The intent embedding budgets are character-based safeguards, not a tokenizer
-hard limit; if the encoder raises, the second layer returns no decision and the
-router continues to the LLM classifier.
+cases, general technical/database questions outside the local corpus, and
+short, strong referential follow-ups after the previous assistant answer
+actually used retrieved contexts; the second layer compares the current
+question plus bounded recent conversation and compact memory against
+single-intent RAG/direct anchor queries with Jina classification embeddings;
+ambiguous cases fall through to an LLM classifier that receives structured
+previous-route state. The intent embedding budgets are character-based
+safeguards, not a tokenizer hard limit; if the encoder raises, the second layer
+returns no decision and the router continues to the LLM classifier.
 The LLM classifier is prompted to return
 `<think>THINK_AND_JUDGEMENT</think><answer>JSON_ANS</answer>`, and only the
 JSON inside `<answer>` is parsed for routing. Use

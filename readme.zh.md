@@ -14,9 +14,10 @@ Compose profile 保留。
 朱剑秋、勇哥连线、菜单定价、顾客评价、社交媒体反应、财务模拟以及
 “巨大历史机遇/巨大历史鲫鱼”梗展开。这类
 小众合成语料比常见 SQL 或数据库知识更适合检验 RAG grounding，因为通用模型
-不太可能从预训练中直接记住这些细节。意图路由的 embedding 层保持通用；关键词层
-和 LLM fallback prompt 包含当前语料的边界与专名提示，替换 `data/docs/` 后应同步
-更新。
+不太可能从预训练中直接记住这些细节。当前 `data/docs/` 不包含通用 DB/SQL
+参考资料；数据库问题作为 direct-chat / eval negative 保留，不作为 RAG 语料。
+意图路由的 embedding 层保持通用；关键词层和 LLM fallback prompt 包含当前语料的
+边界与专名提示，替换 `data/docs/` 后应同步更新。
 
 ## 功能概览
 
@@ -45,9 +46,9 @@ FastAPI /auth, /sessions, /rag
    |-- PostgreSQL users, login tokens, chat sessions, messages, summaries
    |
 IntentRouter
-   |-- keyword rules
-   |-- embedding similarity
-   |-- configured LLM zero-shot fallback for ambiguous cases
+   |-- keyword rules and previous-route strong follow-up state
+   |-- Jina classification similarity over single-intent anchors
+   |-- configured LLM fallback with previous route state
    |
 RAGPipeline or Direct Chat
    |-- BM25 keyword recall + Qdrant vector recall -> RRF fusion
@@ -63,8 +64,8 @@ Answer + retrieved references + compacted conversation memory
 - `app/static/index.html`：浏览器聊天界面和管理员界面。
 - `app/session_store.py`：PostgreSQL 用户、登录 token、会话、消息、运行时
   LLM 设置、路由元数据和 summary。
-- `app/intent_router.py`：关键词、Jina classification embedding 和 tagged LLM
-  fallback 意图路由。
+- `app/intent_router.py`：关键词/状态机、Jina classification embedding 和
+  tagged LLM fallback 意图路由。
 - `app/rag.py`：混合召回、RRF 融合、重排、prompt 构造、基于上下文预算的历史压缩。
 - `app/reranker.py`：启动时预加载 Jina cross-encoder，并对召回 chunk 重排。
 - `app/vector_store.py`：Markdown 切块、Jina embeddings v3 task 路由、BM25
@@ -242,6 +243,16 @@ history 和 summary 视图，不会直接把 256K 级别的主 summary 整段喂
 这些 intent 预算目前是字符级保护；如果 encoder 仍然报错，router 会跳过第二层并
 进入 LLM classifier，而不是让请求失败。
 
+意图路由是状态感知的，但不会把所有历史塞给每一层。第一层会把当前语料外的通用
+技术/数据库问题判 direct；也只在上一轮 assistant 确实使用过检索 contexts，且
+本轮是“继续讲”“后续呢？”这类短强回指时，才通过 `state_rag` 直接走 RAG。
+带新技术名词的追问不会因为上一轮 RAG 被强制检索。
+第二层继续使用本地缓存的 anchor 向量和 NumPy 点积，所有 `RAG_ANCHORS` /
+`DIRECT_ANCHORS` 都应保持单意图 query。第三层 LLM classifier 会收到结构化的
+上一轮 route state，并用
+`<think>THINK_AND_JUDGEMENT</think><answer>JSON_ANS</answer>` 输出格式判断
+模糊追问。
+
 对话 summary 的默认预算按 API 长上下文模型设置：
 `LLM_CONTEXT_MAX_TOKENS=256000`、安全余量 `8192`、prompt overhead `2048`。
 `HISTORY_MAX_MESSAGES=0` 表示压缩前不按消息条数截断；`RAGPipeline` 会估算
@@ -313,9 +324,10 @@ OpenAI-compatible 使用 `GET /models`，Anthropic 使用
 3. 如需让意图路由识别新语料主题，更新 `app/intent_router.py` 中的
    `DOMAIN_RAG_PHRASES`、`DOMAIN_RAG_PATTERNS`、LLM fallback 的语料描述，以及
    `data/eval/intent_router_cases.jsonl`。
-4. 运行 `python scripts/intent_router_ab.py --fake-embedder`；有模型权重时再跑真实
+4. 如需改 `RAG_ANCHORS` / `DIRECT_ANCHORS`，保持每条 anchor 都是单意图 query。
+5. 运行 `python scripts/intent_router_ab.py --fake-embedder`；有模型权重时再跑真实
    encoder 对比。
-5. 通过浏览器或 `/rag` API 提问。
+6. 通过浏览器或 `/rag` API 提问。
 
 Ingest 会递归扫描子目录。增量 ingest 会用当前 Markdown 文件替换同一 source 的旧
 chunk，避免修改或缩短文件后留下陈旧 chunk。删除文档、整体替换语料或修改

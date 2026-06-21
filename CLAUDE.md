@@ -107,7 +107,7 @@ Browser UI  →  POST /rag
 
 - **`app/config.py`** — Frozen `Settings` dataclass; every tunable parameter is read from env vars here. Adding new config always goes through this class; never hard-code URLs, model names, or limits elsewhere.
 - **`app/main.py`** — FastAPI lifespan (constructs all singletons: `VectorStore`, `SessionStore`, runtime-configured `LLMClient`, `Reranker`, `RAGPipeline`), route definitions, Pydantic request/response models, and auth dependency chain (`require_login_auth` → `require_password_ready_user` → `require_admin_auth` → `require_superuser_auth`). Serves the UI shell at `/` and mounts static assets at `/static`.
-- **`app/intent_router.py`** — Three-pass classifier: (1) keyword exact/regex match against `FORCE_*`, `DOMAIN_RAG_*`, and `DIRECT_TASK_PATTERNS`; (2) cosine similarity against `RAG_ANCHORS`/`DIRECT_ANCHORS` using Jina embeddings v3 with the `classification` task; (3) LLM zero-shot fallback. The LLM classifier is prompted to return `<think>THINK_AND_JUDGEMENT</think><answer>JSON_ANS</answer>`, and only the JSON inside `<answer>` is parsed. **When swapping the corpus, update `DOMAIN_RAG_PHRASES`, `DOMAIN_RAG_PATTERNS`, the LLM fallback prompt string inside `_route_with_llm`, and `data/eval/intent_router_cases.jsonl`.**
+- **`app/intent_router.py`** — Three-pass classifier: (1) keyword exact/regex match against `FORCE_*`, `DOMAIN_RAG_*`, and `DIRECT_TASK_PATTERNS`, direct routing for general technical/database questions outside the local corpus, plus `state_rag` only for short, strong referential follow-ups after the previous assistant answer actually used retrieved contexts; (2) cosine similarity against single-intent `RAG_ANCHORS`/`DIRECT_ANCHORS` using Jina embeddings v3 with the `classification` task; (3) LLM zero-shot fallback with structured previous-route state. The LLM classifier is prompted to return `<think>THINK_AND_JUDGEMENT</think><answer>JSON_ANS</answer>`, and only the JSON inside `<answer>` is parsed. **When swapping the corpus, update `DOMAIN_RAG_PHRASES`, `DOMAIN_RAG_PATTERNS`, the LLM fallback prompt string inside `_route_with_llm`, and `data/eval/intent_router_cases.jsonl`.**
 - **`app/rag.py`** — Orchestrates the full answer pipeline: history normalization, context-budget-aware compaction, intent routing, BM25 + vector recall, RRF fusion, reranking, and prompt construction. `RAGPipeline.answer()` is the single entry point from the API layer. Compaction now estimates prompt pressure against the active LLM context window instead of summarizing solely by turn count.
 - **`app/vector_store.py`** — Markdown-aware chunking (text/code/table separately, heading metadata preserved as `h1`/`h2`/`h3` payload), SentenceTransformers Jina embeddings v3 with separate `retrieval.query`, `retrieval.passage`, and `classification` tasks, BM25 keyword indexing over local Markdown chunks, RRF fusion, and Qdrant collection management. Incremental ingest replaces all chunks by `source` filename so no stale chunks accumulate on edits.
 - **`app/reranker.py`** — Jina `jina-reranker-v3` cross-encoder, loaded via `AutoModel.rerank()` (requires `trust_remote_code=True`). Pre-warmed at startup when `RERANKER_PRELOAD=1`. Batched when recall exceeds `RERANKER_MAX_DOCUMENTS_PER_CALL`.
@@ -159,7 +159,10 @@ budget defaults to `CONVERSATION_SUMMARY_MAX_CHARS=256000`,
 Intent embedding budgets are currently character-based safeguards, not
 tokenizer hard limits for Jina's finite context window. If the encoder raises,
 the embedding layer returns no decision and the router falls through to the LLM
-classifier.
+classifier. Keep `RAG_ANCHORS` and `DIRECT_ANCHORS` as single-intent query-like
+anchors; the second layer caches their local vectors and scores with NumPy dot
+products. Ambiguous follow-ups should be left for the third layer, which sees
+the previous route state.
 
 ### Intent Router Evaluation
 

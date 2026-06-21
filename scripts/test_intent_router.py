@@ -20,6 +20,9 @@ from app.vector_store import SearchResult
 class Message:
     role: str
     content: str
+    used_rag: bool | None = None
+    route: str = ""
+    context_count: int = 0
 
 
 class FakeVectorStore:
@@ -128,10 +131,17 @@ class FakeIntentEmbedder:
     def _encode_one(self, text: str) -> list[float]:
         lowered = text.lower()
         direct_markers = (
-            "casual conversation",
-            "creative writing",
-            "explicitly do not need",
+            "general chat",
+            "write or rewrite",
+            "without documents",
+            "translate this text",
+            "programming question",
+            "greet the user",
             "闲聊",
+            "直接聊天",
+            "翻译这句话",
+            "文案或邮件",
+            "不要检索",
             "你好",
             "谢谢",
         )
@@ -139,10 +149,14 @@ class FakeIntentEmbedder:
             return [0.0, 1.0]
 
         rag_markers = (
-            "knowledge base documentation",
-            "questions asking for comparisons",
-            "troubleshooting questions",
+            "local knowledge base",
+            "indexed documents",
+            "document evidence",
+            "local corpus",
+            "local docs",
             "知识库",
+            "本地文档",
+            "引用资料",
             "employee handbook",
             "onboarding",
             "vacation policy",
@@ -332,6 +346,67 @@ def assert_anchor_vectors_initialize_once_under_concurrency() -> None:
     print("Concurrent anchor initialization -> ok")
 
 
+def assert_stateful_referential_routing() -> None:
+    router = IntentRouter(Settings(), embedder=None, llm_client=None)
+    rag_history = [
+        Message("user", "先讲讲巨大历史机遇这个梗。"),
+        Message(
+            "assistant",
+            "它来自家是本门店标语和后续社媒传播。",
+            used_rag=True,
+            route="keyword_rag",
+            context_count=2,
+        ),
+    ]
+    decision = assert_route(
+        router,
+        "后续呢？",
+        True,
+        history=rag_history,
+        expected_route="state_rag",
+    )
+    if "previous answer used retrieval" not in decision.reason:
+        raise AssertionError("State route should explain previous retrieval.")
+
+    long_new_topic = router.route(
+        "这个方案和 PostgreSQL connection pooling 有什么关系？",
+        rag_history,
+        "",
+    )
+    if long_new_topic.route == "state_rag":
+        raise AssertionError("New technical topic should not be forced by state.")
+
+    direct_history = [
+        Message("user", "帮我翻译一句话。"),
+        Message(
+            "assistant",
+            "I will arrive tomorrow.",
+            used_rag=False,
+            route="keyword_direct",
+            context_count=0,
+        ),
+    ]
+    direct_followup = router.route("那这个呢？", direct_history, "")
+    if direct_followup.route == "state_rag":
+        raise AssertionError("Previous direct answer should not force RAG.")
+
+    no_context_history = [
+        Message("user", "查一下这个主题。"),
+        Message(
+            "assistant",
+            "没有找到相关资料。",
+            used_rag=True,
+            route="fallback_rag",
+            context_count=0,
+        ),
+    ]
+    no_context_followup = router.route("继续讲", no_context_history, "")
+    if no_context_followup.route == "state_rag":
+        raise AssertionError("Empty previous retrieval should not force RAG.")
+
+    print("Stateful referential routing -> ok")
+
+
 def assert_llm_fallback_behavior() -> None:
     classifier = FakeClassifierLLM(
         (
@@ -349,7 +424,16 @@ def assert_llm_fallback_behavior() -> None:
         rag_router,
         "那审批时限呢？",
         True,
-        history=[Message("assistant", "We reviewed the vacation policy.")],
+        history=[
+            Message("user", "We reviewed the vacation policy."),
+            Message(
+                "assistant",
+                "The policy requires manager approval.",
+                used_rag=True,
+                route="embedding_rag",
+                context_count=2,
+            ),
+        ],
         expected_route="llm_rag",
     )
     if decision.reason != "knowledge-base follow-up":
@@ -360,6 +444,10 @@ def assert_llm_fallback_behavior() -> None:
         raise AssertionError("LLM classifier should allow tagged judgement output.")
     if "THINK_AND_JUDGEMENT" not in fallback_prompt or "JSON_ANS" not in fallback_prompt:
         raise AssertionError("LLM fallback prompt should specify tagged output format.")
+    if "Previous route state:" not in fallback_prompt:
+        raise AssertionError("LLM fallback should receive previous route state.")
+    if "used_rag=true" not in fallback_prompt or "route=embedding_rag" not in fallback_prompt:
+        raise AssertionError("LLM fallback should include structured route metadata.")
     if classifier.max_tokens[-1] != 512:
         raise AssertionError("LLM classifier output budget should allow tagged output.")
     if fallback_prompt.find("Current question:") > fallback_prompt.find("Compact memory:"):
@@ -432,8 +520,8 @@ def main() -> None:
     assert_route(
         router,
         "Hi, what is PostgreSQL?",
-        True,
-        expected_route="fallback_rag",
+        False,
+        expected_route="keyword_direct",
     )
     assert_route(
         router,
@@ -450,8 +538,8 @@ def main() -> None:
     assert_route(
         router,
         "PostgreSQL email notification pattern 怎么设计？",
-        True,
-        expected_route="fallback_rag",
+        False,
+        expected_route="keyword_direct",
     )
     assert_route(
         router,
@@ -505,6 +593,7 @@ def main() -> None:
     assert_embedding_context_behavior()
     assert_classification_text_prioritizes_current_question()
     assert_anchor_vectors_initialize_once_under_concurrency()
+    assert_stateful_referential_routing()
     assert_llm_fallback_behavior()
     assert_pipeline_search_behavior()
 

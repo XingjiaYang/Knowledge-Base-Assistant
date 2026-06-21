@@ -22,6 +22,9 @@ _CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 class ChatMessage:
     role: Literal["user", "assistant"]
     content: str
+    used_rag: bool | None = None
+    route: str = ""
+    context_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -193,6 +196,12 @@ class RAGPipeline:
                 ChatMessage(
                     role=message.role,
                     content=self.budget.trim_message(content),
+                    used_rag=getattr(message, "used_rag", None),
+                    route=getattr(message, "route", ""),
+                    context_count=max(
+                        0,
+                        int(getattr(message, "context_count", 0) or 0),
+                    ),
                 )
             )
         return clean

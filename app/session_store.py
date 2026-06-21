@@ -867,7 +867,11 @@ class SessionStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT role, content
+                SELECT role,
+                       content,
+                       contexts,
+                       used_rag,
+                       route
                 FROM chat_messages
                 WHERE session_id = %s
                 ORDER BY id
@@ -876,11 +880,23 @@ class SessionStore:
                 (session_id, compacted_message_count),
             ).fetchall()
 
-        return [
-            ChatMessage(role=row["role"], content=row["content"])
-            for row in rows
-            if row["role"] in {"user", "assistant"}
-        ]
+        messages: list[ChatMessage] = []
+        for row in rows:
+            if row["role"] not in {"user", "assistant"}:
+                continue
+            contexts = row["contexts"] or []
+            if isinstance(contexts, str):
+                contexts = json.loads(contexts)
+            messages.append(
+                ChatMessage(
+                    role=row["role"],
+                    content=row["content"],
+                    used_rag=row["used_rag"],
+                    route=row["route"] or "",
+                    context_count=len(contexts),
+                )
+            )
+        return messages
 
     def append_message(
         self,

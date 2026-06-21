@@ -57,9 +57,9 @@ FastAPI /auth, /sessions, /rag
    |-- PostgreSQL users, login tokens, chat sessions, messages, summaries
    |
 IntentRouter
-   |-- keyword rules
-   |-- embedding similarity
-   |-- configured LLM zero-shot fallback for ambiguous cases
+   |-- keyword rules and previous-route strong follow-up state
+   |-- Jina classification similarity over single-intent anchors
+   |-- configured LLM fallback with previous route state
    |
 RAGPipeline or Direct Chat
    |-- BM25 keyword recall + Qdrant vector recall -> RRF fusion
@@ -78,8 +78,8 @@ Main modules:
 - `app/session_store.py`: PostgreSQL-backed users, login tokens, chat sessions,
   messages, runtime LLM settings, route metadata, and compacted conversation
   summaries.
-- `app/intent_router.py`: keyword, Jina-classification embedding, and tagged
-  LLM fallback routing.
+- `app/intent_router.py`: keyword/state, Jina-classification embedding, and
+  tagged LLM fallback routing.
 - `app/rag.py`: hybrid recall, RRF fusion, reranking, prompt construction, and
   context-budget-aware history compaction.
 - `app/reranker.py`: startup-preloaded Jina cross-encoder reranking for
@@ -327,6 +327,19 @@ views rather than the full API-scale conversation summary. These intent budgets
 are character-based safeguards; if the encoder still raises, the router falls
 through to the LLM classifier instead of failing the request.
 
+Intent routing is state-aware without feeding all history to every layer. The
+first keyword layer routes general technical/database topics outside the local
+corpus to direct chat, and uses the previous assistant route metadata only for
+short, strong referential follow-ups such as "continue" or "后续呢？" after the
+previous answer actually used retrieved contexts. New technical topics,
+including general database/API questions, are not forced into RAG by that state
+shortcut.
+The second layer keeps local cached anchor vectors and compares the bounded
+classification text against single-intent RAG/direct anchor queries. The third
+LLM classifier receives structured previous-route state and decides ambiguous
+follow-ups with the tagged
+`<think>THINK_AND_JUDGEMENT</think><answer>JSON_ANS</answer>` format.
+
 Conversation memory is sized for large API-context models. The default context
 window is `256000` tokens, with an `8192` token safety margin and `2048` token
 prompt-overhead reserve. History is not count-truncated before compaction
@@ -427,7 +440,10 @@ Ingestion scans that tree recursively, so nested topic folders are supported.
 The committed files cover a generated restaurant/business case corpus about
 家是本, 朱剑秋, and the 巨大历史机遇/巨大历史鲫鱼 meme. Because these topics are
 unlikely to be memorized well by general models, they are a better fit for RAG
-evaluation than common SQL or database-system facts.
+evaluation than common SQL or database-system facts. The bundled docs
+intentionally do not include general DB/SQL reference material; database
+questions stay in the direct-chat/evaluation-negative path instead of being
+made into RAG content.
 
 To use another subject:
 
@@ -437,9 +453,11 @@ To use another subject:
    (`DOMAIN_RAG_PHRASES` and `DOMAIN_RAG_PATTERNS`), the LLM fallback corpus
    description, and `data/eval/intent_router_cases.jsonl` if first-pass,
    embedding, and fallback intent routing should recognize the new topic.
-4. Run `python scripts/intent_router_ab.py --fake-embedder`; when model weights
+4. Keep any edited `RAG_ANCHORS`/`DIRECT_ANCHORS` as single-intent query-like
+   anchors so the second layer remains interpretable.
+5. Run `python scripts/intent_router_ab.py --fake-embedder`; when model weights
    are available, run a real encoder comparison.
-5. Ask questions about the new corpus through the same UI or `/rag` API.
+6. Ask questions about the new corpus through the same UI or `/rag` API.
 
 ## Restricted Network Setup
 
