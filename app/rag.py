@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import math
 import re
+import time
 from typing import Literal
 
 from app.config import Settings, settings
@@ -28,6 +29,26 @@ class ChatMessage:
 
 
 @dataclass(frozen=True)
+class RAGTimings:
+    total_ms: float = 0.0
+    history_ms: float = 0.0
+    intent_ms: float = 0.0
+    retrieval_ms: float = 0.0
+    recall_ms: float = 0.0
+    bm25_ms: float = 0.0
+    vector_ms: float = 0.0
+    embedding_ms: float = 0.0
+    qdrant_ms: float = 0.0
+    rrf_ms: float = 0.0
+    reranker_ms: float = 0.0
+    llm_ms: float = 0.0
+    llm_ttft_ms: float | None = None
+    llm_output_chars: int = 0
+    llm_estimated_output_tokens: int = 0
+    llm_estimated_tps: float = 0.0
+
+
+@dataclass(frozen=True)
 class RAGAnswer:
     answer: str
     contexts: list[SearchResult]
@@ -40,6 +61,7 @@ class RAGAnswer:
     qdrant_degraded: bool = False
     reranker_degraded: bool = False
     degradation_reason: str = ""
+    timings: RAGTimings = field(default_factory=RAGTimings)
 
 
 @dataclass(frozen=True)
@@ -49,6 +71,18 @@ class RetrievalOutcome:
     qdrant_degraded: bool = False
     reranker_degraded: bool = False
     degradation_reason: str = ""
+    timings: RAGTimings = field(default_factory=RAGTimings)
+
+
+@dataclass(frozen=True)
+class RecallOutcome:
+    contexts: list[SearchResult]
+    recall_ms: float = 0.0
+    bm25_ms: float = 0.0
+    vector_ms: float = 0.0
+    embedding_ms: float = 0.0
+    qdrant_ms: float = 0.0
+    rrf_ms: float = 0.0
 
 
 class RAGPipeline:
@@ -82,6 +116,8 @@ class RAGPipeline:
         conversation_summary: str | None = None,
         rag_only: bool = False,
     ) -> RAGAnswer:
+        total_start = time.perf_counter()
+        history_start = time.perf_counter()
         clean_history = self._normalize_history(history or [])
         summary, recent_history, compacted_count = self._compact_history(
             clean_history,
@@ -89,6 +125,9 @@ class RAGPipeline:
             question,
             top_k=top_k,
         )
+        history_ms = self._elapsed_ms(history_start)
+
+        intent_start = time.perf_counter()
         if rag_only:
             intent = IntentDecision(
                 True,
@@ -97,6 +136,7 @@ class RAGPipeline:
             )
         else:
             intent = self.intent_router.route(question, recent_history, summary)
+        intent_ms = self._elapsed_ms(intent_start)
         logger.info(
             "RAG request routed: route=%s use_rag=%s bm25_top_k=%s "
             "vector_top_k=%s rrf_top_k=%s final_top_k=%s history=%s "
@@ -132,7 +172,34 @@ class RAGPipeline:
             contexts = []
             messages = self._build_direct_messages(question, recent_history, summary)
 
+        llm_start = time.perf_counter()
         answer = self.llm_client.chat(messages)
+        llm_ms = self._elapsed_ms(llm_start)
+        estimated_output_tokens = self._estimate_tokens(answer)
+        llm_estimated_tps = (
+            estimated_output_tokens / (llm_ms / 1000)
+            if llm_ms > 0
+            else 0.0
+        )
+        retrieval_timings = retrieval_outcome.timings
+        timings = RAGTimings(
+            total_ms=self._elapsed_ms(total_start),
+            history_ms=history_ms,
+            intent_ms=intent_ms,
+            retrieval_ms=retrieval_timings.retrieval_ms,
+            recall_ms=retrieval_timings.recall_ms,
+            bm25_ms=retrieval_timings.bm25_ms,
+            vector_ms=retrieval_timings.vector_ms,
+            embedding_ms=retrieval_timings.embedding_ms,
+            qdrant_ms=retrieval_timings.qdrant_ms,
+            rrf_ms=retrieval_timings.rrf_ms,
+            reranker_ms=retrieval_timings.reranker_ms,
+            llm_ms=llm_ms,
+            llm_ttft_ms=None,
+            llm_output_chars=len(answer),
+            llm_estimated_output_tokens=estimated_output_tokens,
+            llm_estimated_tps=llm_estimated_tps,
+        )
         return RAGAnswer(
             answer=answer,
             contexts=contexts,
@@ -145,6 +212,7 @@ class RAGPipeline:
             qdrant_degraded=retrieval_outcome.qdrant_degraded,
             reranker_degraded=retrieval_outcome.reranker_degraded,
             degradation_reason=retrieval_outcome.degradation_reason,
+            timings=timings,
         )
 
     def _retrieve_contexts(
@@ -155,6 +223,7 @@ class RAGPipeline:
         bm25_top_k: int | None = None,
         rrf_top_k: int | None = None,
     ) -> RetrievalOutcome:
+        retrieval_start = time.perf_counter()
         final_top_k = self._final_top_k(top_k)
         bm25_limit = self._bm25_top_k(bm25_top_k)
         vector_limit = self._vector_top_k(recall_top_k)
@@ -163,13 +232,14 @@ class RAGPipeline:
         reranker_degraded = False
         degradation_reasons: list[str] = []
 
-        recalled_contexts = self._recall_contexts(
+        recall_outcome = self._recall_contexts(
             search_query,
             bm25_limit=bm25_limit,
             vector_limit=vector_limit,
             rrf_limit=rrf_limit,
             degradation_reasons=degradation_reasons,
         )
+        recalled_contexts = recall_outcome.contexts
         qdrant_degraded = bool(degradation_reasons)
 
         logger.info(
@@ -184,15 +254,23 @@ class RAGPipeline:
                 qdrant_degraded=qdrant_degraded,
                 reranker_degraded=False,
                 degradation_reason="; ".join(degradation_reasons),
+                timings=self._retrieval_timings(
+                    retrieval_start,
+                    recall_outcome,
+                    reranker_ms=0.0,
+                ),
             )
 
+        reranker_start = time.perf_counter()
         try:
             reranked_contexts = self.reranker.rerank(
                 search_query,
                 recalled_contexts,
                 top_k=final_top_k,
             )
+            reranker_ms = self._elapsed_ms(reranker_start)
         except Exception:
+            reranker_ms = self._elapsed_ms(reranker_start)
             reranker_degraded = True
             degradation_reasons.append(
                 "Reranker failed; using unre-ranked recall results."
@@ -211,6 +289,11 @@ class RAGPipeline:
                 qdrant_degraded=qdrant_degraded,
                 reranker_degraded=reranker_degraded,
                 degradation_reason="; ".join(degradation_reasons),
+                timings=self._retrieval_timings(
+                    retrieval_start,
+                    recall_outcome,
+                    reranker_ms=reranker_ms,
+                ),
             )
 
         logger.info(
@@ -224,6 +307,11 @@ class RAGPipeline:
             qdrant_degraded=qdrant_degraded,
             reranker_degraded=False,
             degradation_reason="; ".join(degradation_reasons),
+            timings=self._retrieval_timings(
+                retrieval_start,
+                recall_outcome,
+                reranker_ms=reranker_ms,
+            ),
         )
 
     def _recall_contexts(
@@ -233,21 +321,39 @@ class RAGPipeline:
         vector_limit: int,
         rrf_limit: int,
         degradation_reasons: list[str],
-    ) -> list[SearchResult]:
+    ) -> RecallOutcome:
+        recall_start = time.perf_counter()
         if hasattr(self.vector_store, "search_bm25") and hasattr(
             self.vector_store,
             "search",
         ):
+            bm25_start = time.perf_counter()
             bm25_contexts = self.vector_store.search_bm25(
                 search_query,
                 top_k=bm25_limit,
             )
+            bm25_ms = self._elapsed_ms(bm25_start)
             try:
-                vector_contexts = self.vector_store.search(
-                    search_query,
-                    top_k=vector_limit,
-                )
+                vector_start = time.perf_counter()
+                if hasattr(self.vector_store, "search_with_timing"):
+                    vector_outcome = self.vector_store.search_with_timing(
+                        search_query,
+                        top_k=vector_limit,
+                    )
+                    vector_contexts = vector_outcome.results
+                    vector_ms = vector_outcome.total_ms
+                    embedding_ms = vector_outcome.embedding_ms
+                    qdrant_ms = vector_outcome.qdrant_ms
+                else:
+                    vector_contexts = self.vector_store.search(
+                        search_query,
+                        top_k=vector_limit,
+                    )
+                    vector_ms = self._elapsed_ms(vector_start)
+                    embedding_ms = 0.0
+                    qdrant_ms = 0.0
             except Exception:
+                vector_ms = self._elapsed_ms(vector_start)
                 degradation_reasons.append(
                     "Qdrant/vector recall failed; using BM25-only retrieval."
                 )
@@ -257,36 +363,61 @@ class RAGPipeline:
                     "fallback=bm25_only bm25_contexts=%s.",
                     len(bm25_contexts),
                 )
-                return bm25_contexts
+                return RecallOutcome(
+                    contexts=bm25_contexts,
+                    recall_ms=self._elapsed_ms(recall_start),
+                    bm25_ms=bm25_ms,
+                    vector_ms=vector_ms,
+                    embedding_ms=0.0,
+                    qdrant_ms=0.0,
+                    rrf_ms=0.0,
+                )
 
+            rrf_start = time.perf_counter()
             fused_contexts = VectorStore._rrf_fuse(
                 vector_contexts,
                 bm25_contexts,
                 top_k=rrf_limit,
             )
+            rrf_ms = self._elapsed_ms(rrf_start)
             logger.info(
                 "Hybrid recall fused bm25=%s vector=%s into rrf=%s contexts.",
                 len(bm25_contexts),
                 len(vector_contexts),
                 len(fused_contexts),
             )
-            return fused_contexts
+            return RecallOutcome(
+                contexts=fused_contexts,
+                recall_ms=self._elapsed_ms(recall_start),
+                bm25_ms=bm25_ms,
+                vector_ms=vector_ms,
+                embedding_ms=embedding_ms,
+                qdrant_ms=qdrant_ms,
+                rrf_ms=rrf_ms,
+            )
 
         if hasattr(self.vector_store, "hybrid_search"):
             try:
-                return self.vector_store.hybrid_search(
+                hybrid_start = time.perf_counter()
+                contexts = self.vector_store.hybrid_search(
                     search_query,
                     bm25_top_k=bm25_limit,
                     vector_top_k=vector_limit,
                     rrf_top_k=rrf_limit,
                 )
+                return RecallOutcome(
+                    contexts=contexts,
+                    recall_ms=self._elapsed_ms(hybrid_start),
+                )
             except Exception:
                 if not hasattr(self.vector_store, "search_bm25"):
                     raise
+                bm25_start = time.perf_counter()
                 bm25_contexts = self.vector_store.search_bm25(
                     search_query,
                     top_k=bm25_limit,
                 )
+                bm25_ms = self._elapsed_ms(bm25_start)
                 degradation_reasons.append(
                     "Qdrant/vector recall failed; using BM25-only retrieval."
                 )
@@ -296,9 +427,40 @@ class RAGPipeline:
                     "fallback=bm25_only bm25_contexts=%s.",
                     len(bm25_contexts),
                 )
-                return bm25_contexts
+                return RecallOutcome(
+                    contexts=bm25_contexts,
+                    recall_ms=self._elapsed_ms(recall_start),
+                    bm25_ms=bm25_ms,
+                )
 
-        return self.vector_store.search(search_query, top_k=vector_limit)[:rrf_limit]
+        vector_start = time.perf_counter()
+        contexts = self.vector_store.search(search_query, top_k=vector_limit)[:rrf_limit]
+        return RecallOutcome(
+            contexts=contexts,
+            recall_ms=self._elapsed_ms(recall_start),
+            vector_ms=self._elapsed_ms(vector_start),
+        )
+
+    def _retrieval_timings(
+        self,
+        retrieval_start: float,
+        recall_outcome: RecallOutcome,
+        reranker_ms: float,
+    ) -> RAGTimings:
+        return RAGTimings(
+            retrieval_ms=self._elapsed_ms(retrieval_start),
+            recall_ms=recall_outcome.recall_ms,
+            bm25_ms=recall_outcome.bm25_ms,
+            vector_ms=recall_outcome.vector_ms,
+            embedding_ms=recall_outcome.embedding_ms,
+            qdrant_ms=recall_outcome.qdrant_ms,
+            rrf_ms=recall_outcome.rrf_ms,
+            reranker_ms=reranker_ms,
+        )
+
+    @staticmethod
+    def _elapsed_ms(start: float) -> float:
+        return (time.perf_counter() - start) * 1000
 
     def _final_top_k(self, top_k: int | None = None) -> int:
         return max(1, top_k or self.config.retrieve_top_k)

@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import re
 from threading import Lock
+import time
 from typing import Literal
 from uuid import NAMESPACE_URL, uuid5
 
@@ -26,6 +27,7 @@ from sentence_transformers import SentenceTransformer
 
 from app.config import PROJECT_ROOT, Settings, settings
 from app.device import preferred_torch_device
+from app.transformers_compat import patch_all_tied_weights_keys
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,14 @@ class SearchResult:
     headings: tuple[str, ...] = ()
     start_line: int = 0
     end_line: int = 0
+
+
+@dataclass(frozen=True)
+class VectorSearchOutcome:
+    results: list[SearchResult]
+    embedding_ms: float = 0.0
+    qdrant_ms: float = 0.0
+    total_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -103,6 +113,10 @@ _MARKDOWN = MarkdownIt("gfm-like", {"linkify": False})
 _BM25_K1 = 1.5
 _BM25_B = 0.75
 _RRF_RANK_CONSTANT = 60
+
+
+class _NonFiniteEmbeddingError(RuntimeError):
+    pass
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -423,6 +437,7 @@ class VectorStore:
         self._bm25_lock = Lock()
         self._bm25_index: _BM25Index | None = None
         self._ensured_payload_indexes: set[str] = set()
+        self._vector_size: int | None = None
 
     @property
     def client(self) -> QdrantClient:
@@ -447,6 +462,7 @@ class VectorStore:
                         self.config.embedding_model,
                         device,
                     )
+                    patch_all_tied_weights_keys()
                     try:
                         self._model = SentenceTransformer(
                             self.config.embedding_model,
@@ -483,13 +499,37 @@ class VectorStore:
 
     @property
     def vector_size(self) -> int:
+        if self._vector_size is not None:
+            return self._vector_size
+
+        reported_size: int | None = None
         if hasattr(self.model, "get_embedding_dimension"):
-            size = self.model.get_embedding_dimension()
+            reported_size = self.model.get_embedding_dimension()
         else:
-            size = self.model.get_sentence_embedding_dimension()
-        if size is None:
+            reported_size = self.model.get_sentence_embedding_dimension()
+
+        actual_size = self._probe_vector_size()
+        if reported_size is not None and int(reported_size) != actual_size:
+            logger.warning(
+                "Embedding model reported dimension %s but produced %s; "
+                "using produced dimension.",
+                reported_size,
+                actual_size,
+            )
+        if actual_size <= 0:
             raise RuntimeError("Embedding model did not report a vector dimension")
-        return int(size)
+        self._vector_size = actual_size
+        return actual_size
+
+    def _probe_vector_size(self) -> int:
+        embeddings = self._encode_matrix(
+            "dimension probe",
+            normalize_embeddings=True,
+            task=self.config.embedding_passage_task,
+        )
+        if len(embeddings) != 1 or not embeddings[0]:
+            raise RuntimeError("Embedding model returned an empty probe vector.")
+        return len(embeddings[0])
 
     def ensure_collection(self, recreate: bool = False) -> None:
         logger.info(
@@ -504,6 +544,21 @@ class VectorStore:
             collection_names.remove(self.config.collection_name)
             self._ensured_payload_indexes.clear()
 
+        if self.config.collection_name in collection_names:
+            current_size = self._collection_vector_size()
+            expected_size = self.vector_size
+            if current_size and current_size != expected_size:
+                logger.warning(
+                    "Qdrant collection %s vector size mismatch: current=%s "
+                    "expected=%s. Recreating collection.",
+                    self.config.collection_name,
+                    current_size,
+                    expected_size,
+                )
+                self.client.delete_collection(collection_name=self.config.collection_name)
+                collection_names.remove(self.config.collection_name)
+                self._ensured_payload_indexes.clear()
+
         if self.config.collection_name not in collection_names:
             self.client.create_collection(
                 collection_name=self.config.collection_name,
@@ -514,6 +569,25 @@ class VectorStore:
             )
 
         self._ensure_payload_index("source_key")
+
+    def _collection_vector_size(self) -> int | None:
+        try:
+            collection_info = self.client.get_collection(
+                collection_name=self.config.collection_name,
+            )
+        except Exception:
+            return None
+
+        config = getattr(collection_info, "config", None)
+        params = getattr(config, "params", None)
+        vectors = getattr(params, "vectors", None)
+        if hasattr(vectors, "size"):
+            return int(vectors.size)
+        if isinstance(vectors, dict):
+            for value in vectors.values():
+                if hasattr(value, "size"):
+                    return int(value.size)
+        return None
 
     def ingest_markdown_dir(
         self,
@@ -532,6 +606,7 @@ class VectorStore:
             if not points:
                 continue
 
+            self._log_point_vector_shape(file_path, points)
             self.client.upsert(
                 collection_name=self.config.collection_name,
                 points=points,
@@ -546,6 +621,24 @@ class VectorStore:
         with self._bm25_lock:
             self._bm25_index = None
         return inserted
+
+    @staticmethod
+    def _log_point_vector_shape(file_path: Path, points: list[PointStruct]) -> None:
+        if not points:
+            return
+
+        vector = points[0].vector
+        vector_len = len(vector) if isinstance(vector, list) else 0
+        first_value = vector[0] if vector_len else None
+        logger.info(
+            "Prepared %s vectors for %s: vector_type=%s vector_len=%s "
+            "first_value_type=%s.",
+            len(points),
+            file_path,
+            type(vector).__name__,
+            vector_len,
+            type(first_value).__name__,
+        )
 
     def _ensure_payload_index(self, field_name: str) -> None:
         if field_name in self._ensured_payload_indexes:
@@ -580,9 +673,24 @@ class VectorStore:
         top_k: int | None = None,
         metadata_filter: dict[str, str] | None = None,
     ) -> list[SearchResult]:
+        return self.search_with_timing(
+            query,
+            top_k=top_k,
+            metadata_filter=metadata_filter,
+        ).results
+
+    def search_with_timing(
+        self,
+        query: str,
+        top_k: int | None = None,
+        metadata_filter: dict[str, str] | None = None,
+    ) -> VectorSearchOutcome:
+        total_start = time.perf_counter()
         limit = top_k or self.config.retrieve_top_k
         score_threshold = self.config.retrieve_score_threshold
+        embedding_start = time.perf_counter()
         query_vector = self._embed_one(query)
+        embedding_ms = (time.perf_counter() - embedding_start) * 1000
         query_filter = self._metadata_filter(metadata_filter)
         logger.info(
             "Running vector search: top_k=%s score_threshold=%s "
@@ -593,6 +701,7 @@ class VectorStore:
         )
 
         try:
+            qdrant_start = time.perf_counter()
             if hasattr(self.client, "query_points"):
                 query_args = {
                     "collection_name": self.config.collection_name,
@@ -618,6 +727,7 @@ class VectorStore:
                 if query_filter is not None:
                     search_args["query_filter"] = query_filter
                 hits = self.client.search(**search_args)
+            qdrant_ms = (time.perf_counter() - qdrant_start) * 1000
         except Exception:
             logger.exception("Qdrant vector search failed.")
             raise
@@ -645,7 +755,12 @@ class VectorStore:
                     end_line=int(payload.get("end_line", 0)),
                 )
             )
-        return results
+        return VectorSearchOutcome(
+            results=results,
+            embedding_ms=embedding_ms,
+            qdrant_ms=qdrant_ms,
+            total_ms=(time.perf_counter() - total_start) * 1000,
+        )
 
     def search_bm25(
         self,
@@ -759,7 +874,7 @@ class VectorStore:
         if not chunks:
             return []
 
-        embeddings = self._encode(
+        embeddings = self._encode_matrix(
             [chunk.embedding_text for chunk in chunks],
             normalize_embeddings=True,
             task=self.config.embedding_passage_task,
@@ -772,7 +887,7 @@ class VectorStore:
             points.append(
                 PointStruct(
                     id=point_id,
-                    vector=embedding.tolist(),
+                    vector=embedding,
                     payload={
                         "source": source,
                         "source_key": source_key,
@@ -840,12 +955,14 @@ class VectorStore:
             return source_path.name
 
     def _embed_one(self, text: str) -> list[float]:
-        embedding = self._encode(
+        embeddings = self._encode_matrix(
             text,
             normalize_embeddings=True,
             task=self.config.embedding_query_task,
         )
-        return embedding.tolist()
+        if len(embeddings) != 1:
+            raise RuntimeError("Embedding model returned an unexpected query shape.")
+        return embeddings[0]
 
     def encode(
         self,
@@ -853,11 +970,56 @@ class VectorStore:
         normalize_embeddings: bool = True,
         task: str | None = None,
     ) -> object:
-        return self._encode(
+        embeddings = self._encode_matrix(
             texts,
             normalize_embeddings=normalize_embeddings,
             task=task or self.config.embedding_classification_task,
         )
+        if isinstance(texts, str):
+            if len(embeddings) != 1:
+                raise RuntimeError("Embedding model returned an unexpected query shape.")
+            return embeddings[0]
+        return embeddings
+
+    def _encode_matrix(
+        self,
+        texts: str | Sequence[str],
+        normalize_embeddings: bool,
+        task: str | None,
+    ) -> list[list[float]]:
+        raw_embeddings = self._encode(
+            texts,
+            normalize_embeddings=normalize_embeddings,
+            task=task,
+        )
+        try:
+            return self._embedding_matrix(raw_embeddings)
+        except _NonFiniteEmbeddingError as exc:
+            if self._model_device == "cuda":
+                logger.warning(
+                    "Embedding model returned non-finite values on CUDA; "
+                    "falling back to CPU: %s",
+                    exc,
+                )
+                self._move_model_to_cpu()
+                raw_embeddings = self._encode(
+                    texts,
+                    normalize_embeddings=normalize_embeddings,
+                    task=task,
+                )
+                try:
+                    return self._embedding_matrix(raw_embeddings)
+                except _NonFiniteEmbeddingError:
+                    pass
+
+            logger.warning(
+                "Embedding model returned non-finite values; sanitizing "
+                "non-finite vector entries to zero."
+            )
+            return self._embedding_matrix(
+                raw_embeddings,
+                sanitize_nonfinite=True,
+            )
 
     def _encode(
         self,
@@ -885,6 +1047,112 @@ class VectorStore:
                 normalize_embeddings=normalize_embeddings,
                 **encode_kwargs,
             )
+
+    @classmethod
+    def _embedding_matrix(
+        cls,
+        embeddings: object,
+        sanitize_nonfinite: bool = False,
+    ) -> list[list[float]]:
+        value = cls._to_builtin(cls._unwrap_embedding_output(embeddings))
+        if not cls._is_sequence(value):
+            raise RuntimeError("Embedding model returned a non-sequence value.")
+
+        rows = list(value)
+        if not rows:
+            return []
+
+        first = cls._to_builtin(cls._unwrap_embedding_output(rows[0]))
+        if not cls._is_sequence(first):
+            return [
+                cls._embedding_vector(
+                    rows,
+                    sanitize_nonfinite=sanitize_nonfinite,
+                )
+            ]
+        return [
+            cls._embedding_vector(
+                row,
+                sanitize_nonfinite=sanitize_nonfinite,
+            )
+            for row in rows
+        ]
+
+    @classmethod
+    def _embedding_vector(
+        cls,
+        embedding: object,
+        sanitize_nonfinite: bool = False,
+    ) -> list[float]:
+        value = cls._to_builtin(cls._unwrap_embedding_output(embedding))
+        if not cls._is_sequence(value):
+            raise RuntimeError("Embedding model returned a non-vector row.")
+
+        items = list(value)
+        if len(items) == 1:
+            nested = cls._to_builtin(cls._unwrap_embedding_output(items[0]))
+            if cls._is_sequence(nested):
+                return cls._embedding_vector(
+                    nested,
+                    sanitize_nonfinite=sanitize_nonfinite,
+                )
+
+        vector: list[float] = []
+        for item in items:
+            item = cls._to_builtin(cls._unwrap_embedding_output(item))
+            if cls._is_sequence(item):
+                raise RuntimeError("Embedding model returned a nested vector row.")
+            numeric_item = float(item)
+            if not math.isfinite(numeric_item):
+                if not sanitize_nonfinite:
+                    raise _NonFiniteEmbeddingError(
+                        "Embedding model returned a non-finite value."
+                    )
+                numeric_item = 0.0
+            vector.append(numeric_item)
+        if sanitize_nonfinite:
+            norm = math.sqrt(sum(item * item for item in vector))
+            if norm > 0:
+                vector = [item / norm for item in vector]
+        return vector
+
+    @staticmethod
+    def _unwrap_embedding_output(value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+
+        for key in (
+            "dense_vecs",
+            "dense",
+            "sentence_embedding",
+            "embeddings",
+            "embedding",
+            "vectors",
+            "vector",
+        ):
+            if key in value:
+                return value[key]
+
+        if len(value) == 1:
+            return next(iter(value.values()))
+        raise RuntimeError(
+            "Embedding model returned a mapping without a dense vector field."
+        )
+
+    @staticmethod
+    def _to_builtin(value: object) -> object:
+        if hasattr(value, "detach") and hasattr(value, "cpu"):
+            value = value.detach().cpu()
+        if hasattr(value, "tolist"):
+            return value.tolist()
+        return value
+
+    @staticmethod
+    def _is_sequence(value: object) -> bool:
+        return isinstance(value, Sequence) and not isinstance(
+            value,
+            (str, bytes, bytearray),
+        )
 
     @staticmethod
     def _encode_kwargs(task: str | None) -> dict[str, str]:

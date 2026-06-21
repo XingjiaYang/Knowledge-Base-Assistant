@@ -18,7 +18,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.config import settings
 from app.llm_client import LLMClient
-from app.rag import RAGPipeline
+from app.rag import RAGPipeline, RAGTimings
 from app.reranker import Reranker
 from app.security import bearer_token
 from app.session_store import (
@@ -194,6 +194,46 @@ class ContextResponse(BaseModel):
         )
 
 
+class TimingResponse(BaseModel):
+    total_ms: float = 0.0
+    history_ms: float = 0.0
+    intent_ms: float = 0.0
+    retrieval_ms: float = 0.0
+    recall_ms: float = 0.0
+    bm25_ms: float = 0.0
+    vector_ms: float = 0.0
+    embedding_ms: float = 0.0
+    qdrant_ms: float = 0.0
+    rrf_ms: float = 0.0
+    reranker_ms: float = 0.0
+    llm_ms: float = 0.0
+    llm_ttft_ms: float | None = None
+    llm_output_chars: int = 0
+    llm_estimated_output_tokens: int = 0
+    llm_estimated_tps: float = 0.0
+
+    @classmethod
+    def from_timings(cls, timings: RAGTimings) -> "TimingResponse":
+        return cls(
+            total_ms=timings.total_ms,
+            history_ms=timings.history_ms,
+            intent_ms=timings.intent_ms,
+            retrieval_ms=timings.retrieval_ms,
+            recall_ms=timings.recall_ms,
+            bm25_ms=timings.bm25_ms,
+            vector_ms=timings.vector_ms,
+            embedding_ms=timings.embedding_ms,
+            qdrant_ms=timings.qdrant_ms,
+            rrf_ms=timings.rrf_ms,
+            reranker_ms=timings.reranker_ms,
+            llm_ms=timings.llm_ms,
+            llm_ttft_ms=timings.llm_ttft_ms,
+            llm_output_chars=timings.llm_output_chars,
+            llm_estimated_output_tokens=timings.llm_estimated_output_tokens,
+            llm_estimated_tps=timings.llm_estimated_tps,
+        )
+
+
 class RAGResponse(BaseModel):
     answer: str
     session_id: str | None = None
@@ -207,6 +247,7 @@ class RAGResponse(BaseModel):
     qdrant_degraded: bool = False
     reranker_degraded: bool = False
     degradation_reason: str = ""
+    timings: TimingResponse = Field(default_factory=TimingResponse)
 
 
 class UserResponse(BaseModel):
@@ -918,6 +959,7 @@ async def rag(
         qdrant_degraded=result.qdrant_degraded,
         reranker_degraded=result.reranker_degraded,
         degradation_reason=result.degradation_reason,
+        timings=TimingResponse.from_timings(result.timings),
     )
 
 
