@@ -76,11 +76,13 @@ def assert_llm_settings() -> None:
         retrieve_score_threshold=0.42,
         intent_embedding_rag_threshold=0.55,
         cuda_enabled=False,
-        embedding_model="jinaai/jina-embeddings-v3",
+        embedding_model="jinaai/jina-embeddings-v5-text-small",
         embedding_trust_remote_code=True,
-        embedding_query_task="retrieval.query",
-        embedding_passage_task="retrieval.passage",
+        embedding_query_task="retrieval",
+        embedding_passage_task="retrieval",
         embedding_classification_task="classification",
+        embedding_query_prompt_name="query",
+        embedding_passage_prompt_name="document",
         reranker_model="jinaai/jina-reranker-v3",
         reranker_preload=True,
         reranker_dtype="auto",
@@ -113,16 +115,20 @@ def assert_llm_settings() -> None:
         raise AssertionError("Retrieval score threshold should be configurable.")
     if config.cuda_enabled:
         raise AssertionError("CUDA preference should be configurable.")
-    if config.embedding_model != "jinaai/jina-embeddings-v3":
+    if config.embedding_model != "jinaai/jina-embeddings-v5-text-small":
         raise AssertionError("Embedding model should be configurable.")
     if not config.embedding_trust_remote_code:
         raise AssertionError("Embedding trust_remote_code should be configurable.")
-    if config.embedding_query_task != "retrieval.query":
+    if config.embedding_query_task != "retrieval":
         raise AssertionError("Embedding query task should be configurable.")
-    if config.embedding_passage_task != "retrieval.passage":
+    if config.embedding_passage_task != "retrieval":
         raise AssertionError("Embedding passage task should be configurable.")
     if config.embedding_classification_task != "classification":
         raise AssertionError("Embedding classification task should be configurable.")
+    if config.embedding_query_prompt_name != "query":
+        raise AssertionError("Embedding query prompt name should be configurable.")
+    if config.embedding_passage_prompt_name != "document":
+        raise AssertionError("Embedding passage prompt name should be configurable.")
     if config.reranker_model != "jinaai/jina-reranker-v3":
         raise AssertionError("Reranker model should be configurable.")
     if not config.reranker_preload:
@@ -697,16 +703,20 @@ def assert_default_embedding_settings() -> None:
         raise AssertionError("Default chunk size should use Jina-scale context.")
     if config.chunk_overlap != 300:
         raise AssertionError("Default chunk overlap should use Jina-scale context.")
-    if config.embedding_model != "jinaai/jina-embeddings-v3":
-        raise AssertionError("Default embedding model should be Jina embeddings v3.")
+    if config.embedding_model != "jinaai/jina-embeddings-v5-text-small":
+        raise AssertionError("Default embedding model should be Jina embeddings v5 text small.")
     if not config.embedding_trust_remote_code:
-        raise AssertionError("Jina embeddings v3 should load with trusted remote code.")
-    if config.embedding_query_task != "retrieval.query":
+        raise AssertionError("Jina embeddings v5 should load with trusted remote code.")
+    if config.embedding_query_task != "retrieval":
         raise AssertionError("Default query embedding task should use Jina retrieval.")
-    if config.embedding_passage_task != "retrieval.passage":
+    if config.embedding_passage_task != "retrieval":
         raise AssertionError("Default passage embedding task should use Jina retrieval.")
     if config.embedding_classification_task != "classification":
         raise AssertionError("Default intent embedding task should use classification.")
+    if config.embedding_query_prompt_name != "query":
+        raise AssertionError("Default query prompt should use Jina query prompt.")
+    if config.embedding_passage_prompt_name != "document":
+        raise AssertionError("Default passage prompt should use Jina document prompt.")
     if config.intent_llm_history_max_chars != 12000:
         raise AssertionError("Default LLM intent history budget should be expanded.")
     if config.intent_llm_summary_max_chars != 32000:

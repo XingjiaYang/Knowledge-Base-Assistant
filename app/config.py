@@ -110,16 +110,28 @@ class Settings:
     docs_dir: Path = PROJECT_ROOT / "data" / "docs"
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     collection_name: str = os.getenv("QDRANT_COLLECTION", "tech_docs")
-    embedding_model: str = os.getenv("EMBEDDING_MODEL", "jinaai/jina-embeddings-v3")
+    embedding_model: str = os.getenv(
+        "EMBEDDING_MODEL",
+        "jinaai/jina-embeddings-v5-text-small",
+    )
     embedding_trust_remote_code: bool = _env_bool("EMBEDDING_TRUST_REMOTE_CODE", True)
-    embedding_query_task: str = os.getenv("EMBEDDING_QUERY_TASK", "retrieval.query")
+    embedding_query_task: str = os.getenv("EMBEDDING_QUERY_TASK", "retrieval")
     embedding_passage_task: str = os.getenv(
         "EMBEDDING_PASSAGE_TASK",
-        "retrieval.passage",
+        "retrieval",
     )
     embedding_classification_task: str = os.getenv(
         "EMBEDDING_CLASSIFICATION_TASK",
         "classification",
+    )
+    embedding_query_prompt_name: str = os.getenv("EMBEDDING_QUERY_PROMPT_NAME", "query")
+    embedding_passage_prompt_name: str = os.getenv(
+        "EMBEDDING_PASSAGE_PROMPT_NAME",
+        "document",
+    )
+    embedding_classification_prompt_name: str = os.getenv(
+        "EMBEDDING_CLASSIFICATION_PROMPT_NAME",
+        "",
     )
     chunk_size: int = _env_int("CHUNK_SIZE", 2000)
     chunk_overlap: int = _env_int("CHUNK_OVERLAP", 300)

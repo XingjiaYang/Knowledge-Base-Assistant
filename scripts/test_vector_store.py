@@ -310,21 +310,27 @@ def assert_jina_embedding_tasks_are_routed_by_use_case() -> None:
     model = FakeEmbeddingModel()
     store = VectorStore(
         Settings(
-            embedding_query_task="retrieval.query",
-            embedding_passage_task="retrieval.passage",
+            embedding_query_task="retrieval",
+            embedding_passage_task="retrieval",
             embedding_classification_task="classification",
+            embedding_query_prompt_name="query",
+            embedding_passage_prompt_name="document",
         ),
         model=model,
     )
 
     _ = store._embed_one("query")
     _ = store.encode("intent text")
-    _ = store._encode(["chunk text"], task=store.config.embedding_passage_task)
+    _ = store._encode(
+        ["chunk text"],
+        task=store.config.embedding_passage_task,
+        prompt_name=store.config.embedding_passage_prompt_name,
+    )
 
     expected = [
-        {"task": "retrieval.query", "prompt_name": "retrieval.query"},
-        {"task": "classification", "prompt_name": "classification"},
-        {"task": "retrieval.passage", "prompt_name": "retrieval.passage"},
+        {"task": "retrieval", "prompt_name": "query"},
+        {"task": "classification"},
+        {"task": "retrieval", "prompt_name": "document"},
     ]
     if model.encode_kwargs != expected:
         raise AssertionError(f"Embedding task routing mismatch: {model.encode_kwargs}")

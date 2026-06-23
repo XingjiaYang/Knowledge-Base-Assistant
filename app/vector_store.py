@@ -463,11 +463,13 @@ class VectorStore:
                         device,
                     )
                     patch_all_tied_weights_keys()
+                    model_kwargs = self._sentence_transformer_kwargs(device)
                     try:
                         self._model = SentenceTransformer(
                             self.config.embedding_model,
                             device=device,
                             trust_remote_code=self.config.embedding_trust_remote_code,
+                            **model_kwargs,
                         )
                         self._model_device = device
                     except Exception as exc:
@@ -482,9 +484,24 @@ class VectorStore:
                             self.config.embedding_model,
                             device="cpu",
                             trust_remote_code=self.config.embedding_trust_remote_code,
+                            **self._sentence_transformer_kwargs("cpu"),
                         )
                         self._model_device = "cpu"
         return self._model
+
+    def _sentence_transformer_kwargs(self, device: str) -> dict[str, object]:
+        if "jina-embeddings-v5" not in self.config.embedding_model.lower():
+            return {}
+
+        kwargs: dict[str, object] = {}
+        if device == "cuda":
+            try:
+                import torch
+            except Exception:
+                return kwargs
+
+            kwargs["model_kwargs"] = {"dtype": torch.bfloat16}
+        return kwargs
 
     def close(self) -> None:
         with self._client_lock:
@@ -526,6 +543,7 @@ class VectorStore:
             "dimension probe",
             normalize_embeddings=True,
             task=self.config.embedding_passage_task,
+            prompt_name=self.config.embedding_passage_prompt_name,
         )
         if len(embeddings) != 1 or not embeddings[0]:
             raise RuntimeError("Embedding model returned an empty probe vector.")
@@ -878,6 +896,7 @@ class VectorStore:
             [chunk.embedding_text for chunk in chunks],
             normalize_embeddings=True,
             task=self.config.embedding_passage_task,
+            prompt_name=self.config.embedding_passage_prompt_name,
         )
         points: list[PointStruct] = []
         source_key = self._source_key(file_path)
@@ -959,6 +978,7 @@ class VectorStore:
             text,
             normalize_embeddings=True,
             task=self.config.embedding_query_task,
+            prompt_name=self.config.embedding_query_prompt_name,
         )
         if len(embeddings) != 1:
             raise RuntimeError("Embedding model returned an unexpected query shape.")
@@ -969,11 +989,17 @@ class VectorStore:
         texts: str | Sequence[str],
         normalize_embeddings: bool = True,
         task: str | None = None,
+        prompt_name: str | None = None,
     ) -> object:
         embeddings = self._encode_matrix(
             texts,
             normalize_embeddings=normalize_embeddings,
             task=task or self.config.embedding_classification_task,
+            prompt_name=(
+                prompt_name
+                if prompt_name is not None
+                else self.config.embedding_classification_prompt_name
+            ),
         )
         if isinstance(texts, str):
             if len(embeddings) != 1:
@@ -986,11 +1012,13 @@ class VectorStore:
         texts: str | Sequence[str],
         normalize_embeddings: bool,
         task: str | None,
+        prompt_name: str | None = None,
     ) -> list[list[float]]:
         raw_embeddings = self._encode(
             texts,
             normalize_embeddings=normalize_embeddings,
             task=task,
+            prompt_name=prompt_name,
         )
         try:
             return self._embedding_matrix(raw_embeddings)
@@ -1006,6 +1034,7 @@ class VectorStore:
                     texts,
                     normalize_embeddings=normalize_embeddings,
                     task=task,
+                    prompt_name=prompt_name,
                 )
                 try:
                     return self._embedding_matrix(raw_embeddings)
@@ -1026,8 +1055,9 @@ class VectorStore:
         texts: str | Sequence[str],
         normalize_embeddings: bool = True,
         task: str | None = None,
+        prompt_name: str | None = None,
     ) -> object:
-        encode_kwargs = self._encode_kwargs(task)
+        encode_kwargs = self._encode_kwargs(task, prompt_name=prompt_name)
         try:
             return self.model.encode(
                 texts,
@@ -1155,11 +1185,23 @@ class VectorStore:
         )
 
     @staticmethod
-    def _encode_kwargs(task: str | None) -> dict[str, str]:
+    def _encode_kwargs(
+        task: str | None,
+        prompt_name: str | None = None,
+    ) -> dict[str, str]:
         task = (task or "").strip()
-        if not task:
-            return {}
-        return {"task": task, "prompt_name": task}
+        prompt_name = (prompt_name or "").strip()
+        if task == "retrieval.query" and not prompt_name:
+            return {"task": "retrieval", "prompt_name": "query"}
+        if task == "retrieval.passage" and not prompt_name:
+            return {"task": "retrieval", "prompt_name": "document"}
+
+        kwargs: dict[str, str] = {}
+        if task:
+            kwargs["task"] = task
+        if prompt_name:
+            kwargs["prompt_name"] = prompt_name
+        return kwargs
 
     def _move_model_to_cpu(self) -> None:
         if self._model is not None and hasattr(self._model, "to"):

@@ -134,11 +134,12 @@ must update their password before using app features.
 For restricted networks, configure runtime proxy or mirror values in `.env`.
 Docker daemon proxy settings only affect image pulls, not running containers.
 
-RAG retrieval uses Jina embeddings v3 by default:
-`EMBEDDING_MODEL=jinaai/jina-embeddings-v3`,
+RAG retrieval uses Jina embeddings v5 text small by default:
+`EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-small`,
 `EMBEDDING_TRUST_REMOTE_CODE=1`, `CHUNK_SIZE=2000`,
-`CHUNK_OVERLAP=300`, query embeddings use `retrieval.query`, document chunks
-use `retrieval.passage`, and intent-routing embeddings use `classification`.
+`CHUNK_OVERLAP=300`, query embeddings use `retrieval` with prompt `query`,
+document chunks use `retrieval` with prompt `document`, and intent-routing
+embeddings use `classification`.
 Hybrid recall runs before reranking: BM25 recalls `BM25_TOP_K` keyword
 candidates from Markdown chunks, Qdrant recalls `RECALL_TOP_K`
 cosine-similarity candidates, reciprocal rank fusion keeps `RRF_TOP_K`

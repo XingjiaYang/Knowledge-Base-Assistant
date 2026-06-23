@@ -27,8 +27,8 @@ Compose profile 保留。
 - 管理员可以在前端创建用户、删除用户、重置密码、切换管理员权限、清空用户会话。
 - 管理员可以上传 CSV 批量创建用户；CSV 必须只有两列，表头必须为 `email,passwd`。
 - 支持 OpenAI-compatible、Anthropic 和可选本地 vLLM。
-- 默认使用 `jinaai/jina-embeddings-v3`，并为查询、文档和意图分类分别使用
-  `retrieval.query`、`retrieval.passage` 和 `classification` task。
+- 默认使用 `jinaai/jina-embeddings-v5-text-small`，并为查询、文档和意图分类分别使用
+  `retrieval` task + `query`/`document` prompt，以及 `classification` task。
 - Markdown 语料可替换，当前语料的关键词提示集中在意图路由 keyword 层。
 - 前端支持多会话、BM25 K、Cosine K、RRF K、Final K 调整、引用展示和路由结果展示。
 - 对话历史保存在后端，只在估算 prompt 接近当前 LLM 上下文窗口时才压缩成
@@ -68,7 +68,7 @@ Answer + retrieved references + compacted conversation memory
   tagged LLM fallback 意图路由。
 - `app/rag.py`：混合召回、RRF 融合、重排、prompt 构造、基于上下文预算的历史压缩。
 - `app/reranker.py`：启动时预加载 Jina cross-encoder，并对召回 chunk 重排。
-- `app/vector_store.py`：Markdown 切块、Jina embeddings v3 task 路由、BM25
+- `app/vector_store.py`：Markdown 切块、Jina embeddings v5 task 路由、BM25
   索引、Qdrant collection 管理、向量搜索和 RRF 融合。
 - `app/llm_client.py`：不同 LLM provider 的请求封装。
 - `scripts/`：ingest、服务启动、smoke test 和 intent-router A/B 评估脚本。
@@ -193,11 +193,14 @@ AUTH_DEFAULT_ADMIN_PASSWORD=123456
 AUTH_BOOTSTRAP_USERS=
 
 QDRANT_COLLECTION=tech_docs
-EMBEDDING_MODEL=jinaai/jina-embeddings-v3
+EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-small
 EMBEDDING_TRUST_REMOTE_CODE=1
-EMBEDDING_QUERY_TASK=retrieval.query
-EMBEDDING_PASSAGE_TASK=retrieval.passage
+EMBEDDING_QUERY_TASK=retrieval
+EMBEDDING_PASSAGE_TASK=retrieval
 EMBEDDING_CLASSIFICATION_TASK=classification
+EMBEDDING_QUERY_PROMPT_NAME=query
+EMBEDDING_PASSAGE_PROMPT_NAME=document
+EMBEDDING_CLASSIFICATION_PROMPT_NAME=
 BM25_TOP_K=100
 RECALL_TOP_K=100
 RRF_TOP_K=100
@@ -236,9 +239,9 @@ WAIT_FOR_LLM=0
 `RETRIEVE_TOP_K` 个 chunk 进入 LLM prompt 和引用列表。前端对应控件为 `BM25 K`、
 `Cosine K`、`RRF K` 和 `Final K`，默认分别为 `100`、`100`、`100` 和 `5`。
 `/health/details` 会返回当前生效的默认值，前端登录后用这些值初始化四个控件。
-默认 embedding 模型是 `jinaai/jina-embeddings-v3`。文档 chunk 使用
-`retrieval.passage`，检索 query 使用 `retrieval.query`，意图路由第二层使用
-`classification`。Jina encoder 有有限 token 窗口，因此第二层只使用有界的最近
+默认 embedding 模型是 `jinaai/jina-embeddings-v5-text-small`。文档 chunk 和
+检索 query 都使用 `retrieval` task，并分别使用 `document` 和 `query` prompt；
+意图路由第二层使用 `classification`。Jina encoder 有有限 token 窗口，因此第二层只使用有界的最近
 history 和 summary 视图，不会直接把 256K 级别的主 summary 整段喂给 encoder。
 这些 intent 预算目前是字符级保护；如果 encoder 仍然报错，router 会跳过第二层并
 进入 LLM classifier，而不是让请求失败。
@@ -265,6 +268,7 @@ summary + 未压缩 history，并在扣除输出、当前 query、安全余量�
 `CUDA=TRUE` 是默认值，Jina embedding 模型和 Jina reranker 会在 PyTorch 能看到
 兼容 NVIDIA GPU 时优先使用 CUDA；如果 CUDA 不可见或模型迁移到 GPU 失败，会
 记录日志并回退到 CPU。设置 `CUDA=FALSE` 可强制全部使用 CPU。
+默认 API 镜像使用 PyTorch CUDA runtime 镜像，不需要在宿主机安装 CUDA toolkit。
 `RERANKER_PRELOAD=1` 时 API 会在启动阶段加载并预热 reranker，模型下载或加载
 错误会被记录为显式降级，服务仍会继续启动；运行时 reranker 失败时也会跳过精排，
 把未重排的 RRF 粗排结果按 `Final K` 直接交给 LLM。代码使用 Jina 模型原生的
@@ -460,14 +464,14 @@ DOCKER_NO_PROXY=postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.
 
 ```text
 models/
-  jina-embeddings-v3/
+  jina-embeddings-v5-text-small/
   qwen2.5-7b-instruct/
 ```
 
 然后配置：
 
 ```bash
-EMBEDDING_MODEL=/models/jina-embeddings-v3
+EMBEDDING_MODEL=/models/jina-embeddings-v5-text-small
 EMBEDDING_TRUST_REMOTE_CODE=1
 VLLM_MODEL=/models/qwen2.5-7b-instruct
 LLM_MODEL=qwen2.5-7b-instruct

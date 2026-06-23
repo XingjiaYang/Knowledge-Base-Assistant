@@ -64,6 +64,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        API_BASE_IMAGE: ${API_BASE_IMAGE:-pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime}
     restart: unless-stopped
     depends_on:
       - qdrant
@@ -78,11 +80,14 @@ services:
       CUDA: ${CUDA:-TRUE}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-tech_docs}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-jinaai/jina-embeddings-v3}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-jinaai/jina-embeddings-v5-text-small}
       EMBEDDING_TRUST_REMOTE_CODE: ${EMBEDDING_TRUST_REMOTE_CODE:-1}
-      EMBEDDING_QUERY_TASK: ${EMBEDDING_QUERY_TASK:-retrieval.query}
-      EMBEDDING_PASSAGE_TASK: ${EMBEDDING_PASSAGE_TASK:-retrieval.passage}
+      EMBEDDING_QUERY_TASK: ${EMBEDDING_QUERY_TASK:-retrieval}
+      EMBEDDING_PASSAGE_TASK: ${EMBEDDING_PASSAGE_TASK:-retrieval}
       EMBEDDING_CLASSIFICATION_TASK: ${EMBEDDING_CLASSIFICATION_TASK:-classification}
+      EMBEDDING_QUERY_PROMPT_NAME: ${EMBEDDING_QUERY_PROMPT_NAME:-query}
+      EMBEDDING_PASSAGE_PROMPT_NAME: ${EMBEDDING_PASSAGE_PROMPT_NAME:-document}
+      EMBEDDING_CLASSIFICATION_PROMPT_NAME: ${EMBEDDING_CLASSIFICATION_PROMPT_NAME:-}
       CHUNK_SIZE: ${CHUNK_SIZE:-2000}
       CHUNK_OVERLAP: ${CHUNK_OVERLAP:-300}
       BM25_TOP_K: ${BM25_TOP_K:-100}

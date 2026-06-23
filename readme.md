@@ -27,9 +27,8 @@ boundaries that should be updated when `data/docs/` is replaced.
 
 - Docker Compose deployment for PostgreSQL, Qdrant, document ingestion, and FastAPI.
 - Configurable cloud LLM providers with an optional local vLLM profile.
-- Jina embeddings v3 by default, with separate retrieval-query,
-  retrieval-passage, and classification tasks for bilingual retrieval and
-  intent routing.
+- Jina embeddings v5 text small by default, with task/prompt routing for
+  retrieval-query, retrieval-passage, and classification embeddings.
 - Replaceable Markdown corpus with isolated keyword hints for the bundled
   domain.
 - Chat-style web UI at `/` with adjustable BM25, cosine, RRF, and final context
@@ -84,7 +83,7 @@ Main modules:
   context-budget-aware history compaction.
 - `app/reranker.py`: startup-preloaded Jina cross-encoder reranking for
   recalled chunks.
-- `app/vector_store.py`: Markdown chunking, Jina embeddings v3 task routing,
+- `app/vector_store.py`: Markdown chunking, Jina embeddings v5 task routing,
   BM25 indexing, Qdrant collection management, vector search, and RRF fusion.
 - `app/llm_client.py`: provider-aware client for cloud APIs or local vLLM.
 - `scripts/`: manual service, ingest, retrieval smoke-test, and intent-router
@@ -264,11 +263,14 @@ SESSION_LIST_LIMIT=50
 SESSION_TITLE_MAX_CHARS=80
 
 QDRANT_COLLECTION=tech_docs
-EMBEDDING_MODEL=jinaai/jina-embeddings-v3
+EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-small
 EMBEDDING_TRUST_REMOTE_CODE=1
-EMBEDDING_QUERY_TASK=retrieval.query
-EMBEDDING_PASSAGE_TASK=retrieval.passage
+EMBEDDING_QUERY_TASK=retrieval
+EMBEDDING_PASSAGE_TASK=retrieval
 EMBEDDING_CLASSIFICATION_TASK=classification
+EMBEDDING_QUERY_PROMPT_NAME=query
+EMBEDDING_PASSAGE_PROMPT_NAME=document
+EMBEDDING_CLASSIFICATION_PROMPT_NAME=
 BM25_TOP_K=100
 RECALL_TOP_K=100
 RRF_TOP_K=100
@@ -318,14 +320,14 @@ LLM chat requests retry transient provider errors (`429`, `502`, `503`, `504`)
 with exponential backoff. Keep `DEBUG=0` outside local development so API errors
 return generic messages while details stay in server logs.
 
-The default embedding model is `jinaai/jina-embeddings-v3` with
-`trust_remote_code` enabled. Document chunks are encoded with
-`retrieval.passage`, search queries with `retrieval.query`, and the second
-intent-router layer with the `classification` task. Because the model has a
-finite token window, the intent layer uses bounded recent history and summary
-views rather than the full API-scale conversation summary. These intent budgets
-are character-based safeguards; if the encoder still raises, the router falls
-through to the LLM classifier instead of failing the request.
+The default embedding model is `jinaai/jina-embeddings-v5-text-small` with
+`trust_remote_code` enabled. Document chunks and search queries both use the
+`retrieval` task, with `document` and `query` prompt names respectively; the
+second intent-router layer uses the `classification` task. Because the model
+has a finite token window, the intent layer uses bounded recent history and
+summary views rather than the full API-scale conversation summary. These intent
+budgets are character-based safeguards; if the encoder still raises, the router
+falls through to the LLM classifier instead of failing the request.
 
 Intent routing is state-aware without feeding all history to every layer. The
 first keyword layer routes general technical/database topics outside the local
@@ -365,8 +367,9 @@ results before fusion. `/health/details` returns the active defaults so the UI
 can initialize all four controls after login. With `CUDA=TRUE` (the default),
 the Jina embedding model and Jina reranker prefer CUDA when PyTorch can see a
 compatible NVIDIA GPU; if CUDA is not visible or model placement fails, they
-log the fallback and continue on CPU. Set `CUDA=FALSE` to force CPU. With
-`RERANKER_PRELOAD=1`, the API loads
+log the fallback and continue on CPU. Set `CUDA=FALSE` to force CPU.
+The default API image uses the PyTorch CUDA runtime image, so no host CUDA
+toolkit install is required. With `RERANKER_PRELOAD=1`, the API loads
 and warms the reranker during startup through Jina's native
 `AutoModel.rerank()` interface. If reranker warmup or runtime reranking fails,
 the service continues and feeds the unre-ranked RRF results to the LLM using
@@ -499,14 +502,14 @@ You can mount local model directories through `./models:/models:ro`:
 
 ```text
 models/
-  jina-embeddings-v3/
+  jina-embeddings-v5-text-small/
   qwen2.5-7b-instruct/
 ```
 
 Then configure:
 
 ```bash
-EMBEDDING_MODEL=/models/jina-embeddings-v3
+EMBEDDING_MODEL=/models/jina-embeddings-v5-text-small
 EMBEDDING_TRUST_REMOTE_CODE=1
 VLLM_MODEL=/models/qwen2.5-7b-instruct
 LLM_MODEL=qwen2.5-7b-instruct
