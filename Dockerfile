@@ -1,18 +1,18 @@
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1
+ARG API_BASE_IMAGE=pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime
+FROM ${API_BASE_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_DEFAULT_TIMEOUT=300 \
+    PIP_RETRIES=20
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY requirements.api.txt .
-RUN pip install --upgrade pip \
-    && pip install -r requirements.api.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --break-system-packages -r requirements.api.txt
 
 COPY app ./app
 COPY scripts ./scripts

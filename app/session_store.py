@@ -71,6 +71,10 @@ class StoredChatMessage:
     used_rag: bool | None
     route: str
     route_reason: str
+    retrieval_degraded: bool
+    qdrant_degraded: bool
+    reranker_degraded: bool
+    degradation_reason: str
     created_at: datetime
 
 
@@ -79,6 +83,7 @@ class LLMSettingsRecord:
     provider: str
     base_url: str
     model: str
+    context_max_tokens: int
     api_key_configured: bool
     source: str
 
@@ -190,8 +195,36 @@ class SessionStore:
                         used_rag BOOLEAN,
                         route TEXT NOT NULL DEFAULT '',
                         route_reason TEXT NOT NULL DEFAULT '',
+                        retrieval_degraded BOOLEAN NOT NULL DEFAULT FALSE,
+                        qdrant_degraded BOOLEAN NOT NULL DEFAULT FALSE,
+                        reranker_degraded BOOLEAN NOT NULL DEFAULT FALSE,
+                        degradation_reason TEXT NOT NULL DEFAULT '',
                         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                     )
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS retrieval_degraded BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS qdrant_degraded BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS reranker_degraded BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS degradation_reason TEXT NOT NULL DEFAULT ''
                     """
                 )
                 cur.execute(
@@ -623,6 +656,7 @@ class SessionStore:
                 "llm_base_url",
                 "llm_api_key",
                 "llm_model",
+                "llm_context_max_tokens",
             ]
         )
         return LLMRuntimeSettings.from_settings(
@@ -631,6 +665,7 @@ class SessionStore:
             base_url=values.get("llm_base_url"),
             api_key=values.get("llm_api_key"),
             model=values.get("llm_model"),
+            context_max_tokens=values.get("llm_context_max_tokens"),
         ).validate()
 
     def get_llm_settings_record(self) -> LLMSettingsRecord:
@@ -640,6 +675,7 @@ class SessionStore:
                 "llm_base_url",
                 "llm_api_key",
                 "llm_model",
+                "llm_context_max_tokens",
             ]
         )
         runtime = LLMRuntimeSettings.from_settings(
@@ -648,11 +684,13 @@ class SessionStore:
             base_url=values.get("llm_base_url"),
             api_key=values.get("llm_api_key"),
             model=values.get("llm_model"),
+            context_max_tokens=values.get("llm_context_max_tokens"),
         ).validate()
         return LLMSettingsRecord(
             provider=runtime.llm_provider,
             base_url=runtime.llm_base_url,
             model=runtime.llm_model,
+            context_max_tokens=runtime.llm_context_max_tokens,
             api_key_configured=bool(runtime.llm_api_key),
             source="database" if values else ".env",
         )
@@ -663,6 +701,7 @@ class SessionStore:
         base_url: str,
         model: str,
         api_key: str | None = None,
+        context_max_tokens: int | None = None,
     ) -> LLMSettingsRecord:
         provider = normalize_llm_provider(provider)
         base_url = base_url.strip()
@@ -674,12 +713,18 @@ class SessionStore:
             base_url=base_url,
             api_key=current.llm_api_key if api_key is None else api_key.strip(),
             model=model,
+            context_max_tokens=(
+                current.llm_context_max_tokens
+                if context_max_tokens is None
+                else context_max_tokens
+            ),
         ).validate()
 
         values = {
             "llm_provider": runtime.llm_provider,
             "llm_base_url": runtime.llm_base_url,
             "llm_model": runtime.llm_model,
+            "llm_context_max_tokens": str(runtime.llm_context_max_tokens),
         }
         if api_key is not None:
             values["llm_api_key"] = runtime.llm_api_key
@@ -837,6 +882,10 @@ class SessionStore:
                        used_rag,
                        route,
                        route_reason,
+                       retrieval_degraded,
+                       qdrant_degraded,
+                       reranker_degraded,
+                       degradation_reason,
                        created_at
                 FROM chat_messages
                 WHERE session_id = %s
@@ -854,7 +903,11 @@ class SessionStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT role, content
+                SELECT role,
+                       content,
+                       contexts,
+                       used_rag,
+                       route
                 FROM chat_messages
                 WHERE session_id = %s
                 ORDER BY id
@@ -863,11 +916,23 @@ class SessionStore:
                 (session_id, compacted_message_count),
             ).fetchall()
 
-        return [
-            ChatMessage(role=row["role"], content=row["content"])
-            for row in rows
-            if row["role"] in {"user", "assistant"}
-        ]
+        messages: list[ChatMessage] = []
+        for row in rows:
+            if row["role"] not in {"user", "assistant"}:
+                continue
+            contexts = row["contexts"] or []
+            if isinstance(contexts, str):
+                contexts = json.loads(contexts)
+            messages.append(
+                ChatMessage(
+                    role=row["role"],
+                    content=row["content"],
+                    used_rag=row["used_rag"],
+                    route=row["route"] or "",
+                    context_count=len(contexts),
+                )
+            )
+        return messages
 
     def append_message(
         self,
@@ -878,6 +943,10 @@ class SessionStore:
         used_rag: bool | None = None,
         route: str = "",
         route_reason: str = "",
+        retrieval_degraded: bool = False,
+        qdrant_degraded: bool = False,
+        reranker_degraded: bool = False,
+        degradation_reason: str = "",
     ) -> StoredChatMessage:
         context_payload = [
             search_result_to_dict(context)
@@ -893,9 +962,13 @@ class SessionStore:
                     contexts,
                     used_rag,
                     route,
-                    route_reason
+                    route_reason,
+                    retrieval_degraded,
+                    qdrant_degraded,
+                    reranker_degraded,
+                    degradation_reason
                 )
-                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id,
                           role,
                           content,
@@ -903,6 +976,10 @@ class SessionStore:
                           used_rag,
                           route,
                           route_reason,
+                          retrieval_degraded,
+                          qdrant_degraded,
+                          reranker_degraded,
+                          degradation_reason,
                           created_at
                 """,
                 (
@@ -913,6 +990,10 @@ class SessionStore:
                     used_rag,
                     route,
                     route_reason,
+                    retrieval_degraded,
+                    qdrant_degraded,
+                    reranker_degraded,
+                    degradation_reason,
                 ),
             ).fetchone()
         return chat_message_from_row(row)
@@ -1126,6 +1207,10 @@ def chat_message_from_row(row: dict[str, Any]) -> StoredChatMessage:
         used_rag=row["used_rag"],
         route=row["route"] or "",
         route_reason=row["route_reason"] or "",
+        retrieval_degraded=bool(row["retrieval_degraded"]),
+        qdrant_degraded=bool(row["qdrant_degraded"]),
+        reranker_degraded=bool(row["reranker_degraded"]),
+        degradation_reason=row["degradation_reason"] or "",
         created_at=row["created_at"],
     )
 

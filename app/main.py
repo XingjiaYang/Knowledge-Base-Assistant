@@ -18,7 +18,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.config import settings
 from app.llm_client import LLMClient
-from app.rag import RAGPipeline
+from app.rag import RAGPipeline, RAGTimings
 from app.reranker import Reranker
 from app.security import bearer_token
 from app.session_store import (
@@ -46,7 +46,14 @@ async def lifespan(_app: FastAPI):
     )
     _app.state.reranker = Reranker(settings)
     if settings.reranker_enabled and settings.reranker_preload:
-        await asyncio.to_thread(_app.state.reranker.warmup)
+        try:
+            await asyncio.to_thread(_app.state.reranker.warmup)
+        except Exception:
+            logger.exception(
+                "Startup degraded: retrieval_degraded=True "
+                "qdrant_degraded=False reranker_degraded=True "
+                "fallback=rrf_or_bm25_top_k."
+            )
     _app.state.rag_pipeline = RAGPipeline(
         settings,
         vector_store=_app.state.vector_store,
@@ -136,6 +143,7 @@ class RAGRequest(BaseModel):
         ge=1,
         le=settings.api_recall_top_k_max,
     )
+    rag_only: bool = False
     history: list[ChatMessageRequest] = Field(
         default_factory=list,
         max_length=settings.api_history_max_messages,
@@ -186,6 +194,46 @@ class ContextResponse(BaseModel):
         )
 
 
+class TimingResponse(BaseModel):
+    total_ms: float = 0.0
+    history_ms: float = 0.0
+    intent_ms: float = 0.0
+    retrieval_ms: float = 0.0
+    recall_ms: float = 0.0
+    bm25_ms: float = 0.0
+    vector_ms: float = 0.0
+    embedding_ms: float = 0.0
+    qdrant_ms: float = 0.0
+    rrf_ms: float = 0.0
+    reranker_ms: float = 0.0
+    llm_ms: float = 0.0
+    llm_ttft_ms: float | None = None
+    llm_output_chars: int = 0
+    llm_estimated_output_tokens: int = 0
+    llm_estimated_tps: float = 0.0
+
+    @classmethod
+    def from_timings(cls, timings: RAGTimings) -> "TimingResponse":
+        return cls(
+            total_ms=timings.total_ms,
+            history_ms=timings.history_ms,
+            intent_ms=timings.intent_ms,
+            retrieval_ms=timings.retrieval_ms,
+            recall_ms=timings.recall_ms,
+            bm25_ms=timings.bm25_ms,
+            vector_ms=timings.vector_ms,
+            embedding_ms=timings.embedding_ms,
+            qdrant_ms=timings.qdrant_ms,
+            rrf_ms=timings.rrf_ms,
+            reranker_ms=timings.reranker_ms,
+            llm_ms=timings.llm_ms,
+            llm_ttft_ms=timings.llm_ttft_ms,
+            llm_output_chars=timings.llm_output_chars,
+            llm_estimated_output_tokens=timings.llm_estimated_output_tokens,
+            llm_estimated_tps=timings.llm_estimated_tps,
+        )
+
+
 class RAGResponse(BaseModel):
     answer: str
     session_id: str | None = None
@@ -195,6 +243,11 @@ class RAGResponse(BaseModel):
     used_rag: bool
     route: str
     route_reason: str
+    retrieval_degraded: bool = False
+    qdrant_degraded: bool = False
+    reranker_degraded: bool = False
+    degradation_reason: str = ""
+    timings: TimingResponse = Field(default_factory=TimingResponse)
 
 
 class UserResponse(BaseModel):
@@ -284,6 +337,7 @@ class AdminLLMSettingsResponse(BaseModel):
     provider: str
     base_url: str
     model: str
+    context_max_tokens: int
     api_key_configured: bool
     source: str
 
@@ -293,6 +347,7 @@ class AdminLLMSettingsResponse(BaseModel):
             provider=record.provider,
             base_url=record.base_url,
             model=record.model,
+            context_max_tokens=record.context_max_tokens,
             api_key_configured=record.api_key_configured,
             source=record.source,
         )
@@ -302,6 +357,7 @@ class AdminLLMSettingsUpdateRequest(BaseModel):
     provider: Literal["openai_compatible", "anthropic"]
     base_url: str = Field(..., min_length=1, max_length=2000)
     model: str = Field(..., min_length=1, max_length=300)
+    context_max_tokens: int | None = Field(default=None, ge=4096, le=2_000_000)
     api_key: str | None = Field(default=None, max_length=10000)
 
 
@@ -346,6 +402,10 @@ class StoredMessageResponse(BaseModel):
     used_rag: bool | None = None
     route: str = ""
     route_reason: str = ""
+    retrieval_degraded: bool = False
+    qdrant_degraded: bool = False
+    reranker_degraded: bool = False
+    degradation_reason: str = ""
     created_at: str
 
     @classmethod
@@ -358,6 +418,10 @@ class StoredMessageResponse(BaseModel):
             used_rag=message.used_rag,
             route=message.route,
             route_reason=message.route_reason,
+            retrieval_degraded=message.retrieval_degraded,
+            qdrant_degraded=message.qdrant_degraded,
+            reranker_degraded=message.reranker_degraded,
+            degradation_reason=message.degradation_reason,
             created_at=message.created_at.isoformat(),
         )
 
@@ -668,6 +732,7 @@ async def admin_update_llm_settings(
             update_request.base_url,
             update_request.model,
             update_request.api_key,
+            update_request.context_max_tokens,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -771,10 +836,20 @@ async def health_details(request: Request) -> dict[str, object]:
         "llm_provider": llm_settings.provider,
         "llm_base_url": llm_settings.base_url,
         "llm_model": llm_settings.model,
+        "llm_context_max_tokens": llm_settings.context_max_tokens,
+        "llm_context_safety_margin_tokens": settings.llm_context_safety_margin_tokens,
+        "llm_context_prompt_overhead_tokens": settings.llm_context_prompt_overhead_tokens,
         "llm_api_key_configured": llm_settings.api_key_configured,
         "llm_settings_source": llm_settings.source,
         "llm_max_tokens": settings.llm_max_tokens,
         "cuda_enabled": settings.cuda_enabled,
+        "embedding_model": settings.embedding_model,
+        "embedding_query_task": settings.embedding_query_task,
+        "embedding_passage_task": settings.embedding_passage_task,
+        "embedding_classification_task": settings.embedding_classification_task,
+        "embedding_query_prompt_name": settings.embedding_query_prompt_name,
+        "embedding_passage_prompt_name": settings.embedding_passage_prompt_name,
+        "embedding_classification_prompt_name": settings.embedding_classification_prompt_name,
         "bm25_top_k": settings.bm25_top_k,
         "recall_top_k": settings.recall_top_k,
         "rrf_top_k": settings.rrf_top_k,
@@ -823,6 +898,7 @@ async def rag(
             rrf_top_k=rag_request.rrf_top_k,
             history=history,
             conversation_summary=conversation_summary,
+            rag_only=rag_request.rag_only,
         )
     except UnexpectedResponse as exc:
         logger.exception("Vector store request failed during RAG.")
@@ -858,6 +934,10 @@ async def rag(
         result.used_rag,
         result.route,
         result.route_reason,
+        result.retrieval_degraded,
+        result.qdrant_degraded,
+        result.reranker_degraded,
+        result.degradation_reason,
     )
     session = await asyncio.to_thread(
         session_store.update_chat_session_after_answer,
@@ -878,6 +958,11 @@ async def rag(
         used_rag=result.used_rag,
         route=result.route,
         route_reason=result.route_reason,
+        retrieval_degraded=result.retrieval_degraded,
+        qdrant_degraded=result.qdrant_degraded,
+        reranker_degraded=result.reranker_degraded,
+        degradation_reason=result.degradation_reason,
+        timings=TimingResponse.from_timings(result.timings),
     )
 
 

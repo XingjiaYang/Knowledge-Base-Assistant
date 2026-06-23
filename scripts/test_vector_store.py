@@ -22,6 +22,9 @@ from app.vector_store import SearchResult, VectorStore
 
 
 class FakeEmbeddingModel:
+    def __init__(self) -> None:
+        self.encode_kwargs: list[dict[str, object]] = []
+
     def get_embedding_dimension(self) -> int:
         return 2
 
@@ -29,7 +32,9 @@ class FakeEmbeddingModel:
         self,
         texts: str | list[str],
         normalize_embeddings: bool = True,
+        **kwargs: object,
     ) -> np.ndarray:
+        self.encode_kwargs.append(dict(kwargs))
         if isinstance(texts, str):
             return np.asarray([1.0, 0.0], dtype=np.float32)
         return np.asarray([[1.0, 0.0] for _ in texts], dtype=np.float32)
@@ -37,6 +42,7 @@ class FakeEmbeddingModel:
 
 class FakeRuntimeCudaEmbeddingModel(FakeEmbeddingModel):
     def __init__(self, device: str = "cpu") -> None:
+        super().__init__()
         self.device = device
         self.devices = [device]
         self.calls = 0
@@ -50,11 +56,16 @@ class FakeRuntimeCudaEmbeddingModel(FakeEmbeddingModel):
         self,
         texts: str | list[str],
         normalize_embeddings: bool = True,
+        **kwargs: object,
     ) -> np.ndarray:
         self.calls += 1
         if self.device == "cuda":
             raise RuntimeError("CUDA encode failed")
-        return super().encode(texts, normalize_embeddings=normalize_embeddings)
+        return super().encode(
+            texts,
+            normalize_embeddings=normalize_embeddings,
+            **kwargs,
+        )
 
 
 class CountingQdrantClient(QdrantClient):
@@ -257,7 +268,7 @@ def assert_embedding_model_respects_cpu_override() -> None:
     finally:
         vector_store_module.SentenceTransformer = original_sentence_transformer
 
-    if calls != [{"device": "cpu"}]:
+    if calls != [{"device": "cpu", "trust_remote_code": True}]:
         raise AssertionError(f"Embedding model should load on CPU override: {calls}")
 
     print("Embedding model CPU override -> ok")
@@ -293,6 +304,38 @@ def assert_embedding_encode_falls_back_to_cpu_on_cuda_failure() -> None:
         raise AssertionError("Embedding encode should retry exactly once.")
 
     print("Embedding CUDA encode fallback -> ok")
+
+
+def assert_jina_embedding_tasks_are_routed_by_use_case() -> None:
+    model = FakeEmbeddingModel()
+    store = VectorStore(
+        Settings(
+            embedding_query_task="retrieval",
+            embedding_passage_task="retrieval",
+            embedding_classification_task="classification",
+            embedding_query_prompt_name="query",
+            embedding_passage_prompt_name="document",
+        ),
+        model=model,
+    )
+
+    _ = store._embed_one("query")
+    _ = store.encode("intent text")
+    _ = store._encode(
+        ["chunk text"],
+        task=store.config.embedding_passage_task,
+        prompt_name=store.config.embedding_passage_prompt_name,
+    )
+
+    expected = [
+        {"task": "retrieval", "prompt_name": "query"},
+        {"task": "classification"},
+        {"task": "retrieval", "prompt_name": "document"},
+    ]
+    if model.encode_kwargs != expected:
+        raise AssertionError(f"Embedding task routing mismatch: {model.encode_kwargs}")
+
+    print("Jina embedding task routing -> ok")
 
 
 def assert_collection_setup_avoids_redundant_indexes() -> None:
@@ -495,6 +538,7 @@ def main() -> None:
     assert_vector_store_lazy_loads_once_under_concurrency()
     assert_embedding_model_respects_cpu_override()
     assert_embedding_encode_falls_back_to_cpu_on_cuda_failure()
+    assert_jina_embedding_tasks_are_routed_by_use_case()
     assert_collection_setup_avoids_redundant_indexes()
     assert_ingest_streams_files_and_skips_recreate_deletes()
     assert_search_score_threshold()

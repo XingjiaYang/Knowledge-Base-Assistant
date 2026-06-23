@@ -1,10 +1,10 @@
 // Admin dashboard: list users, create, CSV import, toggle role, reset
 // password, clear chat data, and delete users.
 
-import { state, on, emit } from "../store.js?v=20260617-hybrid-retrieval";
-import { api } from "../api.js?v=20260617-hybrid-retrieval";
-import { byId, el, clear, icon } from "../dom.js?v=20260617-hybrid-retrieval";
-import { loadSessions } from "./sessions.js?v=20260617-hybrid-retrieval";
+import { state, on, emit } from "../store.js?v=20260620-rag-only";
+import { api } from "../api.js?v=20260620-rag-only";
+import { byId, el, clear, icon } from "../dom.js?v=20260620-rag-only";
+import { loadSessions } from "./sessions.js?v=20260620-rag-only";
 
 let els = {};
 
@@ -32,6 +32,7 @@ export function mountAdmin() {
     llmProvider: byId("adminLlmProvider"),
     llmBaseUrl: byId("adminLlmBaseUrl"),
     llmModel: byId("adminLlmModel"),
+    llmContextMaxTokens: byId("adminLlmContextMaxTokens"),
     llmApiKey: byId("adminLlmApiKey"),
     llmStatus: byId("adminLlmSettingsStatus"),
     error: byId("adminError"),
@@ -124,10 +125,18 @@ async function onSaveLLMSettings(event) {
     base_url: els.llmBaseUrl.value.trim(),
     model: els.llmModel.value.trim(),
   };
+  const contextMaxTokens = Number.parseInt(els.llmContextMaxTokens.value, 10);
+  if (Number.isFinite(contextMaxTokens)) {
+    payload.context_max_tokens = contextMaxTokens;
+  }
   const apiKey = els.llmApiKey.value.trim();
   if (apiKey) payload.api_key = apiKey;
   if (!payload.base_url || !payload.model) {
     setAlert(els.llmStatus, "API URL and model are required.", "error");
+    return;
+  }
+  if (!payload.context_max_tokens || payload.context_max_tokens < 4096) {
+    setAlert(els.llmStatus, "Context max tokens must be at least 4096.", "error");
     return;
   }
   try {
@@ -209,6 +218,7 @@ function renderLLMSettings() {
   els.llmProvider.value = settings.provider || "openai_compatible";
   els.llmBaseUrl.value = settings.base_url || "";
   els.llmModel.value = settings.model || "";
+  els.llmContextMaxTokens.value = settings.context_max_tokens || 256000;
   const keyState = settings.api_key_configured ? "key configured" : "no key configured";
   setAlert(
     els.llmStatus,

@@ -145,6 +145,9 @@ class LLMClient:
             return False
         return True
 
+    def runtime_settings(self) -> LLMRuntimeSettings:
+        return self._active_config()
+
     def _active_config(self) -> LLMRuntimeSettings:
         if self.runtime_settings_provider is not None:
             return self.runtime_settings_provider().validate()

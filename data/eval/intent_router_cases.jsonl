@@ -1,0 +1,50 @@
+{"id":"rag_domain_menu","category":"domain_rag","expected_use_rag":true,"question":"家是本菜单价格有哪些争议？"}
+{"id":"rag_domain_finance","category":"domain_rag","expected_use_rag":true,"question":"朱剑秋的三年千店计划财务上有什么风险？"}
+{"id":"rag_domain_meme","category":"domain_rag","expected_use_rag":true,"question":"巨大历史机遇和巨大历史鲫鱼是什么梗？"}
+{"id":"rag_domain_bilibili","category":"domain_rag","expected_use_rag":true,"question":"B站评论里大家怎么评价勇哥连线？"}
+{"id":"rag_domain_reviews","category":"domain_rag","expected_use_rag":true,"question":"家是本顾客差评主要集中在哪些方面？"}
+{"id":"rag_domain_song","category":"domain_rag","expected_use_rag":true,"question":"家是本之歌歌词体现了什么品牌叙事？"}
+{"id":"rag_domain_timeline","category":"domain_rag","expected_use_rag":true,"question":"按时间线梳理朱剑秋和勇哥连线事件。"}
+{"id":"rag_domain_slogan_photo","category":"domain_rag","expected_use_rag":true,"question":"春熙路门店照片里的红色大字标语为什么会传播？"}
+{"id":"rag_explicit_docs_sqlite","category":"explicit_rag","expected_use_rag":true,"question":"基于文档回答：SQLite 适合什么场景？"}
+{"id":"rag_explicit_cite","category":"explicit_rag","expected_use_rag":true,"question":"请查知识库并带引用说明菜单定价。"}
+{"id":"rag_followup_menu","category":"followup_rag","expected_use_rag":true,"question":"那葱油饼的定价呢？","history":[{"role":"user","content":"我们刚才在看家是本的菜单。"},{"role":"assistant","content":"菜单里包括老妈蹄花和葱油饼等项目。"}]}
+{"id":"rag_followup_finance","category":"followup_rag","expected_use_rag":true,"question":"这个亏损测算怎么来的？","history":[{"role":"user","content":"分析一下家是本的财务模拟。"},{"role":"assistant","content":"核心变量包括租金、客流、客单价和毛利率。"}]}
+{"id":"rag_followup_summary","category":"followup_rag","expected_use_rag":true,"question":"这个扩张计划最危险的假设是什么？","summary":"The user is discussing the local corpus about 家是本, 朱剑秋, and the three-year thousand-store expansion plan."}
+{"id":"rag_domain_profile","category":"domain_rag","expected_use_rag":true,"question":"朱剑秋的人物画像是什么？"}
+{"id":"rag_domain_social_archive","category":"domain_rag","expected_use_rag":true,"question":"社媒档案里豆包视频起到了什么作用？"}
+{"id":"rag_domain_brand","category":"domain_rag","expected_use_rag":true,"question":"家是本的家文化口号和品牌定位有什么矛盾？"}
+{"id":"direct_greeting","category":"direct_chat","expected_use_rag":false,"question":"你好，今天怎么样？"}
+{"id":"direct_thanks","category":"direct_chat","expected_use_rag":false,"question":"谢谢你刚才的帮助。"}
+{"id":"direct_translate","category":"direct_task","expected_use_rag":false,"question":"把这句话翻译成英文：今天晚上一起吃饭。"}
+{"id":"direct_poem","category":"direct_task","expected_use_rag":false,"question":"写一首关于春天的短诗。"}
+{"id":"direct_email","category":"direct_task","expected_use_rag":false,"question":"帮我写一封请假邮件。"}
+{"id":"direct_resume","category":"direct_task","expected_use_rag":false,"question":"帮我润色这段简历经历。"}
+{"id":"direct_joke","category":"direct_task","expected_use_rag":false,"question":"讲一个程序员笑话。"}
+{"id":"direct_sql_general","category":"general_programming","expected_use_rag":false,"question":"PostgreSQL 如何创建索引？"}
+{"id":"direct_python_general","category":"general_programming","expected_use_rag":false,"question":"Python dataclass frozen=True 是什么意思？"}
+{"id":"direct_fastapi_general","category":"general_programming","expected_use_rag":false,"question":"FastAPI 里 Depends 怎么用？"}
+{"id":"direct_math","category":"general_knowledge","expected_use_rag":false,"question":"解释一下贝叶斯定理。"}
+{"id":"direct_world_history","category":"general_knowledge","expected_use_rag":false,"question":"法国大革命的主要原因是什么？"}
+{"id":"direct_cooking","category":"general_knowledge","expected_use_rag":false,"question":"推荐一份适合晚餐的菜单。"}
+{"id":"direct_no_rag_domain","category":"explicit_direct","expected_use_rag":false,"question":"不用知识库，直接回答：朱剑秋是谁？"}
+{"id":"direct_no_rag_sql","category":"explicit_direct","expected_use_rag":false,"question":"不要检索，直接解释一下 SQL JOIN。"}
+{"id":"direct_followup_chat","category":"followup_direct","expected_use_rag":false,"question":"那我该怎么回复她？","history":[{"role":"user","content":"帮我写一条比较礼貌的微信回复。"},{"role":"assistant","content":"可以先表达理解，再说明你的安排。"}]}
+{"id":"direct_followup_translation","category":"followup_direct","expected_use_rag":false,"question":"再自然一点。","history":[{"role":"user","content":"把这句话翻译成英文：我明天到。"},{"role":"assistant","content":"I will arrive tomorrow."}]}
+{"id":"direct_followup_summary","category":"followup_direct","expected_use_rag":false,"question":"这个语气能不能更正式？","summary":"The user is editing an email and wants a more formal tone."}
+{"id":"direct_creative_domain_name","category":"direct_task","expected_use_rag":false,"question":"写一首关于家是本的诗，不要引用资料。"}
+{"id":"direct_general_llm","category":"general_ai","expected_use_rag":false,"question":"什么是 transformer attention？"}
+{"id":"direct_admin_question","category":"general_programming","expected_use_rag":false,"question":"前端如何安全地修改 API key？"}
+{"id":"rag_compare_reviews","category":"domain_rag","expected_use_rag":true,"question":"顾客评论和B站评论对家是本的批评有什么差异？"}
+{"id":"rag_timeline_followup_short","category":"followup_rag","expected_use_rag":true,"question":"后续发酵有哪些节点？","history":[{"role":"user","content":"先讲讲巨大历史机遇这个梗的时间线。"},{"role":"assistant","content":"它从门店标语、视频传播和评论二创逐步扩散。"}]}
+{"id":"direct_policy_general","category":"general_knowledge","expected_use_rag":false,"question":"公司应该如何制定年假政策？"}
+{"id":"bilingual_rag_jiashiben_menu","category":"bilingual_rag","expected_use_rag":true,"question":"What were the pricing controversies around Jiashiben's menu?"}
+{"id":"bilingual_rag_zhu_yongge","category":"bilingual_rag","expected_use_rag":true,"question":"Summarize the Zhu Jianqiu and Yongge livestream incident from the local docs."}
+{"id":"bilingual_rag_crucian_meme","category":"bilingual_rag","expected_use_rag":true,"question":"Why did giant historical crucian carp become a meme?"}
+{"id":"bilingual_rag_mixed_reviews","category":"bilingual_rag","expected_use_rag":true,"question":"Compare Bilibili comments 和顾客差评对家是本的批评。"}
+{"id":"bilingual_rag_pinyin_brand","category":"bilingual_rag","expected_use_rag":true,"question":"What does Jia Shi Ben's family-culture slogan try to communicate?"}
+{"id":"bilingual_rag_doubao","category":"bilingual_rag","expected_use_rag":true,"question":"How did Doubao AI video contribute to the Jiashiben social-media spread?"}
+{"id":"bilingual_rag_followup","category":"bilingual_rag","expected_use_rag":true,"question":"What happened after that slogan went viral?","history":[{"role":"user","content":"Explain the 巨大历史机遇 / giant historical opportunity meme in English."},{"role":"assistant","content":"It spread from the Jiashiben wall slogan into Bilibili comments and remixes."}]}
+{"id":"bilingual_direct_general_restaurant","category":"bilingual_direct","expected_use_rag":false,"question":"How should a normal restaurant design a pricing strategy?"}
+{"id":"bilingual_direct_translation","category":"bilingual_direct","expected_use_rag":false,"question":"Translate this sentence: 家是本，本是家。"}
+{"id":"bilingual_direct_programming","category":"bilingual_direct","expected_use_rag":false,"question":"Explain JavaScript promise chaining in Chinese."}

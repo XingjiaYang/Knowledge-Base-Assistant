@@ -1,8 +1,8 @@
 // Status indicator, health/model metadata, and the retrieval-settings popover.
 
-import { state, on, emit, setStatus } from "../store.js?v=20260617-hybrid-retrieval";
-import { api } from "../api.js?v=20260617-hybrid-retrieval";
-import { byId } from "../dom.js?v=20260617-hybrid-retrieval";
+import { state, on, emit, setStatus } from "../store.js?v=20260620-rag-only";
+import { api } from "../api.js?v=20260620-rag-only";
+import { byId } from "../dom.js?v=20260620-rag-only";
 
 let els = {};
 
@@ -12,6 +12,7 @@ export function mountMeta() {
     statusText: byId("statusText"),
     settingsToggle: byId("settingsToggle"),
     settingsPopover: byId("settingsPopover"),
+    ragOnlyMode: byId("ragOnlyMode"),
     bm25TopK: byId("bm25TopK"),
     recallTopK: byId("recallTopK"),
     rrfTopK: byId("rrfTopK"),
@@ -39,6 +40,9 @@ export function mountMeta() {
     if (event.key === "Escape") closePopover();
   });
 
+  els.ragOnlyMode.addEventListener("change", () => {
+    state.ragOnly = els.ragOnlyMode.checked;
+  });
   els.bm25TopK.addEventListener("input", () => {
     state.bm25TopK = els.bm25TopK.value ? Number(els.bm25TopK.value) : null;
   });
@@ -98,6 +102,7 @@ function renderMeta() {
   els.statusText.textContent = state.statusText;
   els.latestRoute.textContent = state.latestRoute || "None";
   els.compactChip.hidden = !state.conversationSummary;
+  els.ragOnlyMode.checked = Boolean(state.ragOnly);
 
   const data = state.health;
   if (!data) return;

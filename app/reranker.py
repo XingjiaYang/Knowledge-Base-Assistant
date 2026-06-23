@@ -7,6 +7,7 @@ from typing import Sequence
 
 from app.config import Settings, settings
 from app.device import preferred_torch_device
+from app.transformers_compat import patch_all_tied_weights_keys
 from app.vector_store import SearchResult
 
 
@@ -29,6 +30,7 @@ class Reranker:
         if self._model is None:
             with self._model_lock:
                 if self._model is None:
+                    patch_all_tied_weights_keys()
                     from transformers import AutoModel
 
                     device = preferred_torch_device(
