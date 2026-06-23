@@ -70,9 +70,19 @@ def assert_llm_settings() -> None:
         llm_retry_attempts=4,
         llm_retry_backoff_seconds=0.5,
         llm_retry_backoff_max_seconds=4.0,
+        llm_context_max_tokens=131072,
+        llm_context_safety_margin_tokens=4096,
+        llm_context_prompt_overhead_tokens=1024,
         retrieve_score_threshold=0.42,
         intent_embedding_rag_threshold=0.55,
         cuda_enabled=False,
+        embedding_model="jinaai/jina-embeddings-v5-text-small",
+        embedding_trust_remote_code=True,
+        embedding_query_task="retrieval",
+        embedding_passage_task="retrieval",
+        embedding_classification_task="classification",
+        embedding_query_prompt_name="query",
+        embedding_passage_prompt_name="document",
         reranker_model="jinaai/jina-reranker-v3",
         reranker_preload=True,
         reranker_dtype="auto",
@@ -95,10 +105,30 @@ def assert_llm_settings() -> None:
         raise AssertionError("LLM retry backoff should be configurable.")
     if config.llm_retry_backoff_max_seconds != 4.0:
         raise AssertionError("LLM retry max backoff should be configurable.")
+    if config.llm_context_max_tokens != 131072:
+        raise AssertionError("LLM context max tokens should be configurable.")
+    if config.llm_context_safety_margin_tokens != 4096:
+        raise AssertionError("LLM context safety margin should be configurable.")
+    if config.llm_context_prompt_overhead_tokens != 1024:
+        raise AssertionError("LLM context prompt overhead should be configurable.")
     if config.retrieve_score_threshold != 0.42:
         raise AssertionError("Retrieval score threshold should be configurable.")
     if config.cuda_enabled:
         raise AssertionError("CUDA preference should be configurable.")
+    if config.embedding_model != "jinaai/jina-embeddings-v5-text-small":
+        raise AssertionError("Embedding model should be configurable.")
+    if not config.embedding_trust_remote_code:
+        raise AssertionError("Embedding trust_remote_code should be configurable.")
+    if config.embedding_query_task != "retrieval":
+        raise AssertionError("Embedding query task should be configurable.")
+    if config.embedding_passage_task != "retrieval":
+        raise AssertionError("Embedding passage task should be configurable.")
+    if config.embedding_classification_task != "classification":
+        raise AssertionError("Embedding classification task should be configurable.")
+    if config.embedding_query_prompt_name != "query":
+        raise AssertionError("Embedding query prompt name should be configurable.")
+    if config.embedding_passage_prompt_name != "document":
+        raise AssertionError("Embedding passage prompt name should be configurable.")
     if config.reranker_model != "jinaai/jina-reranker-v3":
         raise AssertionError("Reranker model should be configurable.")
     if not config.reranker_preload:
@@ -242,6 +272,7 @@ def assert_llm_runtime_settings_provider() -> None:
         base_url="https://runtime.example/v1",
         api_key="runtime-key",
         model="runtime-model",
+        context_max_tokens=123456,
     )
     client = LLMClient(
         base,
@@ -257,6 +288,8 @@ def assert_llm_runtime_settings_provider() -> None:
         raise AssertionError("Runtime LLM API key should override env config.")
     if "runtime-model" not in str(seen.get("body")):
         raise AssertionError("Runtime LLM model should override env config.")
+    if client.runtime_settings().llm_context_max_tokens != 123456:
+        raise AssertionError("Runtime context max tokens should override env config.")
     client.close()
 
     print("LLM runtime settings provider -> ok")
@@ -417,6 +450,7 @@ def assert_rag_endpoint_accepts_original_body_shape() -> None:
         bm25_top_k=9,
         recall_top_k=10,
         rrf_top_k=8,
+        rag_only=True,
         history=[],
         conversation_summary="",
     )
@@ -426,6 +460,7 @@ def assert_rag_endpoint_accepts_original_body_shape() -> None:
         or request.bm25_top_k != 9
         or request.recall_top_k != 10
         or request.rrf_top_k != 8
+        or request.rag_only is not True
         or request.history != []
         or request.conversation_summary != ""
     ):
@@ -522,9 +557,14 @@ def assert_superuser_gate_and_llm_settings_models() -> None:
         provider="anthropic",
         base_url="https://api.anthropic.com/v1",
         model="claude-test",
+        context_max_tokens=200000,
         api_key="secret",
     )
-    if request.provider != "anthropic" or request.model != "claude-test":
+    if (
+        request.provider != "anthropic"
+        or request.model != "claude-test"
+        or request.context_max_tokens != 200000
+    ):
         raise AssertionError("LLM settings request should parse editable fields.")
 
     print("Superuser LLM settings gate -> ok")
@@ -565,11 +605,16 @@ def assert_invalid_settings_rejected() -> None:
     invalid_configs = [
         {"chunk_size": 100, "chunk_overlap": 100},
         {"chunk_size": 100, "chunk_overlap": 99},
+        {"embedding_model": ""},
         {"llm_retry_attempts": 0},
         {
             "llm_retry_backoff_seconds": 2.0,
             "llm_retry_backoff_max_seconds": 1.0,
         },
+        {"llm_context_max_tokens": 0},
+        {"llm_context_safety_margin_tokens": -1},
+        {"llm_context_prompt_overhead_tokens": -1},
+        {"intent_llm_max_tokens": 0},
         {"api_top_k_max": 0},
         {"api_recall_top_k_max": 0},
         {"retrieve_score_threshold": -0.1},
@@ -628,6 +673,64 @@ def assert_prompt_budget_settings() -> None:
     print("Prompt budget settings -> ok")
 
 
+def assert_default_conversation_summary_budget() -> None:
+    config = Settings()
+    if config.conversation_summary_max_chars != 256000:
+        raise AssertionError(
+            "Default conversation summary char limit should match API-scale context."
+        )
+    if config.summary_history_max_chars != 200000:
+        raise AssertionError("Default summary input budget should be API-scale.")
+    if config.summary_max_tokens != 4096:
+        raise AssertionError("Default summary output budget should be API-scale.")
+    if config.llm_context_max_tokens != 256000:
+        raise AssertionError("Default LLM context window should be API-scale.")
+    if config.llm_context_safety_margin_tokens != 8192:
+        raise AssertionError("Default LLM context safety margin should be configured.")
+    if config.llm_context_prompt_overhead_tokens != 2048:
+        raise AssertionError("Default LLM context overhead should be configured.")
+    if config.history_max_messages != 0:
+        raise AssertionError("History should not be count-truncated before compaction.")
+    if config.intent_llm_max_tokens != 512:
+        raise AssertionError("Default intent classifier output budget should allow tags.")
+
+    print("Default conversation summary budget -> ok")
+
+
+def assert_default_embedding_settings() -> None:
+    config = Settings()
+    if config.chunk_size != 2000:
+        raise AssertionError("Default chunk size should use Jina-scale context.")
+    if config.chunk_overlap != 300:
+        raise AssertionError("Default chunk overlap should use Jina-scale context.")
+    if config.embedding_model != "jinaai/jina-embeddings-v5-text-small":
+        raise AssertionError("Default embedding model should be Jina embeddings v5 text small.")
+    if not config.embedding_trust_remote_code:
+        raise AssertionError("Jina embeddings v5 should load with trusted remote code.")
+    if config.embedding_query_task != "retrieval":
+        raise AssertionError("Default query embedding task should use Jina retrieval.")
+    if config.embedding_passage_task != "retrieval":
+        raise AssertionError("Default passage embedding task should use Jina retrieval.")
+    if config.embedding_classification_task != "classification":
+        raise AssertionError("Default intent embedding task should use classification.")
+    if config.embedding_query_prompt_name != "query":
+        raise AssertionError("Default query prompt should use Jina query prompt.")
+    if config.embedding_passage_prompt_name != "document":
+        raise AssertionError("Default passage prompt should use Jina document prompt.")
+    if config.intent_llm_history_max_chars != 12000:
+        raise AssertionError("Default LLM intent history budget should be expanded.")
+    if config.intent_llm_summary_max_chars != 32000:
+        raise AssertionError("Default LLM intent summary budget should be expanded.")
+    if config.intent_embedding_history_max_chars != 8000:
+        raise AssertionError("Default embedding intent history budget should expand.")
+    if config.intent_embedding_summary_max_chars != 8000:
+        raise AssertionError("Default embedding intent summary budget should expand.")
+    if config.intent_embedding_text_max_chars != 12000:
+        raise AssertionError("Default embedding intent text budget should expand.")
+
+    print("Default embedding settings -> ok")
+
+
 def main() -> None:
     assert_api_limits()
     assert_llm_settings()
@@ -647,6 +750,8 @@ def main() -> None:
     assert_csv_import_parser()
     assert_invalid_settings_rejected()
     assert_prompt_budget_settings()
+    assert_default_conversation_summary_budget()
+    assert_default_embedding_settings()
 
 
 if __name__ == "__main__":

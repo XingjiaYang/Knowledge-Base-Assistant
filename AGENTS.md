@@ -8,19 +8,24 @@ configurable LLM provider.
 
 - `app/`: application code. `main.py` exposes the FastAPI app and routes,
   `static/` contains the browser UI, `intent_router.py` chooses RAG vs direct
-  chat, `rag.py` coordinates BM25/vector recall, RRF fusion, reranking,
-  prompts, generation, and history compaction, `reranker.py` loads and runs the
-  Jina cross-encoder, `vector_store.py` manages Markdown chunking, BM25
-  indexing, Qdrant vector search, and RRF fusion, `session_store.py` manages
-  PostgreSQL-backed users, auth sessions, chat sessions, messages, retrieved
-  references, and summaries, `llm_client.py` calls cloud or local LLM APIs, and
+  chat through keyword/state, Jina-embedding, and LLM-classifier passes, `rag.py`
+  coordinates BM25/vector recall, RRF fusion, reranking, prompts, generation,
+  and context-budget-aware history compaction, `reranker.py` loads and runs the
+  Jina cross-encoder, `vector_store.py` manages Markdown chunking, Jina
+  embeddings v3 task routing, BM25 indexing, Qdrant vector search, and RRF
+  fusion, `session_store.py` manages PostgreSQL-backed users, auth sessions,
+  chat sessions, messages, retrieved references, route metadata, runtime LLM
+  settings, and summaries, `llm_client.py` calls cloud or local LLM APIs, and
   `config.py` reads environment settings.
-- `scripts/`: operational and smoke-test scripts for local services,
-  ingestion, retrieval, routing, prompt budgeting, settings, and session
-  helpers.
+- `scripts/`: operational, smoke-test, and evaluation scripts for local
+  services, ingestion, retrieval, routing, prompt budgeting, settings, session
+  helpers, and offline intent-router A/B checks.
 - `data/docs/`: replaceable Markdown source documents ingested into Qdrant.
   The committed corpus is a synthetic Chinese restaurant/business case,
   including the 巨大历史机遇/巨大历史鲫鱼 meme topic.
+- `data/eval/`: labeled intent-routing evaluation cases used by
+  `scripts/intent_router_ab.py`, including bilingual and cross-lingual slices
+  for comparing Jina against other encoders.
 - `docker/`, `Dockerfile`, `compose.yaml`: container entrypoint and Docker
   Compose deployment.
 - Runtime state such as `postgres_data/`, `qdrant_storage/`, `models/`, caches,
@@ -55,6 +60,11 @@ configurable LLM provider.
   behavior without a live PostgreSQL service.
 - `python scripts/test_intent_router.py`: smoke-test routing for RAG vs
   direct-chat questions.
+- `python scripts/intent_router_ab.py --fake-embedder`: smoke-test the offline
+  intent-router A/B harness without downloading encoder weights.
+- `python scripts/intent_router_ab.py --model-variant old_bge=BAAI/bge-small-en-v1.5,,0`:
+  compare current Jina intent embeddings against the old BGE small encoder on
+  the labeled routing set; this may download model weights.
 - `python scripts/test_reranker.py`: smoke-test cross-encoder reranker ordering
   with a fake model.
 - `python scripts/test_prompt_budget.py`: validate prompt trimming, query
@@ -115,23 +125,68 @@ Change `AUTH_DEFAULT_ADMIN_PASSWORD` before exposing the app beyond local
 development. If the PostgreSQL volume already contains that user, startup keeps
 the existing password. The startup-created administrator is the only
 superuser. Superuser-only Admin UI controls can update the global LLM provider
-format, API base URL, model name, and API key at runtime; those values are
-stored in PostgreSQL `app_settings` and override the `.env` LLM defaults. API
-keys are write-only from the browser's perspective. Admin-created and
-CSV-imported users default to `must_change_password`, so they must update their
-password before using app features.
+format, API base URL, model name, context-window size, and API key at runtime;
+those values are stored in PostgreSQL `app_settings` and override the `.env`
+LLM defaults. API keys are write-only from the browser's perspective.
+Admin-created and CSV-imported users default to `must_change_password`, so they
+must update their password before using app features.
 
 For restricted networks, configure runtime proxy or mirror values in `.env`.
 Docker daemon proxy settings only affect image pulls, not running containers.
 
-RAG retrieval uses hybrid recall before reranking: BM25 recalls `BM25_TOP_K`
-keyword candidates from the Markdown chunks, Qdrant recalls `RECALL_TOP_K`
+RAG retrieval uses Jina embeddings v5 text small by default:
+`EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-small`,
+`EMBEDDING_TRUST_REMOTE_CODE=1`, `CHUNK_SIZE=2000`,
+`CHUNK_OVERLAP=300`, query embeddings use `retrieval` with prompt `query`,
+document chunks use `retrieval` with prompt `document`, and intent-routing
+embeddings use `classification`.
+Hybrid recall runs before reranking: BM25 recalls `BM25_TOP_K` keyword
+candidates from Markdown chunks, Qdrant recalls `RECALL_TOP_K`
 cosine-similarity candidates, reciprocal rank fusion keeps `RRF_TOP_K`
 candidates, `jinaai/jina-reranker-v3` reranks them through its native
 `AutoModel.rerank()` interface, and only `RETRIEVE_TOP_K` chunks enter the
 prompt. The API preloads and warms the reranker during startup by default with
-`RERANKER_PRELOAD=1`; keep Hugging Face cache, mirror, or proxy settings ready
-before rebuilding containers. The browser exposes these limits as `BM25 K`,
-`Cosine K`, `RRF K`, and `Final K`, defaulting to `100`, `100`, `100`, and `5`.
-If Docker logs do not show INFO-level retrieval messages, use the response or
-PostgreSQL-stored `contexts` scores to confirm which stages ran.
+`RERANKER_PRELOAD=1`; warmup failure is logged as
+`retrieval_degraded=True`/`reranker_degraded=True` but does not prevent startup.
+Keep Hugging Face cache, mirror, or proxy settings ready before rebuilding
+containers. The browser exposes these limits as `BM25 K`, `Cosine K`, `RRF K`,
+and `Final K`, defaulting to `100`, `100`, `100`, and `5`.
+
+Retrieval degradation must be explicit. If Qdrant/vector recall fails, RAG falls
+back to BM25-only recall from local Markdown. If reranking fails, the pipeline
+uses the unre-ranked RRF/BM25 coarse results capped by `Final K`. Responses and
+stored assistant messages include `retrieval_degraded`, `qdrant_degraded`,
+`reranker_degraded`, and `degradation_reason`; the frontend shows the same
+warning, and server logs write the degradation booleans.
+
+Conversation memory defaults to API-scale context windows:
+`LLM_CONTEXT_MAX_TOKENS=256000`, safety margin `8192`, prompt overhead `2048`,
+`CONVERSATION_SUMMARY_MAX_CHARS=256000`, `SUMMARY_HISTORY_MAX_CHARS=200000`,
+and `SUMMARY_MAX_TOKENS=4096`. History is not count-truncated before
+compaction (`HISTORY_MAX_MESSAGES=0`); compaction runs only when estimated
+summary + uncompressed history would exceed the active context window after
+reserving output, question, safety, prompt overhead, and expected retrieved
+reference tokens.
+
+The intent router is layered: keyword rules short-circuit explicit/domain
+cases, general technical/database questions outside the local corpus, and
+short, strong referential follow-ups after the previous assistant answer
+actually used retrieved contexts; the second layer compares the current
+question plus bounded recent conversation and compact memory against
+single-intent RAG/direct anchor queries with Jina classification embeddings;
+ambiguous cases fall through to an LLM classifier that receives structured
+previous-route state. The intent embedding budgets are character-based
+safeguards, not a tokenizer hard limit; if the encoder raises, the second layer
+returns no decision and the router continues to the LLM classifier.
+The LLM classifier is prompted to return
+`<think>THINK_AND_JUDGEMENT</think><answer>JSON_ANS</answer>`, and only the
+JSON inside `<answer>` is parsed for routing. Use
+`scripts/intent_router_ab.py` to compare keyword-only routing, current Jina
+embedding routing, threshold variants, and alternative encoder models before
+changing thresholds or encoders. If Docker logs do not show INFO-level
+retrieval messages, use the response or PostgreSQL-stored `contexts` scores to
+confirm which retrieval stages ran.
+
+All users can enable the browser `RAG-only` switch. That sends `rag_only=true`
+to `/rag`, bypasses the intent router for that request, and stores route
+metadata as `rag_only`.

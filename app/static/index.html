@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>Knowledge Base Assistant</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/css/styles.css">
+  <link rel="stylesheet" href="/static/css/styles.css?v=20260620-rag-only">
 </head>
 <body>
   <!-- Inline SVG icon sprite: keeps icons local with no external/CDN dependency. -->
@@ -148,6 +148,9 @@
             </button>
             <div id="settingsPopover" class="popover" hidden>
               <div class="popover-title">Retrieval</div>
+              <label class="checkbox">
+                <input id="ragOnlyMode" type="checkbox"> RAG-only
+              </label>
               <label class="field field-row">
                 <span class="field-label">BM25 K</span>
                 <input id="bm25TopK" type="number" min="1" inputmode="numeric">
@@ -275,6 +278,8 @@
             <input id="adminLlmBaseUrl" placeholder="https://api.openai.com/v1" autocomplete="off">
             <label class="field-label" for="adminLlmModel">Model</label>
             <input id="adminLlmModel" placeholder="gpt-4o-mini" autocomplete="off">
+            <label class="field-label" for="adminLlmContextMaxTokens">Context max tokens</label>
+            <input id="adminLlmContextMaxTokens" type="number" min="4096" max="2000000" step="1024" placeholder="256000" autocomplete="off">
             <label class="field-label" for="adminLlmApiKey">API key</label>
             <input id="adminLlmApiKey" type="password" placeholder="Leave blank to keep current key" autocomplete="new-password">
             <button id="adminLlmSaveButton" class="btn btn-primary btn-block" type="submit">Save LLM settings</button>
@@ -285,6 +290,6 @@
     </div>
   </main>
 
-  <script type="module" src="/static/js/main.js?v=20260617-hybrid-retrieval"></script>
+  <script type="module" src="/static/js/main.js?v=20260620-rag-only"></script>
 </body>
 </html>
