@@ -1,8 +1,8 @@
 // Status indicator, health/model metadata, and the retrieval-settings popover.
 
-import { state, on, emit, setStatus } from "../store.js?v=20260620-rag-only";
-import { api } from "../api.js?v=20260620-rag-only";
-import { byId } from "../dom.js?v=20260620-rag-only";
+import { state, on, emit, setStatus } from "../store.js?v=20260626-code-search";
+import { api } from "../api.js?v=20260626-code-search";
+import { byId, clear, icon } from "../dom.js?v=20260626-code-search";
 
 let els = {};
 
@@ -17,6 +17,9 @@ export function mountMeta() {
     recallTopK: byId("recallTopK"),
     rrfTopK: byId("rrfTopK"),
     topK: byId("topK"),
+    codeRepository: byId("settingsCodeRepository"),
+    codeIndexButton: byId("settingsCodeIndexButton"),
+    codeIndexStatus: byId("settingsCodeIndexStatus"),
     modelName: byId("modelName"),
     collectionName: byId("collectionName"),
     maxTokens: byId("maxTokens"),
@@ -55,14 +58,25 @@ export function mountMeta() {
   els.topK.addEventListener("input", () => {
     state.topK = els.topK.value ? Number(els.topK.value) : null;
   });
+  els.codeRepository.addEventListener("change", () => {
+    state.selectedCodeRepositoryId = els.codeRepository.value;
+    renderCodeIndexSettings();
+    emit("messages");
+  });
+  els.codeIndexButton.addEventListener("click", indexSelectedCodeRepositories);
 
   on("meta", renderMeta);
+  on("authenticated", () => {
+    ensureCodeRepositories();
+  });
 }
 
 function togglePopover() {
   if (els.settingsPopover.hidden) {
     els.settingsPopover.hidden = false;
     els.settingsToggle.setAttribute("aria-expanded", "true");
+    ensureCodeRepositories();
+    renderCodeIndexSettings();
   } else {
     closePopover();
   }
@@ -118,6 +132,7 @@ function renderMeta() {
   applyNumberSetting(els.recallTopK, "recallTopK", data.recall_top_k, data.api_recall_top_k_max);
   applyNumberSetting(els.rrfTopK, "rrfTopK", data.rrf_top_k, data.api_recall_top_k_max);
   applyNumberSetting(els.topK, "topK", data.retrieve_top_k, data.api_top_k_max);
+  renderCodeIndexSettings();
 }
 
 function applyNumberSetting(input, stateKey, value, max) {
@@ -128,4 +143,124 @@ function applyNumberSetting(input, stateKey, value, max) {
     input.value = String(value);
     state[stateKey] = value;
   }
+}
+
+async function ensureCodeRepositories() {
+  if (!state.currentUser || state.currentUser.must_change_password) return;
+  if (state.codeRepositoriesLoaded || state.codeRepositoriesLoading) return;
+  state.codeRepositoriesLoading = true;
+  renderCodeIndexSettings();
+  try {
+    const data = await api.codeRepositories();
+    state.codeRepositories = data.repositories || [];
+    state.codeRepositoriesLoaded = true;
+    const ids = new Set(state.codeRepositories.map((repository) => repository.id));
+    if (state.selectedCodeRepositoryId && !ids.has(state.selectedCodeRepositoryId)) {
+      state.selectedCodeRepositoryId = "";
+    }
+    if (!state.selectedCodeRepositoryId && data.default_repository_ids?.length === 1) {
+      state.selectedCodeRepositoryId = data.default_repository_ids[0];
+    }
+    state.codeError = "";
+  } catch (error) {
+    state.codeError = error.message || "Unable to load code folders.";
+  } finally {
+    state.codeRepositoriesLoading = false;
+    renderCodeIndexSettings();
+    emit("messages");
+  }
+}
+
+async function indexSelectedCodeRepositories() {
+  await ensureCodeRepositories();
+  if (state.codeIndexing || !state.codeRepositories.length) return;
+
+  state.codeIndexing = true;
+  state.codeIndexStatus = "Indexing code...";
+  renderCodeIndexSettings();
+  emit("messages");
+
+  try {
+    const data = await api.codeIndex({
+      repository_ids: selectedCodeRepositoryIds(),
+      rebuild: true,
+    });
+    state.codeRepositories = data.repositories || state.codeRepositories;
+    state.codeRepositoriesLoaded = true;
+    state.codeIndexStatus =
+      `Indexed ${data.files || 0} files, ${data.functions || 0} symbols, `
+      + `${data.call_edges || 0} calls.`;
+    state.codeError = "";
+  } catch (error) {
+    state.codeError = error.message || "Code indexing failed.";
+    state.codeIndexStatus = "";
+  } finally {
+    state.codeIndexing = false;
+    renderCodeIndexSettings();
+    emit("messages");
+  }
+}
+
+function renderCodeIndexSettings() {
+  if (!els.codeRepository || !els.codeIndexButton || !els.codeIndexStatus) return;
+
+  const repos = state.codeRepositories || [];
+  clear(els.codeRepository);
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = "All code folders";
+  els.codeRepository.append(all);
+  for (const repository of repos) {
+    const option = document.createElement("option");
+    option.value = repository.id;
+    option.textContent =
+      `${repository.name || repository.id} (${repository.indexed_files || 0})`;
+    els.codeRepository.append(option);
+  }
+  els.codeRepository.value = state.selectedCodeRepositoryId || "";
+  els.codeRepository.disabled = state.codeRepositoriesLoading || state.codeIndexing;
+
+  const indexedCount = selectedIndexedFileCount(repos);
+  const buttonLabel = state.codeIndexing
+    ? "Indexing"
+    : indexedCount > 0
+      ? "Reindex"
+      : "Index";
+  clear(els.codeIndexButton);
+  els.codeIndexButton.append(icon("refresh"), document.createTextNode(buttonLabel));
+  els.codeIndexButton.disabled =
+    state.codeRepositoriesLoading
+    || state.codeIndexing
+    || !repos.length
+    || !state.currentUser
+    || Boolean(state.currentUser?.must_change_password);
+
+  if (state.codeIndexStatus) {
+    els.codeIndexStatus.textContent = state.codeIndexStatus;
+  } else if (state.codeRepositoriesLoading) {
+    els.codeIndexStatus.textContent = "Loading folders...";
+  } else if (state.codeError) {
+    els.codeIndexStatus.textContent = state.codeError;
+  } else if (!repos.length) {
+    els.codeIndexStatus.textContent = "No code folders";
+  } else {
+    els.codeIndexStatus.textContent = `${indexedCount} indexed files`;
+  }
+}
+
+function selectedCodeRepositoryIds() {
+  return state.selectedCodeRepositoryId ? [state.selectedCodeRepositoryId] : [];
+}
+
+function selectedIndexedFileCount(repos) {
+  if (state.selectedCodeRepositoryId) {
+    const selected = repos.find(
+      (repository) => repository.id === state.selectedCodeRepositoryId,
+    );
+    return selected?.indexed_files || 0;
+  }
+  return repos.reduce(
+    (total, repository) => total + (repository.indexed_files || 0),
+    0,
+  );
 }

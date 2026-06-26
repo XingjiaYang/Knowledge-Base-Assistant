@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+os.environ.setdefault("RAY_ENABLED", "0")
 
 from app.config import Settings
 import app.reranker as reranker_module

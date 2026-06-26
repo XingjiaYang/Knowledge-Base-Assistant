@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from collections import Counter
 from dataclasses import dataclass, replace
 import logging
 import math
@@ -9,7 +8,7 @@ from pathlib import Path
 import re
 from threading import Lock
 import time
-from typing import Literal
+from typing import Any, Literal
 from uuid import NAMESPACE_URL, uuid5
 
 from markdown_it import MarkdownIt
@@ -89,18 +88,10 @@ class MarkdownChunk:
 
 
 @dataclass(frozen=True)
-class _BM25Document:
-    result: SearchResult
-    term_counts: dict[str, int]
-    length: int
-
-
-@dataclass(frozen=True)
 class _BM25Index:
     signature: tuple[tuple[str, int, int], ...]
-    documents: tuple[_BM25Document, ...]
-    document_frequencies: dict[str, int]
-    average_length: float
+    retriever: Any
+    documents: tuple[SearchResult, ...]
 
 
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
@@ -110,8 +101,6 @@ _TABLE_DIVIDER_RE = re.compile(
 _ASCII_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 _CJK_BLOCK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
 _MARKDOWN = MarkdownIt("gfm-like", {"linkify": False})
-_BM25_K1 = 1.5
-_BM25_B = 0.75
 _RRF_RANK_CONSTANT = 60
 
 
@@ -427,11 +416,13 @@ class VectorStore:
         config: Settings = settings,
         client: QdrantClient | None = None,
         model: SentenceTransformer | None = None,
+        use_ray: bool = True,
     ) -> None:
         self.config = config
         self._client = client
         self._model = model
         self._model_device = "cpu" if model is not None else None
+        self._use_ray = use_ray and model is None
         self._client_lock = Lock()
         self._model_lock = Lock()
         self._bm25_lock = Lock()
@@ -503,6 +494,17 @@ class VectorStore:
             kwargs["model_kwargs"] = {"dtype": torch.bfloat16}
         return kwargs
 
+    def _embedding_actor(self) -> object | None:
+        if not self._use_ray:
+            return None
+        try:
+            from app.model_actors import get_embedding_actor
+
+            return get_embedding_actor(self.config)
+        except Exception:
+            logger.exception("Embedding Ray actor setup failed.")
+            return None
+
     def close(self) -> None:
         with self._client_lock:
             client = self._client
@@ -518,6 +520,26 @@ class VectorStore:
     def vector_size(self) -> int:
         if self._vector_size is not None:
             return self._vector_size
+
+        if self._use_ray:
+            actor = self._embedding_actor()
+            if actor is not None:
+                try:
+                    from app.model_actors import mark_ray_unavailable, ray_get
+
+                    actual_size = int(ray_get(actor.vector_size.remote(), self.config))
+                    if actual_size <= 0:
+                        raise RuntimeError(
+                            "Embedding actor returned an invalid vector dimension."
+                        )
+                    self._vector_size = actual_size
+                    return actual_size
+                except Exception:
+                    logger.exception(
+                        "Embedding Ray actor failed during dimension probe; "
+                        "falling back to local model."
+                    )
+                    mark_ray_unavailable()
 
         reported_size: int | None = None
         if hasattr(self.model, "get_embedding_dimension"):
@@ -791,61 +813,44 @@ class VectorStore:
         if not index.documents:
             return []
 
-        query_terms = set(_bm25_tokens(query))
-        if not query_terms:
+        query_tokens = _bm25_tokens(query)
+        if not query_tokens or index.retriever is None:
             return []
 
         metadata_filter = metadata_filter or {}
-        document_count = len(index.documents)
-        scored: list[tuple[float, SearchResult]] = []
-        for document in index.documents:
-            if not self._matches_result_metadata(document.result, metadata_filter):
-                continue
-
-            score = 0.0
-            for term in query_terms:
-                frequency = document.term_counts.get(term, 0)
-                if not frequency:
-                    continue
-
-                document_frequency = index.document_frequencies.get(term, 0)
-                idf = math.log(
-                    1
-                    + (
-                        (document_count - document_frequency + 0.5)
-                        / (document_frequency + 0.5)
-                    )
-                )
-                denominator = frequency + _BM25_K1 * (
-                    1
-                    - _BM25_B
-                    + _BM25_B * document.length / index.average_length
-                )
-                score += idf * (frequency * (_BM25_K1 + 1)) / denominator
-
-            if score > 0:
-                scored.append(
-                    (
-                        score,
-                        replace(
-                            document.result,
-                            score=score,
-                            bm25_score=score,
-                            retrieval_source="bm25",
-                        ),
-                    )
-                )
-
-        scored.sort(
-            key=lambda item: (
-                item[0],
-                item[1].source,
-                -item[1].chunk_id,
-            ),
-            reverse=True,
+        search_limit = len(index.documents) if metadata_filter else limit
+        response = index.retriever.retrieve(
+            [query_tokens],
+            k=min(max(1, search_limit), len(index.documents)),
+            sorted=True,
+            return_as="tuple",
+            show_progress=False,
         )
-        logger.info("BM25 recall returned %s contexts.", min(len(scored), limit))
-        return [result for _, result in scored[:limit]]
+        documents = list(response.documents[0])
+        scores = list(response.scores[0])
+
+        results: list[SearchResult] = []
+        for document, score_value in zip(documents, scores):
+            score = float(score_value)
+            if score <= 0:
+                continue
+            if not isinstance(document, SearchResult):
+                raise RuntimeError("BM25S returned an unexpected document payload.")
+            if not self._matches_result_metadata(document, metadata_filter):
+                continue
+            results.append(
+                replace(
+                    document,
+                    score=score,
+                    bm25_score=score,
+                    retrieval_source="bm25",
+                )
+            )
+            if len(results) >= limit:
+                break
+
+        logger.info("BM25 recall returned %s contexts.", len(results))
+        return results
 
     def hybrid_search(
         self,
@@ -1014,6 +1019,29 @@ class VectorStore:
         task: str | None,
         prompt_name: str | None = None,
     ) -> list[list[float]]:
+        if self._use_ray:
+            actor = self._embedding_actor()
+            if actor is not None:
+                try:
+                    from app.model_actors import mark_ray_unavailable, ray_get
+
+                    payload = texts if isinstance(texts, str) else list(texts)
+                    return ray_get(
+                        actor.encode_matrix.remote(
+                            payload,
+                            normalize_embeddings,
+                            task,
+                            prompt_name,
+                        ),
+                        self.config,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Embedding Ray actor failed during encode; falling back "
+                        "to local model."
+                    )
+                    mark_ray_unavailable()
+
         raw_embeddings = self._encode(
             texts,
             normalize_embeddings=normalize_embeddings,
@@ -1226,8 +1254,15 @@ class VectorStore:
         self,
         signature: tuple[tuple[str, int, int], ...],
     ) -> _BM25Index:
-        documents: list[_BM25Document] = []
-        document_frequencies: Counter[str] = Counter()
+        try:
+            import bm25s
+        except ImportError as exc:
+            raise RuntimeError(
+                "BM25S is required for keyword recall. Install requirements.api.txt."
+            ) from exc
+
+        documents: list[SearchResult] = []
+        tokenized_documents: list[list[str]] = []
 
         for file_path in sorted(self.config.docs_dir.rglob("*.md")):
             text = file_path.read_text(encoding="utf-8")
@@ -1242,44 +1277,38 @@ class VectorStore:
                 if not tokens:
                     continue
 
-                term_counts = Counter(tokens)
-                document_frequencies.update(term_counts.keys())
                 documents.append(
-                    _BM25Document(
-                        result=SearchResult(
-                            text=chunk.text,
-                            source=source,
-                            chunk_id=idx,
-                            score=0.0,
-                            content_type=chunk.content_type,
-                            h1=chunk.h1,
-                            h2=chunk.h2,
-                            h3=chunk.h3,
-                            headings=chunk.headings,
-                            start_line=chunk.start_line,
-                            end_line=chunk.end_line,
-                            retrieval_source="bm25",
-                        ),
-                        term_counts=dict(term_counts),
-                        length=len(tokens),
+                    SearchResult(
+                        text=chunk.text,
+                        source=source,
+                        chunk_id=idx,
+                        score=0.0,
+                        content_type=chunk.content_type,
+                        h1=chunk.h1,
+                        h2=chunk.h2,
+                        h3=chunk.h3,
+                        headings=chunk.headings,
+                        start_line=chunk.start_line,
+                        end_line=chunk.end_line,
+                        retrieval_source="bm25",
                     )
                 )
+                tokenized_documents.append(tokens)
 
-        average_length = (
-            sum(document.length for document in documents) / len(documents)
-            if documents
-            else 1.0
-        )
+        retriever = None
+        if documents:
+            retriever = bm25s.BM25(corpus=documents)
+            retriever.index(tokenized_documents, show_progress=False)
+
         logger.info(
-            "Built BM25 index from %s chunks under %s.",
+            "Built BM25S index from %s chunks under %s.",
             len(documents),
             self.config.docs_dir,
         )
         return _BM25Index(
             signature=signature,
+            retriever=retriever,
             documents=tuple(documents),
-            document_frequencies=dict(document_frequencies),
-            average_length=max(average_length, 1.0),
         )
 
     def _docs_signature(self) -> tuple[tuple[str, int, int], ...]:

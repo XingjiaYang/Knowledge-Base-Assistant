@@ -8,6 +8,7 @@ export LLM_API_KEY="${LLM_API_KEY:-}"
 API_HOST="${API_HOST:-0.0.0.0}"
 API_PORT="${API_PORT:-8080}"
 INGEST_ON_STARTUP="${INGEST_ON_STARTUP:-1}"
+INGEST_USE_RAY="${INGEST_USE_RAY:-0}"
 RECREATE_COLLECTION="${RECREATE_COLLECTION:-0}"
 WAIT_FOR_LLM="${WAIT_FOR_LLM:-0}"
 SERVICE_TIMEOUT_SECONDS="${SERVICE_TIMEOUT_SECONDS:-1800}"
@@ -118,7 +119,11 @@ if is_true "$INGEST_ON_STARTUP"; then
     ingest_args+=(--recreate)
   fi
 
-  python scripts/ingest_docs.py "${ingest_args[@]}"
+  if is_true "$INGEST_USE_RAY"; then
+    python scripts/ingest_docs.py "${ingest_args[@]}"
+  else
+    RAY_ENABLED=0 python scripts/ingest_docs.py "${ingest_args[@]}"
+  fi
 else
   echo "Skipping document ingest because INGEST_ON_STARTUP=${INGEST_ON_STARTUP}"
 fi

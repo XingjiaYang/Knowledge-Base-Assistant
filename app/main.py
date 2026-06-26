@@ -6,18 +6,27 @@ import csv
 from io import StringIO
 import logging
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+from app.call_graph import CallGraphStore
 from app.config import settings
+from app.code_indexer import CodeIndexer, CodeRepository, discover_code_repositories
+from app.code_retrieval import (
+    CodeIndexUnavailable,
+    CodeRetrieval,
+    CodeSearchHit,
+    CodeFileHit,
+)
 from app.llm_client import LLMClient
+from app.model_actors import warmup_model_actors
 from app.rag import RAGPipeline, RAGTimings
 from app.reranker import Reranker
 from app.security import bearer_token
@@ -35,6 +44,16 @@ from app.vector_store import SearchResult, VectorStore
 logger = logging.getLogger(__name__)
 
 
+async def _warmup_model_actors_background() -> None:
+    try:
+        await asyncio.to_thread(warmup_model_actors, settings)
+    except Exception:
+        logger.exception(
+            "Startup degraded: Ray model actor warmup failed; "
+            "falling back to lazy or local model loading when needed."
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _app.state.vector_store = VectorStore(settings)
@@ -44,8 +63,16 @@ async def lifespan(_app: FastAPI):
         settings,
         runtime_settings_provider=_app.state.session_store.get_llm_runtime_settings,
     )
+    if settings.ray_enabled:
+        _app.state.model_actor_warmup_task = asyncio.create_task(
+            _warmup_model_actors_background()
+        )
     _app.state.reranker = Reranker(settings)
-    if settings.reranker_enabled and settings.reranker_preload:
+    if (
+        settings.reranker_enabled
+        and settings.reranker_preload
+        and not settings.ray_enabled
+    ):
         try:
             await asyncio.to_thread(_app.state.reranker.warmup)
         except Exception:
@@ -60,6 +87,9 @@ async def lifespan(_app: FastAPI):
         llm_client=_app.state.llm_client,
         reranker=_app.state.reranker,
     )
+    _app.state.code_retrieval = CodeRetrieval(settings)
+    _app.state.call_graph = CallGraphStore(settings)
+    _app.state.code_index_lock = asyncio.Lock()
     try:
         yield
     finally:
@@ -152,6 +182,163 @@ class RAGRequest(BaseModel):
         default=None,
         max_length=settings.api_summary_max_chars,
     )
+
+
+class CodeSearchRequest(BaseModel):
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=settings.api_question_max_chars,
+    )
+    session_id: UUID | None = None
+    repository_ids: list[str] = Field(default_factory=list)
+    file_top_k: int | None = Field(
+        default=None,
+        ge=1,
+        le=settings.api_recall_top_k_max,
+    )
+    function_top_k: int | None = Field(
+        default=None,
+        ge=1,
+        le=settings.api_recall_top_k_max,
+    )
+    final_top_k: int | None = Field(default=None, ge=1, le=settings.api_top_k_max)
+
+
+class CodeFileHitResponse(BaseModel):
+    file_id: str
+    repository_id: str
+    repository_name: str
+    source_root: str
+    path: str
+    language: str
+    score: float
+
+    @classmethod
+    def from_hit(cls, hit: CodeFileHit) -> "CodeFileHitResponse":
+        return cls(
+            file_id=str(hit.file_id),
+            repository_id=hit.repository_id,
+            repository_name=hit.repository_name,
+            source_root=hit.source_root,
+            path=hit.path,
+            language=hit.language,
+            score=hit.score,
+        )
+
+
+class CodeFunctionHitResponse(BaseModel):
+    function_id: str
+    file_id: str
+    repository_id: str
+    repository_name: str
+    source_root: str
+    path: str
+    language: str
+    name: str
+    qualified_name: str
+    kind: str
+    signature: str
+    docstring: str
+    snippet: str
+    start_line: int
+    end_line: int
+    score: float
+    vector_score: float
+    file_score: float | None = None
+    rerank_score: float | None = None
+
+    @classmethod
+    def from_hit(cls, hit: CodeSearchHit) -> "CodeFunctionHitResponse":
+        return cls(
+            function_id=str(hit.function_id),
+            file_id=str(hit.file_id),
+            repository_id=hit.repository_id,
+            repository_name=hit.repository_name,
+            source_root=hit.source_root,
+            path=hit.path,
+            language=hit.language,
+            name=hit.name,
+            qualified_name=hit.qualified_name,
+            kind=hit.kind,
+            signature=hit.signature,
+            docstring=hit.docstring,
+            snippet=hit.snippet,
+            start_line=hit.start_line,
+            end_line=hit.end_line,
+            score=hit.score,
+            vector_score=hit.vector_score,
+            file_score=hit.file_score,
+            rerank_score=hit.rerank_score,
+        )
+
+
+class CodeSearchResponse(BaseModel):
+    query: str
+    session_id: str | None = None
+    answer: str = ""
+    files: list[CodeFileHitResponse]
+    functions: list[CodeFunctionHitResponse]
+    contexts: list["ContextResponse"] = Field(default_factory=list)
+
+
+class CodeRepositoryResponse(BaseModel):
+    id: str
+    name: str
+    source_root: str
+    indexed_files: int
+
+
+class CodeRepositoriesResponse(BaseModel):
+    repositories: list[CodeRepositoryResponse]
+    default_repository_ids: list[str]
+
+
+class CodeIndexRequest(BaseModel):
+    repository_ids: list[str] = Field(default_factory=list)
+    rebuild: bool = True
+
+
+class CodeIndexResponse(BaseModel):
+    repositories: list[CodeRepositoryResponse]
+    indexed_repository_ids: list[str]
+    files: int
+    functions: int
+    call_edges: int
+
+
+class CodeGraphNodeResponse(BaseModel):
+    id: str
+    label: str
+    name: str
+    kind: str
+    path: str
+    repository_id: str = ""
+    repository_name: str = ""
+    start_line: int
+    end_line: int
+    indexed: bool
+
+
+class CodeGraphEdgeResponse(BaseModel):
+    source: str
+    target: str
+    path: str
+    lines: list[int]
+
+
+class CodeGraphElementResponse(BaseModel):
+    group: Literal["nodes", "edges"]
+    data: dict[str, Any]
+
+
+class CodeCallGraphResponse(BaseModel):
+    function_name: str
+    depth: int
+    callers: list[CodeGraphNodeResponse]
+    nodes: list[CodeGraphNodeResponse]
+    edges: list[CodeGraphEdgeResponse]
+    elements: list[CodeGraphElementResponse] = Field(default_factory=list)
 
 
 class ContextResponse(BaseModel):
@@ -833,6 +1020,14 @@ async def health_details(request: Request) -> dict[str, object]:
         "qdrant": qdrant_ok,
         "llm": llm_ok,
         "collection": settings.collection_name,
+        "code_root_dir": str(settings.code_root_dir),
+        "code_source_dir": str(settings.code_source_dir),
+        "code_files_collection": settings.code_files_collection,
+        "code_functions_collection": settings.code_functions_collection,
+        "code_embedding_model": settings.code_embedding_model,
+        "code_search_file_top_k": settings.code_search_file_top_k,
+        "code_search_function_top_k": settings.code_search_function_top_k,
+        "code_search_final_top_k": settings.code_search_final_top_k,
         "llm_provider": llm_settings.provider,
         "llm_base_url": llm_settings.base_url,
         "llm_model": llm_settings.model,
@@ -861,9 +1056,231 @@ async def health_details(request: Request) -> dict[str, object]:
         "reranker_enabled": settings.reranker_enabled,
         "reranker_preload": settings.reranker_preload,
         "reranker_model": settings.reranker_model,
+        "ray_enabled": settings.ray_enabled,
+        "ray_address": settings.ray_address,
+        "ray_namespace": settings.ray_namespace,
+        "ray_embedding_actor_num_gpus": settings.ray_embedding_actor_num_gpus,
+        "ray_reranker_actor_num_gpus": settings.ray_reranker_actor_num_gpus,
+        "ray_embedding_actor_name": settings.ray_embedding_actor_name,
+        "ray_reranker_actor_name": settings.ray_reranker_actor_name,
         "intent_router": settings.intent_router_enabled,
         "auth_enabled": True,
     }
+
+
+@app.get(
+    "/code/repositories",
+    response_model=CodeRepositoriesResponse,
+    dependencies=[Depends(require_password_ready_user)],
+)
+async def code_repositories(http_request: Request) -> CodeRepositoriesResponse:
+    try:
+        repositories = await asyncio.to_thread(
+            _code_retrieval(http_request).repositories
+        )
+    except Exception as exc:
+        logger.exception("Code repository listing failed.")
+        raise HTTPException(
+            status_code=500,
+            detail=_error_detail("Internal server error.", exc),
+        ) from exc
+
+    responses = [
+        CodeRepositoryResponse(
+            id=repository.id,
+            name=repository.name,
+            source_root=repository.source_root,
+            indexed_files=indexed_files,
+        )
+        for repository, indexed_files in repositories
+    ]
+    return CodeRepositoriesResponse(
+        repositories=responses,
+        default_repository_ids=[] if len(responses) != 1 else [responses[0].id],
+    )
+
+
+@app.post(
+    "/code/index",
+    response_model=CodeIndexResponse,
+    dependencies=[Depends(require_password_ready_user)],
+)
+async def code_index(
+    http_request: Request,
+    index_request: CodeIndexRequest,
+) -> CodeIndexResponse:
+    repositories = _select_code_repositories(index_request.repository_ids)
+    if not repositories:
+        raise HTTPException(
+            status_code=404,
+            detail="No code repositories found under CODE_ROOT_DIR.",
+        )
+
+    lock = getattr(http_request.app.state, "code_index_lock", None)
+    if lock is None:
+        raise HTTPException(status_code=503, detail="Code indexing is unavailable.")
+
+    async with lock:
+        try:
+            stats = await asyncio.to_thread(
+                CodeIndexer(settings).index_repositories,
+                repositories,
+                recreate=False,
+                clear_existing=index_request.rebuild,
+            )
+            refreshed = await asyncio.to_thread(
+                _code_retrieval(http_request).repositories
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Code indexing failed.")
+            raise HTTPException(
+                status_code=500,
+                detail=_error_detail("Internal server error.", exc),
+            ) from exc
+
+    return CodeIndexResponse(
+        repositories=[
+            CodeRepositoryResponse(
+                id=repository.id,
+                name=repository.name,
+                source_root=repository.source_root,
+                indexed_files=indexed_files,
+            )
+            for repository, indexed_files in refreshed
+        ],
+        indexed_repository_ids=[repository.id for repository in repositories],
+        files=stats.files,
+        functions=stats.functions,
+        call_edges=stats.call_edges,
+    )
+
+
+@app.post(
+    "/code/search",
+    response_model=CodeSearchResponse,
+    dependencies=[Depends(require_password_ready_user)],
+)
+async def code_search(
+    http_request: Request,
+    search_request: CodeSearchRequest,
+    user: Annotated[CurrentUser, Depends(require_password_ready_user)],
+) -> CodeSearchResponse:
+    try:
+        outcome = await asyncio.to_thread(
+            _code_retrieval(http_request).search,
+            search_request.query,
+            file_top_k=search_request.file_top_k,
+            function_top_k=search_request.function_top_k,
+            final_top_k=search_request.final_top_k,
+            repository_ids=search_request.repository_ids,
+        )
+    except CodeIndexUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except UnexpectedResponse as exc:
+        logger.exception("Code search vector store request failed.")
+        raise HTTPException(
+            status_code=502,
+            detail=_error_detail("Upstream vector store error.", exc),
+        ) from exc
+    except Exception as exc:
+        logger.exception("Code search request failed.")
+        raise HTTPException(
+            status_code=500,
+            detail=_error_detail("Internal server error.", exc),
+        ) from exc
+
+    session_store = _session_store(http_request)
+    session = await _get_or_create_chat_session(
+        session_store,
+        user,
+        search_request.session_id,
+    )
+    answer = _code_search_answer(outcome.functions)
+    contexts = [
+        _code_hit_to_search_result(hit, index)
+        for index, hit in enumerate(outcome.functions)
+    ]
+    await asyncio.to_thread(
+        session_store.append_message,
+        session.id,
+        "user",
+        search_request.query,
+    )
+    await asyncio.to_thread(
+        session_store.append_message,
+        session.id,
+        "assistant",
+        answer,
+        contexts,
+        True,
+        "code_search",
+        "Code search over selected repositories.",
+    )
+    session = await asyncio.to_thread(
+        session_store.update_chat_session_after_answer,
+        session.id,
+        session.conversation_summary,
+        0,
+        search_request.query,
+    )
+
+    return CodeSearchResponse(
+        query=outcome.query,
+        session_id=str(session.id),
+        answer=answer,
+        files=[CodeFileHitResponse.from_hit(hit) for hit in outcome.files],
+        functions=[
+            CodeFunctionHitResponse.from_hit(hit)
+            for hit in outcome.functions
+        ],
+        contexts=[ContextResponse.from_search_result(item) for item in contexts],
+    )
+
+
+@app.get(
+    "/code/call-graph",
+    response_model=CodeCallGraphResponse,
+    dependencies=[Depends(require_password_ready_user)],
+)
+async def code_call_graph(
+    http_request: Request,
+    function_name: str = Query(..., min_length=1, max_length=300),
+    depth: int = Query(default=settings.code_call_graph_depth, ge=1, le=10),
+    repository_ids: list[str] | None = Query(default=None),
+) -> CodeCallGraphResponse:
+    try:
+        callers, chain = await asyncio.gather(
+            asyncio.to_thread(
+                _call_graph(http_request).get_callers,
+                function_name,
+                repository_ids,
+            ),
+            asyncio.to_thread(
+                _call_graph(http_request).get_call_chain,
+                function_name,
+                depth,
+                repository_ids,
+            ),
+        )
+    except Exception as exc:
+        logger.exception("Code call graph request failed.")
+        raise HTTPException(
+            status_code=500,
+            detail=_error_detail("Internal server error.", exc),
+        ) from exc
+
+    graph_nodes = [CodeGraphNodeResponse(**node) for node in chain["nodes"]]
+    graph_edges = [CodeGraphEdgeResponse(**edge) for edge in chain["edges"]]
+    return CodeCallGraphResponse(
+        function_name=function_name,
+        depth=depth,
+        callers=[CodeGraphNodeResponse(**node) for node in callers],
+        nodes=graph_nodes,
+        edges=graph_edges,
+        elements=_code_graph_elements(graph_nodes, graph_edges),
+    )
 
 
 @app.post(
@@ -998,6 +1415,126 @@ def _session_store(request: Request) -> SessionStore:
     if session_store is None:
         raise HTTPException(status_code=503, detail="Account storage is unavailable.")
     return session_store
+
+
+def _code_retrieval(request: Request) -> CodeRetrieval:
+    code_retrieval = getattr(request.app.state, "code_retrieval", None)
+    if code_retrieval is None:
+        raise HTTPException(status_code=503, detail="Code search is unavailable.")
+    return code_retrieval
+
+
+def _call_graph(request: Request) -> CallGraphStore:
+    call_graph = getattr(request.app.state, "call_graph", None)
+    if call_graph is None:
+        raise HTTPException(status_code=503, detail="Code call graph is unavailable.")
+    return call_graph
+
+
+def _code_graph_elements(
+    nodes: list[CodeGraphNodeResponse],
+    edges: list[CodeGraphEdgeResponse],
+) -> list[CodeGraphElementResponse]:
+    elements: list[CodeGraphElementResponse] = []
+    for node in nodes:
+        elements.append(
+            CodeGraphElementResponse(
+                group="nodes",
+                data={
+                    "id": node.id,
+                    "label": node.label,
+                    "name": node.name,
+                    "kind": node.kind,
+                    "path": node.path,
+                    "repository_id": node.repository_id,
+                    "repository_name": node.repository_name,
+                    "start_line": node.start_line,
+                    "end_line": node.end_line,
+                    "indexed": node.indexed,
+                },
+            )
+        )
+    for index, edge in enumerate(edges):
+        elements.append(
+            CodeGraphElementResponse(
+                group="edges",
+                data={
+                    "id": f"{edge.source}->{edge.target}:{index}",
+                    "source": edge.source,
+                    "target": edge.target,
+                    "path": edge.path,
+                    "lines": edge.lines,
+                    "label": ", ".join(str(line) for line in edge.lines),
+                },
+            )
+        )
+    return elements
+
+
+def _code_hit_to_search_result(hit: CodeSearchHit, index: int) -> SearchResult:
+    text = "\n\n".join(
+        part
+        for part in (
+            hit.signature,
+            hit.docstring,
+            hit.snippet,
+        )
+        if part
+    )
+    return SearchResult(
+        text=text,
+        source=f"{hit.repository_name or hit.repository_id}/{hit.path}",
+        chunk_id=index,
+        score=hit.score,
+        vector_score=hit.vector_score,
+        retrieval_source="code_search",
+        content_type="code",
+        start_line=hit.start_line,
+        end_line=hit.end_line,
+    )
+
+
+def _code_search_answer(functions: list[CodeSearchHit]) -> str:
+    if not functions:
+        return "No matching code functions found."
+
+    lines = ["Found these code entry points:"]
+    for index, hit in enumerate(functions[:10], start=1):
+        location = f"{hit.path}:{hit.start_line}"
+        lines.append(
+            f"{index}. `{hit.qualified_name}` in `{location}` "
+            f"(score {hit.score:.3f})"
+        )
+    return "\n".join(lines)
+
+
+def _select_code_repositories(repository_ids: list[str]) -> list[CodeRepository]:
+    repositories = discover_code_repositories(settings)
+    requested = {
+        repository_id.strip()
+        for repository_id in repository_ids
+        if repository_id.strip()
+    }
+    if not requested:
+        return repositories
+
+    selected = [
+        repository
+        for repository in repositories
+        if repository.id in requested or repository.name in requested
+    ]
+    matched = {
+        value
+        for repository in selected
+        for value in (repository.id, repository.name)
+    }
+    missing = requested - matched
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown code repository: {', '.join(sorted(missing))}",
+        )
+    return selected
 
 
 def parse_user_csv(csv_text: str) -> list[tuple[str, str]]:

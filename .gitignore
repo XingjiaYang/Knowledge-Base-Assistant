@@ -40,6 +40,8 @@ hf_cache/
 .uv-cache/
 data/raw/
 data/cache/
+data/code/*
+!data/code/.gitkeep
 data/uploads/
 *.db
 *.sqlite

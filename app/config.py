@@ -30,6 +30,18 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _env_path(name: str, default: str) -> Path:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return Path(default)
+    return Path(value)
+
+
+def _env_has_value(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and bool(value.strip())
+
+
 def normalize_llm_provider(provider: str) -> str:
     normalized = provider.strip().lower().replace("-", "_")
     if normalized in {"openai", "openai_compatible", "openai_compat"}:
@@ -107,7 +119,7 @@ class Settings:
     debug: bool = _env_bool("DEBUG", False)
     cuda_enabled: bool = _env_bool("CUDA", True)
 
-    docs_dir: Path = PROJECT_ROOT / "data" / "docs"
+    docs_dir: Path = Path(os.getenv("DOCS_DIR", str(PROJECT_ROOT / "data" / "docs")))
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     collection_name: str = os.getenv("QDRANT_COLLECTION", "tech_docs")
     embedding_model: str = os.getenv(
@@ -142,6 +154,39 @@ class Settings:
     retrieve_score_threshold: float = _env_float("RETRIEVE_SCORE_THRESHOLD", 0.0)
     api_top_k_max: int = _env_int("API_TOP_K_MAX", 20)
     api_recall_top_k_max: int = _env_int("API_RECALL_TOP_K_MAX", 1000)
+    code_root_dir: Path = _env_path(
+        "CODE_ROOT_DIR",
+        str(PROJECT_ROOT / "data" / "code"),
+    )
+    code_source_dir_explicit: bool = _env_has_value("CODE_SOURCE_DIR")
+    code_source_dir: Path = _env_path(
+        "CODE_SOURCE_DIR",
+        os.getenv("CODE_ROOT_DIR", str(PROJECT_ROOT / "data" / "code")),
+    )
+    code_files_collection: str = os.getenv("CODE_FILES_COLLECTION", "code_files")
+    code_functions_collection: str = os.getenv(
+        "CODE_FUNCTIONS_COLLECTION",
+        "code_functions",
+    )
+    code_embedding_model: str = os.getenv(
+        "CODE_EMBEDDING_MODEL",
+        "microsoft/codebert-base",
+    )
+    code_embedding_batch_size: int = _env_int("CODE_EMBEDDING_BATCH_SIZE", 8)
+    code_embedding_max_tokens: int = _env_int("CODE_EMBEDDING_MAX_TOKENS", 512)
+    code_file_embedding_max_chars: int = _env_int(
+        "CODE_FILE_EMBEDDING_MAX_CHARS",
+        20000,
+    )
+    code_function_embedding_max_chars: int = _env_int(
+        "CODE_FUNCTION_EMBEDDING_MAX_CHARS",
+        12000,
+    )
+    code_payload_snippet_chars: int = _env_int("CODE_PAYLOAD_SNIPPET_CHARS", 2400)
+    code_search_file_top_k: int = _env_int("CODE_SEARCH_FILE_TOP_K", 20)
+    code_search_function_top_k: int = _env_int("CODE_SEARCH_FUNCTION_TOP_K", 50)
+    code_search_final_top_k: int = _env_int("CODE_SEARCH_FINAL_TOP_K", 10)
+    code_call_graph_depth: int = _env_int("CODE_CALL_GRAPH_DEPTH", 3)
     reranker_enabled: bool = _env_bool("RERANKER_ENABLED", True)
     reranker_model: str = os.getenv("RERANKER_MODEL", "jinaai/jina-reranker-v3")
     reranker_preload: bool = _env_bool("RERANKER_PRELOAD", True)
@@ -154,6 +199,27 @@ class Settings:
         "RERANKER_MAX_DOCUMENTS_PER_CALL",
         64,
     )
+    ray_enabled: bool = _env_bool("RAY_ENABLED", True)
+    ray_address: str = os.getenv("RAY_ADDRESS", "")
+    ray_namespace: str = os.getenv("RAY_NAMESPACE", "kba")
+    ray_actor_num_cpus: float = _env_float("RAY_ACTOR_NUM_CPUS", 1.0)
+    ray_embedding_actor_num_gpus: float = _env_float(
+        "RAY_EMBEDDING_ACTOR_NUM_GPUS",
+        0.5 if _env_bool("CUDA", True) else 0.0,
+    )
+    ray_reranker_actor_num_gpus: float = _env_float(
+        "RAY_RERANKER_ACTOR_NUM_GPUS",
+        0.5 if _env_bool("CUDA", True) else 0.0,
+    )
+    ray_embedding_actor_name: str = os.getenv(
+        "RAY_EMBEDDING_ACTOR_NAME",
+        "kba_embedding",
+    )
+    ray_reranker_actor_name: str = os.getenv(
+        "RAY_RERANKER_ACTOR_NAME",
+        "kba_reranker",
+    )
+    ray_task_timeout_seconds: float = _env_float("RAY_TASK_TIMEOUT_SECONDS", 300.0)
 
     llm_provider: str = os.getenv("LLM_PROVIDER", "openai_compatible")
     llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
@@ -287,6 +353,32 @@ class Settings:
             raise ValueError("API_TOP_K_MAX must be greater than 0.")
         if self.api_recall_top_k_max <= 0:
             raise ValueError("API_RECALL_TOP_K_MAX must be greater than 0.")
+        if not self.code_files_collection.strip():
+            raise ValueError("CODE_FILES_COLLECTION must not be empty.")
+        if not self.code_functions_collection.strip():
+            raise ValueError("CODE_FUNCTIONS_COLLECTION must not be empty.")
+        if not self.code_embedding_model.strip():
+            raise ValueError("CODE_EMBEDDING_MODEL must not be empty.")
+        if self.code_embedding_batch_size <= 0:
+            raise ValueError("CODE_EMBEDDING_BATCH_SIZE must be greater than 0.")
+        if self.code_embedding_max_tokens <= 0:
+            raise ValueError("CODE_EMBEDDING_MAX_TOKENS must be greater than 0.")
+        if self.code_file_embedding_max_chars <= 0:
+            raise ValueError("CODE_FILE_EMBEDDING_MAX_CHARS must be greater than 0.")
+        if self.code_function_embedding_max_chars <= 0:
+            raise ValueError(
+                "CODE_FUNCTION_EMBEDDING_MAX_CHARS must be greater than 0."
+            )
+        if self.code_payload_snippet_chars <= 0:
+            raise ValueError("CODE_PAYLOAD_SNIPPET_CHARS must be greater than 0.")
+        if self.code_search_file_top_k <= 0:
+            raise ValueError("CODE_SEARCH_FILE_TOP_K must be greater than 0.")
+        if self.code_search_function_top_k <= 0:
+            raise ValueError("CODE_SEARCH_FUNCTION_TOP_K must be greater than 0.")
+        if self.code_search_final_top_k <= 0:
+            raise ValueError("CODE_SEARCH_FINAL_TOP_K must be greater than 0.")
+        if self.code_call_graph_depth <= 0:
+            raise ValueError("CODE_CALL_GRAPH_DEPTH must be greater than 0.")
         if not self.reranker_model.strip():
             raise ValueError("RERANKER_MODEL must not be empty.")
         if not self.reranker_dtype.strip():
@@ -295,6 +387,22 @@ class Settings:
             raise ValueError(
                 "RERANKER_MAX_DOCUMENTS_PER_CALL must be greater than 0."
             )
+        if self.ray_actor_num_cpus <= 0:
+            raise ValueError("RAY_ACTOR_NUM_CPUS must be greater than 0.")
+        if self.ray_embedding_actor_num_gpus < 0:
+            raise ValueError(
+                "RAY_EMBEDDING_ACTOR_NUM_GPUS must be greater than or equal to 0."
+            )
+        if self.ray_reranker_actor_num_gpus < 0:
+            raise ValueError(
+                "RAY_RERANKER_ACTOR_NUM_GPUS must be greater than or equal to 0."
+            )
+        if not self.ray_namespace.strip():
+            raise ValueError("RAY_NAMESPACE must not be empty.")
+        if not self.ray_embedding_actor_name.strip():
+            raise ValueError("RAY_EMBEDDING_ACTOR_NAME must not be empty.")
+        if not self.ray_reranker_actor_name.strip():
+            raise ValueError("RAY_RERANKER_ACTOR_NAME must not be empty.")
         if self.llm_timeout_seconds <= 0:
             raise ValueError("LLM_TIMEOUT_SECONDS must be greater than 0.")
         if self.llm_retry_attempts <= 0:

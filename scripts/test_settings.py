@@ -83,10 +83,33 @@ def assert_llm_settings() -> None:
         embedding_classification_task="classification",
         embedding_query_prompt_name="query",
         embedding_passage_prompt_name="document",
+        code_root_dir=Path("/repo/code"),
+        code_source_dir=Path("/repo/code/repo-one"),
+        code_files_collection="code-file-test",
+        code_functions_collection="code-function-test",
+        code_embedding_model="microsoft/codebert-base",
+        code_embedding_batch_size=4,
+        code_embedding_max_tokens=256,
+        code_file_embedding_max_chars=6000,
+        code_function_embedding_max_chars=3000,
+        code_payload_snippet_chars=1200,
+        code_search_file_top_k=11,
+        code_search_function_top_k=22,
+        code_search_final_top_k=7,
+        code_call_graph_depth=4,
         reranker_model="jinaai/jina-reranker-v3",
         reranker_preload=True,
         reranker_dtype="auto",
         reranker_max_documents_per_call=32,
+        ray_enabled=True,
+        ray_address="ray://localhost:10001",
+        ray_namespace="test-ns",
+        ray_actor_num_cpus=2.0,
+        ray_embedding_actor_num_gpus=0.25,
+        ray_reranker_actor_num_gpus=0.75,
+        ray_embedding_actor_name="embedding-test",
+        ray_reranker_actor_name="reranker-test",
+        ray_task_timeout_seconds=12.5,
     )
 
     if config.llm_provider != "anthropic":
@@ -129,6 +152,32 @@ def assert_llm_settings() -> None:
         raise AssertionError("Embedding query prompt name should be configurable.")
     if config.embedding_passage_prompt_name != "document":
         raise AssertionError("Embedding passage prompt name should be configurable.")
+    if config.code_root_dir != Path("/repo/code"):
+        raise AssertionError("Code root directory should be configurable.")
+    if config.code_source_dir != Path("/repo/code/repo-one"):
+        raise AssertionError("Code source directory should be configurable.")
+    if (
+        config.code_files_collection != "code-file-test"
+        or config.code_functions_collection != "code-function-test"
+    ):
+        raise AssertionError("Code Qdrant collections should be configurable.")
+    if config.code_embedding_model != "microsoft/codebert-base":
+        raise AssertionError("Code embedding model should be configurable.")
+    if (
+        config.code_embedding_batch_size != 4
+        or config.code_embedding_max_tokens != 256
+        or config.code_file_embedding_max_chars != 6000
+        or config.code_function_embedding_max_chars != 3000
+        or config.code_payload_snippet_chars != 1200
+    ):
+        raise AssertionError("Code embedding limits should be configurable.")
+    if (
+        config.code_search_file_top_k != 11
+        or config.code_search_function_top_k != 22
+        or config.code_search_final_top_k != 7
+        or config.code_call_graph_depth != 4
+    ):
+        raise AssertionError("Code search limits should be configurable.")
     if config.reranker_model != "jinaai/jina-reranker-v3":
         raise AssertionError("Reranker model should be configurable.")
     if not config.reranker_preload:
@@ -137,6 +186,21 @@ def assert_llm_settings() -> None:
         raise AssertionError("Reranker dtype should be configurable.")
     if config.reranker_max_documents_per_call != 32:
         raise AssertionError("Reranker per-call document limit should be configurable.")
+    if not config.ray_enabled or config.ray_address != "ray://localhost:10001":
+        raise AssertionError("Ray runtime should be configurable.")
+    if (
+        config.ray_namespace != "test-ns"
+        or config.ray_embedding_actor_name != "embedding-test"
+        or config.ray_reranker_actor_name != "reranker-test"
+    ):
+        raise AssertionError("Ray actor names and namespace should be configurable.")
+    if (
+        config.ray_actor_num_cpus != 2.0
+        or config.ray_embedding_actor_num_gpus != 0.25
+        or config.ray_reranker_actor_num_gpus != 0.75
+        or config.ray_task_timeout_seconds != 12.5
+    ):
+        raise AssertionError("Ray actor resource settings should be configurable.")
 
     print("LLM settings -> ok")
 
@@ -621,6 +685,18 @@ def assert_invalid_settings_rejected() -> None:
         {"bm25_top_k": 0},
         {"recall_top_k": 0},
         {"rrf_top_k": 0},
+        {"code_files_collection": ""},
+        {"code_functions_collection": ""},
+        {"code_embedding_model": ""},
+        {"code_embedding_batch_size": 0},
+        {"code_embedding_max_tokens": 0},
+        {"code_file_embedding_max_chars": 0},
+        {"code_function_embedding_max_chars": 0},
+        {"code_payload_snippet_chars": 0},
+        {"code_search_file_top_k": 0},
+        {"code_search_function_top_k": 0},
+        {"code_search_final_top_k": 0},
+        {"code_call_graph_depth": 0},
         {"reranker_model": ""},
         {"reranker_dtype": ""},
         {"reranker_max_documents_per_call": 0},
@@ -727,6 +803,12 @@ def assert_default_embedding_settings() -> None:
         raise AssertionError("Default embedding intent summary budget should expand.")
     if config.intent_embedding_text_max_chars != 12000:
         raise AssertionError("Default embedding intent text budget should expand.")
+    if not config.ray_enabled:
+        raise AssertionError("Ray actor scheduling should be enabled by default.")
+    if config.ray_embedding_actor_num_gpus != 0.5:
+        raise AssertionError("Default embedding actor should request fractional GPU.")
+    if config.ray_reranker_actor_num_gpus != 0.5:
+        raise AssertionError("Default reranker actor should request fractional GPU.")
 
     print("Default embedding settings -> ok")
 

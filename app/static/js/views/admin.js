@@ -1,10 +1,10 @@
 // Admin dashboard: list users, create, CSV import, toggle role, reset
 // password, clear chat data, and delete users.
 
-import { state, on, emit } from "../store.js?v=20260620-rag-only";
-import { api } from "../api.js?v=20260620-rag-only";
-import { byId, el, clear, icon } from "../dom.js?v=20260620-rag-only";
-import { loadSessions } from "./sessions.js?v=20260620-rag-only";
+import { state, on, emit } from "../store.js?v=20260626-code-search";
+import { api } from "../api.js?v=20260626-code-search";
+import { byId, el, clear, icon } from "../dom.js?v=20260626-code-search";
+import { loadSessions } from "./sessions.js?v=20260626-code-search";
 
 let els = {};
 

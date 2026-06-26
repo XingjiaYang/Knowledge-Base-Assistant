@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 ARG API_BASE_IMAGE=pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime
 FROM ${API_BASE_IMAGE}
 
@@ -16,8 +15,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY app ./app
 COPY scripts ./scripts
-COPY data/docs ./data/docs
 COPY docker ./docker
+
+RUN mkdir -p data/docs
 
 RUN chmod +x docker/entrypoint.sh
 

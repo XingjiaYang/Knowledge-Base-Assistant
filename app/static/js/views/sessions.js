@@ -1,9 +1,9 @@
 // Sidebar session list: search/filter, select, inline rename, and delete.
 // Also owns the session data actions used by the chat view.
 
-import { state, on, emit } from "../store.js?v=20260620-rag-only";
-import { api } from "../api.js?v=20260620-rag-only";
-import { byId, el, clear, icon } from "../dom.js?v=20260620-rag-only";
+import { state, on, emit } from "../store.js?v=20260626-code-search";
+import { api } from "../api.js?v=20260626-code-search";
+import { byId, el, clear, icon } from "../dom.js?v=20260626-code-search";
 
 let els = {};
 
@@ -88,22 +88,28 @@ function applySessionDetail(session) {
   state.renamingSessionId = "";
   state.conversationSummary = session.conversation_summary || "";
   state.summarizedMessageCount = session.compacted_message_count || 0;
-  state.messages = (session.messages || []).map((m) => ({
-    role: m.role,
-    content: m.content,
-    contexts: m.contexts || [],
-    usedRag: Boolean(m.used_rag),
-    route: m.route || "",
-    routeReason: m.route_reason || "",
-    retrievalDegraded: Boolean(m.retrieval_degraded),
-    qdrantDegraded: Boolean(m.qdrant_degraded),
-    rerankerDegraded: Boolean(m.reranker_degraded),
-    degradationReason: m.degradation_reason || "",
-  }));
+  state.messages = (session.messages || []).map((m) => {
+    const message = {
+      role: m.role,
+      content: m.content,
+      contexts: m.contexts || [],
+      usedRag: Boolean(m.used_rag),
+      route: m.route || "",
+      routeReason: m.route_reason || "",
+      retrievalDegraded: Boolean(m.retrieval_degraded),
+      qdrantDegraded: Boolean(m.qdrant_degraded),
+      rerankerDegraded: Boolean(m.reranker_degraded),
+      degradationReason: m.degradation_reason || "",
+    };
+    if (message.role === "assistant" && message.route === "code_search") {
+      message.codeResults = restoreCodeResults(message);
+    }
+    return message;
+  });
 
   const lastAssistant = [...state.messages].reverse().find((m) => m.role === "assistant");
   state.latestRoute = lastAssistant
-    ? `${lastAssistant.usedRag ? "RAG" : "Direct"} · ${lastAssistant.route || "unknown"}${
+    ? `${lastAssistant.route === "code_search" ? "Code" : lastAssistant.usedRag ? "RAG" : "Direct"} · ${lastAssistant.route || "unknown"}${
         lastAssistant.retrievalDegraded ? " · Degraded" : ""
       }`
     : "None";
@@ -122,6 +128,53 @@ function applySessionDetail(session) {
   emit("meta");
   emit("session-selected");
   emit("focus-prompt");
+}
+
+function restoreCodeResults(message) {
+  const contexts = message.contexts || [];
+  if (!contexts.length) return [];
+
+  const answerHits = [...String(message.content || "").matchAll(
+    /^\d+\.\s+`([^`]+)`\s+in\s+`(.+):(\d+)`/gm,
+  )];
+
+  return contexts.map((context, index) => {
+    const source = String(context.source || "");
+    const slashIndex = source.indexOf("/");
+    const repositoryName = slashIndex > 0 ? source.slice(0, slashIndex) : "";
+    const path = slashIndex > 0 ? source.slice(slashIndex + 1) : source;
+    const answerHit = answerHits[index];
+    const qualifiedName = answerHit?.[1] || firstCodeLine(context.text) || source;
+    const startLine = Number(context.start_line || answerHit?.[3] || 0);
+    return {
+      function_id: "",
+      file_id: "",
+      repository_id: repositoryName,
+      repository_name: repositoryName,
+      source_root: "",
+      path,
+      language: "",
+      name: qualifiedName.split(/::|\./).pop() || qualifiedName,
+      qualified_name: qualifiedName,
+      kind: "function",
+      signature: firstCodeLine(context.text),
+      docstring: "",
+      snippet: context.text || "",
+      start_line: startLine,
+      end_line: Number(context.end_line || startLine || 0),
+      score: Number(context.score || context.vector_score || 0),
+      vector_score: Number(context.vector_score || context.score || 0),
+      file_score: null,
+      rerank_score: context.rerank_score ?? null,
+    };
+  });
+}
+
+function firstCodeLine(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) || "";
 }
 
 async function doRename(id, title) {

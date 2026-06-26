@@ -1,7 +1,7 @@
 // Thin HTTP layer. Attaches the bearer token, surfaces 401/403 as events,
 // and returns parsed JSON (throwing on non-OK with the server's detail).
 
-import { state, loadToken, emit } from "./store.js?v=20260620-rag-only";
+import { state, loadToken, emit } from "./store.js?v=20260626-code-search";
 
 async function raw(path, options = {}, { auth = true } = {}) {
   const headers = { ...(options.headers || {}) };
@@ -61,6 +61,21 @@ export const api = {
 
   // rag
   ask: (payload) => send("/rag", { method: "POST", ...jsonBody(payload) }),
+
+  // code search
+  codeRepositories: () => send("/code/repositories"),
+  codeIndex: (payload) => send("/code/index", { method: "POST", ...jsonBody(payload) }),
+  codeSearch: (payload) => send("/code/search", { method: "POST", ...jsonBody(payload) }),
+  codeCallGraph: (functionName, depth = 3, repositoryIds = []) => {
+    const params = new URLSearchParams({
+      function_name: functionName,
+      depth: String(depth),
+    });
+    for (const repositoryId of repositoryIds || []) {
+      if (repositoryId) params.append("repository_ids", repositoryId);
+    }
+    return send(`/code/call-graph?${params.toString()}`);
+  },
 
   // admin
   listUsers: () => send("/admin/users"),
