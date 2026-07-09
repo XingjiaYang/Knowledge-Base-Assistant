@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+import hashlib
 import logging
 import math
 from pathlib import Path
@@ -889,6 +890,7 @@ class VectorStore:
 
     def _points_for_file(self, file_path: Path) -> list[PointStruct]:
         text = file_path.read_text(encoding="utf-8")
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         chunks = chunk_markdown(
             text,
             chunk_size=self.config.chunk_size,
@@ -906,6 +908,7 @@ class VectorStore:
         points: list[PointStruct] = []
         source_key = self._source_key(file_path)
         source = self._display_source(file_path)
+        source_doc_id = str(uuid5(NAMESPACE_URL, source_key))
         for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             point_id = str(uuid5(NAMESPACE_URL, f"{source_key}:{idx}"))
             points.append(
@@ -915,6 +918,9 @@ class VectorStore:
                     payload={
                         "source": source,
                         "source_key": source_key,
+                        "source_doc_id": source_doc_id,
+                        "version_id": content_hash,
+                        "content_hash": content_hash,
                         "chunk_id": idx,
                         "text": chunk.text,
                         "content_type": chunk.content_type,
@@ -1261,6 +1267,9 @@ class VectorStore:
                 "BM25S is required for keyword recall. Install requirements.api.txt."
             ) from exc
 
+        if self.config.docs_source == "s3":
+            return self._build_bm25_index_from_qdrant(signature, bm25s)
+
         documents: list[SearchResult] = []
         tokenized_documents: list[list[str]] = []
 
@@ -1311,7 +1320,74 @@ class VectorStore:
             documents=tuple(documents),
         )
 
+    def _build_bm25_index_from_qdrant(
+        self,
+        signature: tuple[tuple[str, int, int], ...],
+        bm25s_module: object,
+    ) -> _BM25Index:
+        documents: list[SearchResult] = []
+        tokenized_documents: list[list[str]] = []
+        offset = None
+
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.config.collection_name,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for record in records:
+                payload = record.payload or {}
+                text = str(payload.get("text", ""))
+                if not text:
+                    continue
+
+                tokens = _bm25_tokens(self._bm25_payload_text(payload))
+                if not tokens:
+                    continue
+
+                documents.append(
+                    SearchResult(
+                        text=text,
+                        source=self._public_source(str(payload.get("source", ""))),
+                        chunk_id=int(payload.get("chunk_id", -1)),
+                        score=0.0,
+                        content_type=str(payload.get("content_type", "text")),
+                        h1=str(payload.get("h1", "")),
+                        h2=str(payload.get("h2", "")),
+                        h3=str(payload.get("h3", "")),
+                        headings=tuple(payload.get("headings", ())),
+                        start_line=int(payload.get("start_line", 0)),
+                        end_line=int(payload.get("end_line", 0)),
+                        retrieval_source="bm25",
+                    )
+                )
+                tokenized_documents.append(tokens)
+
+            if offset is None:
+                break
+
+        retriever = None
+        if documents:
+            retriever = bm25s_module.BM25(corpus=documents)
+            retriever.index(tokenized_documents, show_progress=False)
+
+        logger.info(
+            "Built BM25S index from %s Qdrant chunks in %s.",
+            len(documents),
+            self.config.collection_name,
+        )
+        return _BM25Index(
+            signature=signature,
+            retriever=retriever,
+            documents=tuple(documents),
+        )
+
     def _docs_signature(self) -> tuple[tuple[str, int, int], ...]:
+        if self.config.docs_source == "s3":
+            return self._qdrant_docs_signature()
+
         docs_dir = self.config.docs_dir
         if not docs_dir.exists():
             return ()
@@ -1321,6 +1397,44 @@ class VectorStore:
             stat = file_path.stat()
             signature.append((str(file_path.resolve()), stat.st_mtime_ns, stat.st_size))
         return tuple(signature)
+
+    def _qdrant_docs_signature(self) -> tuple[tuple[str, int, int], ...]:
+        try:
+            active_collection = self._active_collection_name(self.config.collection_name)
+            info = self.client.get_collection(collection_name=self.config.collection_name)
+        except Exception:
+            logger.exception(
+                "Failed to inspect active Qdrant document collection for BM25."
+            )
+            return ()
+
+        points_count = int(getattr(info, "points_count", 0) or 0)
+        vectors_count = int(getattr(info, "vectors_count", 0) or 0)
+        return ((f"qdrant:{active_collection}", points_count, vectors_count),)
+
+    def _active_collection_name(self, collection_or_alias: str) -> str:
+        try:
+            aliases = self.client.get_aliases().aliases
+        except Exception:
+            return collection_or_alias
+
+        for alias in aliases:
+            if alias.alias_name == collection_or_alias:
+                return alias.collection_name
+        return collection_or_alias
+
+    @staticmethod
+    def _bm25_payload_text(payload: dict[str, object]) -> str:
+        parts = []
+        headings = payload.get("headings") or ()
+        if isinstance(headings, Sequence) and not isinstance(headings, (str, bytes)):
+            heading_text = " > ".join(str(heading) for heading in headings if heading)
+            if heading_text:
+                parts.append(f"Headings: {heading_text}")
+        content_type = str(payload.get("content_type", "text"))
+        parts.append(f"Content type: {content_type}")
+        parts.append(str(payload.get("text", "")))
+        return "\n\n".join(part for part in parts if part).strip()
 
     @staticmethod
     def _rrf_fuse(

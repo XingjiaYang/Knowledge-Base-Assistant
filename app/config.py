@@ -120,6 +120,30 @@ class Settings:
     cuda_enabled: bool = _env_bool("CUDA", True)
 
     docs_dir: Path = Path(os.getenv("DOCS_DIR", str(PROJECT_ROOT / "data" / "docs")))
+    docs_source: str = os.getenv("DOCS_SOURCE", "local")
+    docs_s3_bucket: str = os.getenv("DOCS_S3_BUCKET", "")
+    docs_s3_prefix: str = os.getenv("DOCS_S3_PREFIX", "docs")
+    docs_s3_endpoint_url: str = os.getenv("DOCS_S3_ENDPOINT_URL", "")
+    docs_s3_region: str = os.getenv("DOCS_S3_REGION", "us-east-1")
+    docs_s3_access_key_id: str = os.getenv("DOCS_S3_ACCESS_KEY_ID", "")
+    docs_s3_secret_access_key: str = os.getenv("DOCS_S3_SECRET_ACCESS_KEY", "")
+    docs_s3_session_token: str = os.getenv("DOCS_S3_SESSION_TOKEN", "")
+    docs_s3_force_path_style: bool = _env_bool("DOCS_S3_FORCE_PATH_STYLE", False)
+    docs_s3_require_versioning: bool = _env_bool("DOCS_S3_REQUIRE_VERSIONING", True)
+    docs_s3_retain_versions: int = _env_int("DOCS_S3_RETAIN_VERSIONS", 5)
+    docs_s3_processing_retain_versions: int = _env_int(
+        "DOCS_S3_PROCESSING_RETAIN_VERSIONS",
+        6,
+    )
+    docs_s3_manifest_prefix: str = os.getenv(
+        "DOCS_S3_MANIFEST_PREFIX",
+        "_kba/manifests/docs",
+    )
+    qdrant_retain_versions: int = _env_int("QDRANT_RETAIN_VERSIONS", 2)
+    qdrant_processing_retain_versions: int = _env_int(
+        "QDRANT_PROCESSING_RETAIN_VERSIONS",
+        3,
+    )
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     collection_name: str = os.getenv("QDRANT_COLLECTION", "tech_docs")
     embedding_model: str = os.getenv(
@@ -352,6 +376,28 @@ class Settings:
             raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE.")
         if self.chunk_overlap and self.chunk_overlap >= self.chunk_size - 1:
             raise ValueError("CHUNK_OVERLAP must leave room for new chunk content.")
+        if self.docs_source not in {"local", "s3"}:
+            raise ValueError("DOCS_SOURCE must be local or s3.")
+        if self.docs_source == "s3" and not self.docs_s3_bucket.strip():
+            raise ValueError("DOCS_S3_BUCKET must not be empty when DOCS_SOURCE=s3.")
+        if self.docs_s3_prefix.startswith("/"):
+            raise ValueError("DOCS_S3_PREFIX must not start with '/'.")
+        if self.docs_s3_manifest_prefix.startswith("/"):
+            raise ValueError("DOCS_S3_MANIFEST_PREFIX must not start with '/'.")
+        if self.docs_s3_retain_versions <= 0:
+            raise ValueError("DOCS_S3_RETAIN_VERSIONS must be greater than 0.")
+        if self.docs_s3_processing_retain_versions < self.docs_s3_retain_versions:
+            raise ValueError(
+                "DOCS_S3_PROCESSING_RETAIN_VERSIONS must be greater than or "
+                "equal to DOCS_S3_RETAIN_VERSIONS."
+            )
+        if self.qdrant_retain_versions <= 0:
+            raise ValueError("QDRANT_RETAIN_VERSIONS must be greater than 0.")
+        if self.qdrant_processing_retain_versions < self.qdrant_retain_versions:
+            raise ValueError(
+                "QDRANT_PROCESSING_RETAIN_VERSIONS must be greater than or "
+                "equal to QDRANT_RETAIN_VERSIONS."
+            )
         if not self.embedding_model.strip():
             raise ValueError("EMBEDDING_MODEL must not be empty.")
         if self.retrieve_top_k <= 0:

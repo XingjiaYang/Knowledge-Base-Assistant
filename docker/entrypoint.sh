@@ -7,9 +7,14 @@ export LLM_API_KEY="${LLM_API_KEY:-}"
 
 API_HOST="${API_HOST:-0.0.0.0}"
 API_PORT="${API_PORT:-8080}"
-INGEST_ON_STARTUP="${INGEST_ON_STARTUP:-1}"
+INGEST_ON_STARTUP="${INGEST_ON_STARTUP:-0}"
 INGEST_USE_RAY="${INGEST_USE_RAY:-0}"
 RECREATE_COLLECTION="${RECREATE_COLLECTION:-0}"
+DOCS_SOURCE="${DOCS_SOURCE:-local}"
+DOCS_INIT_ON_IMAGE_BUILD="${DOCS_INIT_ON_IMAGE_BUILD:-1}"
+DOCS_INIT_DELETE_REMOVED="${DOCS_INIT_DELETE_REMOVED:-1}"
+DOCS_IMAGE_BUILD_ID_FILE="${DOCS_IMAGE_BUILD_ID_FILE:-/app/.image_build_id}"
+DOCS_INIT_LOCAL_MARKER="${DOCS_INIT_LOCAL_MARKER:-/app/.docs_init_build_id}"
 WAIT_FOR_LLM="${WAIT_FOR_LLM:-0}"
 SERVICE_TIMEOUT_SECONDS="${SERVICE_TIMEOUT_SECONDS:-1800}"
 POSTGRES_HOST="${POSTGRES_HOST:-postgres}"
@@ -113,7 +118,33 @@ LLM_READY_URL="${LLM_READY_URL:-${LLM_BASE_URL%/}${LLM_READY_PATH}}"
 wait_http "Qdrant" "$QDRANT_READY_URL" "$SERVICE_TIMEOUT_SECONDS"
 wait_tcp "PostgreSQL" "$POSTGRES_HOST" "$POSTGRES_PORT" "$SERVICE_TIMEOUT_SECONDS"
 
-if is_true "$INGEST_ON_STARTUP"; then
+if [[ "${DOCS_SOURCE,,}" == "s3" ]] && is_true "$DOCS_INIT_ON_IMAGE_BUILD"; then
+  image_build_id="unknown"
+  if [[ -s "$DOCS_IMAGE_BUILD_ID_FILE" ]]; then
+    image_build_id="$(tr -d '\n\r' < "$DOCS_IMAGE_BUILD_ID_FILE")"
+  fi
+
+  initialized_build_id=""
+  if [[ -s "$DOCS_INIT_LOCAL_MARKER" ]]; then
+    initialized_build_id="$(tr -d '\n\r' < "$DOCS_INIT_LOCAL_MARKER")"
+  fi
+
+  if [[ "$initialized_build_id" == "$image_build_id" ]]; then
+    echo "Skipping S3 document initialization; image build ${image_build_id} is already initialized in this container."
+  else
+    init_args=(--build-id "$image_build_id")
+    if is_true "$DOCS_INIT_DELETE_REMOVED"; then
+      init_args+=(--delete-removed)
+    fi
+
+    if is_true "$INGEST_USE_RAY"; then
+      python scripts/init_docs_on_build.py "${init_args[@]}"
+    else
+      RAY_ENABLED=0 python scripts/init_docs_on_build.py "${init_args[@]}"
+    fi
+    printf '%s\n' "$image_build_id" > "$DOCS_INIT_LOCAL_MARKER"
+  fi
+elif is_true "$INGEST_ON_STARTUP"; then
   ingest_args=()
   if is_true "$RECREATE_COLLECTION"; then
     ingest_args+=(--recreate)
