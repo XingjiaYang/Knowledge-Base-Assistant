@@ -25,7 +25,8 @@ boundaries that should be updated when `data/docs/` is replaced.
 
 ## Highlights
 
-- Docker Compose deployment for PostgreSQL, Qdrant, local MinIO S3 storage, and FastAPI.
+- Docker Compose deployment for PostgreSQL, Qdrant, local MinIO S3 storage,
+  Ray model workers, and FastAPI.
 - Configurable cloud LLM providers with an optional local vLLM profile.
 - Jina embeddings v5 text small by default, with task/prompt routing for
   retrieval-query, retrieval-passage, and classification embeddings.
@@ -83,8 +84,8 @@ Main modules:
   tagged LLM fallback routing.
 - `app/rag.py`: hybrid recall, RRF fusion, reranking, prompt construction, and
   context-budget-aware history compaction.
-- `app/reranker.py`: startup-preloaded Jina cross-encoder reranking for
-  recalled chunks.
+- `app/reranker.py`: Jina cross-encoder reranking for recalled chunks, using
+  Ray actors when enabled.
 - `app/vector_store.py`: Markdown chunking, Jina embeddings v5 task routing,
   BM25 indexing, Qdrant collection management, vector search, and RRF fusion.
 - `app/code_indexer.py`: tree-sitter based Python/C++ source parsing, CodeBERT
@@ -198,8 +199,8 @@ docker compose down -v
 
 ## Startup Behavior
 
-`compose.yaml` starts four long-running services and one one-shot initializer by
-default:
+`compose.yaml` starts seven long-running services and one one-shot initializer
+by default:
 
 - `postgres`: runs PostgreSQL inside Docker and stores users, login tokens, and
   chat sessions in the `postgres_data` Docker volume.
@@ -208,22 +209,79 @@ default:
   Docker volume.
 - `minio-init`: creates the configured document bucket and enables S3 object
   versioning before the API starts.
-- `api`: waits for Qdrant, PostgreSQL, and MinIO initialization, optionally
-  runs document initialization, and starts FastAPI on container port `8080`.
+- `ray-head`: owns the Ray cluster control plane and Ray client endpoint.
+- `ray-worker-embedding-1`: runs the named document embedding actor and is
+  tagged with Ray resource `ray_worker_embedding`.
+- `ray-worker-reranker-1`: runs the named reranker actor and is tagged with Ray
+  resource `ray_worker_reranker`.
+- `main`: waits for Qdrant, PostgreSQL, and MinIO initialization, optionally
+  runs document initialization, connects to Ray, and starts FastAPI on
+  container port `8080`.
+
+Docker service architecture:
+
+```mermaid
+flowchart TD
+    User["Browser / curl<br/>localhost:8080"] --> Main["main<br/>FastAPI + UI + RAG orchestration<br/>Ray client only"]
+
+    subgraph Compose["Docker Compose network"]
+        Main
+        PG["postgres<br/>PostgreSQL<br/>users / sessions / messages / settings"]
+        Qdrant["qdrant<br/>Qdrant<br/>vector collections + aliases"]
+        MinIO["minio<br/>S3-compatible object store<br/>versioned docs"]
+        MinIOInit["minio-init<br/>one-shot bucket init<br/>enable versioning"]
+        RayHead["ray-head<br/>Ray control plane<br/>ray://ray-head:10001"]
+        EmbedWorker["ray-worker-embedding-1<br/>Ray worker<br/>resource: ray_worker_embedding<br/>hosts kba_embedding actor"]
+        RerankWorker["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker<br/>hosts kba_reranker actor"]
+        VLLM["vllm<br/>optional local-llm profile<br/>OpenAI-compatible LLM server"]
+    end
+
+    Main --> PG
+    Main --> Qdrant
+    Main --> MinIO
+    Main --> RayHead
+    MinIOInit --> MinIO
+    RayHead --> EmbedWorker
+    RayHead --> RerankWorker
+    Main -. optional .-> VLLM
+    Main --> CloudLLM["Cloud LLM API<br/>OpenAI-compatible / Anthropic"]
+
+    subgraph Volumes["Docker volumes and bind mounts"]
+        PGVol["postgres_data"]
+        QVol["qdrant_storage"]
+        S3Vol["minio_data"]
+        HFVol["huggingface_cache"]
+        DataBind["./data:/app/data:ro"]
+        ModelsBind["./models:/models:ro"]
+    end
+
+    PG --> PGVol
+    Qdrant --> QVol
+    MinIO --> S3Vol
+    Main --> DataBind
+    Main --> HFVol
+    Main --> ModelsBind
+    EmbedWorker --> HFVol
+    EmbedWorker --> ModelsBind
+    RerankWorker --> HFVol
+    RerankWorker --> ModelsBind
+```
 
 Startup and image-bound document initialization:
 
 ```mermaid
 flowchart TD
-    A["docker compose up --build"] --> B["Build api image"]
+    A["docker compose up --build"] --> B["Build main image"]
     B --> C["Bake DOCS_INIT_BUILD_ID into /app/.image_build_id"]
     A --> D["Start postgres"]
     A --> E["Start qdrant"]
     A --> F["Start minio"]
+    A --> R["Start Ray head and model workers"]
     F --> G["minio-init creates bucket and enables versioning"]
-    D --> H["api entrypoint waits for PostgreSQL"]
+    D --> H["main entrypoint waits for PostgreSQL"]
     E --> H
     G --> H
+    R --> H
     H --> I{"DOCS_SOURCE=s3 and DOCS_INIT_ON_IMAGE_BUILD=1?"}
     I -- "no" --> J["Skip automatic document initialization"]
     I -- "yes" --> K{"Build id already marked in S3 or local marker?"}
@@ -255,6 +313,7 @@ Important startup flags:
 
 ```bash
 INGEST_ON_STARTUP=0      # manual document ingest is the default
+INGEST_USE_RAY=1         # document ingest embeddings run on Ray workers
 RECREATE_COLLECTION=0    # local mode: rebuild collection; S3 mode: rebuild version
 DOCS_INIT_ON_IMAGE_BUILD=1 # S3 mode: initialize docs once per image build id
 DOCS_INIT_DELETE_REMOVED=1 # S3 build init removes remote docs missing locally
@@ -265,6 +324,11 @@ POSTGRES_IMAGE=postgres:17-alpine
 MINIO_IMAGE=minio/minio:latest
 MINIO_API_PORT=9000      # local S3 API
 MINIO_CONSOLE_PORT=9001  # local MinIO browser console
+RAY_ADDRESS=ray://ray-head:10001
+RAY_LOCAL_FALLBACK=0     # do not load embedding/reranker models in main
+GRPC_ENABLE_FORK_SUPPORT=0 # keep Ray Client stable inside Compose containers
+RAY_EMBEDDING_ACTOR_RESOURCE=ray_worker_embedding
+RAY_RERANKER_ACTOR_RESOURCE=ray_worker_reranker
 ```
 
 For fast restarts after the image has already been built:
@@ -292,7 +356,7 @@ CODE_ROOT_DIR=/app/data/code
 CODE_FILES_COLLECTION=code_files
 CODE_FUNCTIONS_COLLECTION=code_functions
 CODE_EMBEDDING_MODEL=microsoft/codebert-base
-CODE_EMBEDDING_PRELOAD=1
+CODE_EMBEDDING_PRELOAD=0
 CODE_EMBEDDING_PRELOAD_RETRIES=3
 CODE_EMBEDDING_PRELOAD_RETRY_SECONDS=20
 CODE_SEARCH_FILE_TOP_K=20
@@ -300,6 +364,9 @@ CODE_SEARCH_FUNCTION_TOP_K=50
 CODE_SEARCH_FINAL_TOP_K=10
 CODE_CALL_GRAPH_DEPTH=3
 RAY_ENABLED=1
+RAY_ADDRESS=ray://ray-head:10001
+RAY_LOCAL_FALLBACK=0
+GRPC_ENABLE_FORK_SUPPORT=0
 RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS=0
 RAY_CODE_EMBEDDING_ACTOR_NAME=kba_code_embedding
 ```
@@ -342,7 +409,7 @@ curl -sS http://localhost:8080/code/index \
 For operational scripts or CI, you can still build from the container shell:
 
 ```bash
-docker compose exec -T api python scripts/index_code.py \
+docker compose exec -T main python scripts/index_code.py \
   --recreate
 ```
 
@@ -504,8 +571,8 @@ INTENT_EMBEDDING_MARGIN=0.06
 
 `LLM_PROVIDER=openai_compatible` works with OpenAI-compatible cloud APIs and
 local vLLM. For Anthropic Claude, use `LLM_PROVIDER=anthropic` and
-`LLM_BASE_URL=https://api.anthropic.com/v1`. Embeddings remain local through
-SentenceTransformers.
+`LLM_BASE_URL=https://api.anthropic.com/v1`. Embeddings run through the
+configured Ray embedding actor by default.
 
 Leave `LLM_HEALTH_PATH` blank to use provider-specific health defaults:
 OpenAI-compatible providers use `GET /models`, while Anthropic uses
@@ -560,15 +627,12 @@ the LLM prompt and response references. The browser UI exposes these values as
 and `5`. Set `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector
 results before fusion. `/health/details` returns the active defaults so the UI
 can initialize all four controls after login. With `CUDA=TRUE` (the default),
-the Jina embedding model and Jina reranker prefer CUDA when PyTorch can see a
-compatible NVIDIA GPU; if CUDA is not visible or model placement fails, they
-log the fallback and continue on CPU. Set `CUDA=FALSE` to force CPU.
-The default API image uses the PyTorch CUDA runtime image, so no host CUDA
-toolkit install is required. With `RERANKER_PRELOAD=1`, the API loads
-and warms the reranker during startup through Jina's native
-`AutoModel.rerank()` interface. If reranker warmup or runtime reranking fails,
-the service continues and feeds the unre-ranked RRF results to the LLM using
-the same `Final K` limit.
+the Ray model workers expose GPU resources and run the Jina embedding model and
+Jina reranker as detached named actors. The `main` container connects to
+`ray://ray-head:10001` and, with `RAY_LOCAL_FALLBACK=0`, does not load those
+models locally. Set `CUDA=FALSE` to force the Ray workers and actor resource
+requests to CPU. The default API image uses the PyTorch CUDA runtime image, so
+no host CUDA toolkit install is required.
 `jina-reranker-v3` is a listwise reranker, so candidates are reranked in
 batches of `RERANKER_MAX_DOCUMENTS_PER_CALL` when recall returns more than the
 model should process in one call.
@@ -584,12 +648,12 @@ flowchart TD
     D --> E{"Needs local documents?"}
     E -- "no" --> Z["Direct chat with LLM"]
     E -- "yes" --> F
-    F --> G["Embed query with Jina retrieval query prompt"]
+    F --> G["Embed query through Ray embedding actor"]
     F --> H["BM25S keyword recall from active Qdrant payload cache"]
     G --> I["Qdrant vector recall through tech_docs alias"]
     H --> J["RRF fusion"]
     I --> J
-    J --> K["Jina cross-encoder rerank"]
+    J --> K["Rerank through Ray reranker actor"]
     K --> L["Keep Final K chunks"]
     L --> M["Build prompt with references and conversation memory"]
     M --> N["LLM answer"]
@@ -601,17 +665,18 @@ sessions, runtime settings, messages, and retrieved-context snapshots for past
 answers. The current chunk text lives in Qdrant payloads and is rebuildable
 from the S3 source documents.
 
-Retrieval degrades explicitly instead of failing silently. If Qdrant/vector
-recall fails, the answer falls back to BM25-only recall from local Markdown. If
-the reranker fails, the pipeline skips reranking and uses the coarse RRF result
-list, capped by `Final K`. Responses and stored assistant messages include
+Retrieval degrades explicitly instead of failing silently. If BM25S keyword
+recall fails, the answer continues with Qdrant/vector-only recall. If
+Qdrant/vector recall fails, the answer falls back to BM25-only recall. If the
+reranker actor fails, the pipeline skips reranking and uses the coarse RRF
+result list, capped by `Final K`. Responses and stored assistant messages include
 `retrieval_degraded`, `qdrant_degraded`, `reranker_degraded`, and
 `degradation_reason`; server logs write the same booleans, and the browser
 shows a degraded retrieval notice beside the answer and references.
 
-The default Compose configuration exposes all visible NVIDIA GPUs to the API
-container with `gpus: all`, so a plain startup uses CUDA when Docker can provide
-GPU devices:
+The default Compose configuration exposes NVIDIA GPU devices to
+`ray-worker-embedding-1` and `ray-worker-reranker-1`, while the `main` container
+remains a Ray client and does not request GPUs:
 
 ```bash
 docker compose up --build
@@ -716,11 +781,14 @@ For host-side Mihomo, enable Allow LAN / bind to `0.0.0.0`, then set:
 ```bash
 DOCKER_HTTP_PROXY=http://host.docker.internal:7890
 DOCKER_HTTPS_PROXY=http://host.docker.internal:7890
-DOCKER_NO_PROXY=postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+DOCKER_NO_PROXY=postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+GRPC_ENABLE_FORK_SUPPORT=0
 ```
 
 Do not use `127.0.0.1` for the proxy host inside containers; it points to the
-container itself.
+container itself. The Compose file maps `host.docker.internal` for `main`,
+`ray-head`, and both Ray workers so model downloads can use the same host-side
+proxy from every model-serving container.
 
 ## Offline Models
 

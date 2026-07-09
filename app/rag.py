@@ -78,6 +78,7 @@ class RetrievalOutcome:
 @dataclass(frozen=True)
 class RecallOutcome:
     contexts: list[SearchResult]
+    qdrant_degraded: bool = False
     recall_ms: float = 0.0
     bm25_ms: float = 0.0
     vector_ms: float = 0.0
@@ -241,7 +242,8 @@ class RAGPipeline:
             degradation_reasons=degradation_reasons,
         )
         recalled_contexts = recall_outcome.contexts
-        qdrant_degraded = bool(degradation_reasons)
+        recall_degraded = bool(degradation_reasons)
+        qdrant_degraded = recall_outcome.qdrant_degraded
 
         logger.info(
             "Hybrid recall returned %s contexts before reranking.",
@@ -251,7 +253,7 @@ class RAGPipeline:
         if not self.config.reranker_enabled or not recalled_contexts:
             return RetrievalOutcome(
                 contexts=recalled_contexts[:final_top_k],
-                retrieval_degraded=qdrant_degraded,
+                retrieval_degraded=recall_degraded,
                 qdrant_degraded=qdrant_degraded,
                 reranker_degraded=False,
                 degradation_reason="; ".join(degradation_reasons),
@@ -304,7 +306,7 @@ class RAGPipeline:
         )
         return RetrievalOutcome(
             contexts=reranked_contexts,
-            retrieval_degraded=qdrant_degraded,
+            retrieval_degraded=recall_degraded,
             qdrant_degraded=qdrant_degraded,
             reranker_degraded=False,
             degradation_reason="; ".join(degradation_reasons),
@@ -376,9 +378,19 @@ class RAGPipeline:
                         embedding_ms,
                         qdrant_ms,
                     ) = vector_future.result()
-                except Exception:
+                except Exception as vector_exc:
                     vector_ms = self._elapsed_ms(vector_start)
-                    bm25_contexts, bm25_ms = bm25_future.result()
+                    try:
+                        bm25_contexts, bm25_ms = bm25_future.result()
+                    except Exception as bm25_exc:
+                        logger.exception(
+                            "Retrieval failed: Qdrant/vector recall and BM25 "
+                            "keyword recall both failed. vector_error=%s",
+                            vector_exc,
+                        )
+                        raise RuntimeError(
+                            "Qdrant/vector recall and BM25 keyword recall both failed."
+                        ) from bm25_exc
                     degradation_reasons.append(
                         "Qdrant/vector recall failed; using BM25-only retrieval."
                     )
@@ -390,6 +402,7 @@ class RAGPipeline:
                     )
                     return RecallOutcome(
                         contexts=bm25_contexts,
+                        qdrant_degraded=True,
                         recall_ms=self._elapsed_ms(recall_start),
                         bm25_ms=bm25_ms,
                         vector_ms=vector_ms,
@@ -398,7 +411,28 @@ class RAGPipeline:
                         rrf_ms=0.0,
                     )
 
-                bm25_contexts, bm25_ms = bm25_future.result()
+                try:
+                    bm25_contexts, bm25_ms = bm25_future.result()
+                except Exception:
+                    degradation_reasons.append(
+                        "BM25 keyword recall failed; using Qdrant/vector-only retrieval."
+                    )
+                    logger.exception(
+                        "Retrieval degraded: retrieval_degraded=True "
+                        "qdrant_degraded=False reranker_degraded=False "
+                        "fallback=qdrant_only vector_contexts=%s.",
+                        len(vector_contexts),
+                    )
+                    return RecallOutcome(
+                        contexts=vector_contexts[:rrf_limit],
+                        qdrant_degraded=False,
+                        recall_ms=self._elapsed_ms(recall_start),
+                        bm25_ms=0.0,
+                        vector_ms=vector_ms,
+                        embedding_ms=embedding_ms,
+                        qdrant_ms=qdrant_ms,
+                        rrf_ms=0.0,
+                    )
 
             try:
                 rrf_start = time.perf_counter()
@@ -419,6 +453,7 @@ class RAGPipeline:
             )
             return RecallOutcome(
                 contexts=fused_contexts,
+                qdrant_degraded=False,
                 recall_ms=self._elapsed_ms(recall_start),
                 bm25_ms=bm25_ms,
                 vector_ms=vector_ms,
@@ -438,6 +473,7 @@ class RAGPipeline:
                 )
                 return RecallOutcome(
                     contexts=contexts,
+                    qdrant_degraded=False,
                     recall_ms=self._elapsed_ms(hybrid_start),
                 )
             except Exception:
@@ -460,6 +496,7 @@ class RAGPipeline:
                 )
                 return RecallOutcome(
                     contexts=bm25_contexts,
+                    qdrant_degraded=True,
                     recall_ms=self._elapsed_ms(recall_start),
                     bm25_ms=bm25_ms,
                 )
@@ -468,6 +505,7 @@ class RAGPipeline:
         contexts = self.vector_store.search(search_query, top_k=vector_limit)[:rrf_limit]
         return RecallOutcome(
             contexts=contexts,
+            qdrant_degraded=False,
             recall_ms=self._elapsed_ms(recall_start),
             vector_ms=self._elapsed_ms(vector_start),
         )

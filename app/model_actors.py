@@ -89,6 +89,7 @@ def get_embedding_actor(config: Settings = settings) -> Any | None:
                 EmbeddingActor,
                 config.ray_embedding_actor_name,
                 num_gpus=config.ray_embedding_actor_num_gpus,
+                node_resource=config.ray_embedding_actor_resource,
             )
         return _embedding_actor
 
@@ -104,6 +105,7 @@ def get_code_embedding_actor(config: Settings = settings) -> Any | None:
                 CodeEmbeddingActor,
                 config.ray_code_embedding_actor_name,
                 num_gpus=config.ray_code_embedding_actor_num_gpus,
+                node_resource=config.ray_code_embedding_actor_resource,
             )
         return _code_embedding_actor
 
@@ -125,6 +127,7 @@ def get_reranker_actor(config: Settings = settings) -> Any | None:
                 RerankerActor,
                 config.ray_reranker_actor_name,
                 num_gpus=config.ray_reranker_actor_num_gpus,
+                node_resource=config.ray_reranker_actor_resource,
             )
         return _reranker_actor
 
@@ -206,6 +209,7 @@ def _get_or_create_actor(
     actor_cls: type[Any],
     name: str,
     num_gpus: float,
+    node_resource: str = "",
 ) -> Any | None:
     global _ray_unavailable
     if _ray_unavailable:
@@ -215,7 +219,7 @@ def _get_or_create_actor(
         ray = _ensure_ray(config)
         requested_gpus = max(0.0, num_gpus)
         available_gpus = float(ray.available_resources().get("GPU", 0.0))
-        if requested_gpus > 0 and available_gpus <= 0:
+        if requested_gpus > 0 and available_gpus <= 0 and not node_resource.strip():
             logger.warning(
                 "Ray has no visible GPU resources for actor %s; scheduling on CPU.",
                 name,
@@ -226,22 +230,33 @@ def _get_or_create_actor(
         except ValueError:
             pass
 
-        remote_cls = ray.remote(
-            num_cpus=config.ray_actor_num_cpus,
-            num_gpus=requested_gpus,
-        )(actor_cls)
+        remote_options: dict[str, Any] = {
+            "num_cpus": config.ray_actor_num_cpus,
+            "num_gpus": requested_gpus,
+        }
+        if node_resource.strip():
+            remote_options["resources"] = {node_resource.strip(): 0.001}
+
+        remote_cls = ray.remote(**remote_options)(actor_cls)
         logger.info(
-            "Starting Ray actor %s with cpus=%s gpus=%s.",
+            "Starting Ray actor %s with cpus=%s gpus=%s resource=%s.",
             name,
             config.ray_actor_num_cpus,
             requested_gpus,
+            node_resource or "none",
         )
-        return remote_cls.options(name=name).remote(config)
+        return remote_cls.options(
+            name=name,
+            lifetime="detached",
+            get_if_exists=True,
+            namespace=config.ray_namespace,
+        ).remote(config)
     except Exception:
         _ray_unavailable = True
         logger.exception(
-            "Ray actor %s is unavailable; falling back to local model.",
+            "Ray actor %s is unavailable; local_model_fallback=%s.",
             name,
+            config.ray_local_fallback,
         )
         return None
 

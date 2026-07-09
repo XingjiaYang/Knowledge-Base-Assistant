@@ -21,7 +21,8 @@ Compose profile 保留。
 
 ## 功能概览
 
-- Docker Compose 一键启动 PostgreSQL、Qdrant、本机 MinIO S3 对象存储和 FastAPI。
+- Docker Compose 一键启动 PostgreSQL、Qdrant、本机 MinIO S3 对象存储、Ray
+  model worker 和 FastAPI。
 - 必须登录账号后才能使用 RAG 系统，没有匿名访问模式。
 - 默认管理员账号为 `admin / 123456`，可通过环境变量改默认密码。
 - 管理员可以在前端创建用户、删除用户、重置密码、切换管理员权限、清空用户会话。
@@ -69,7 +70,7 @@ Answer + retrieved references + compacted conversation memory
 - `app/intent_router.py`：关键词/状态机、Jina classification embedding 和
   tagged LLM fallback 意图路由。
 - `app/rag.py`：混合召回、RRF 融合、重排、prompt 构造、基于上下文预算的历史压缩。
-- `app/reranker.py`：启动时预加载 Jina cross-encoder，并对召回 chunk 重排。
+- `app/reranker.py`：Jina cross-encoder 重排；启用 Ray 时通过 actor 调用。
 - `app/vector_store.py`：Markdown 切块、Jina embeddings v5 task 路由、BM25
   索引、Qdrant collection 管理、向量搜索和 RRF 融合。
 - `app/code_indexer.py`：基于 tree-sitter 的 Python/C++ 源码解析、CodeBERT
@@ -152,19 +153,77 @@ docker compose down
 docker compose down -v
 ```
 
+默认 `compose.yaml` 会启动 PostgreSQL、Qdrant、MinIO、Ray head、两个 Ray
+model worker 和 `main` API 服务。`ray-worker-embedding-1` 带 Ray resource
+`ray_worker_embedding`，用于文档 embedding actor；`ray-worker-reranker-1`
+带 `ray_worker_reranker`，用于 reranker actor。`main` 容器只连接
+`ray://ray-head:10001`，默认 `RAY_LOCAL_FALLBACK=0`，不会把 embedding/reranker
+模型加载回 API 进程。
+
+Docker 服务架构：
+
+```mermaid
+flowchart TD
+    User["浏览器 / curl<br/>localhost:8080"] --> Main["main<br/>FastAPI + UI + RAG 编排<br/>仅作为 Ray client"]
+
+    subgraph Compose["Docker Compose 网络"]
+        Main
+        PG["postgres<br/>PostgreSQL<br/>用户 / 会话 / 消息 / 设置"]
+        Qdrant["qdrant<br/>Qdrant<br/>向量 collection + alias"]
+        MinIO["minio<br/>S3 兼容对象存储<br/>版本化文档"]
+        MinIOInit["minio-init<br/>一次性 bucket 初始化<br/>开启 versioning"]
+        RayHead["ray-head<br/>Ray 控制面<br/>ray://ray-head:10001"]
+        EmbedWorker["ray-worker-embedding-1<br/>Ray worker<br/>resource: ray_worker_embedding<br/>承载 kba_embedding actor"]
+        RerankWorker["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker<br/>承载 kba_reranker actor"]
+        VLLM["vllm<br/>可选 local-llm profile<br/>OpenAI-compatible LLM 服务"]
+    end
+
+    Main --> PG
+    Main --> Qdrant
+    Main --> MinIO
+    Main --> RayHead
+    MinIOInit --> MinIO
+    RayHead --> EmbedWorker
+    RayHead --> RerankWorker
+    Main -. 可选 .-> VLLM
+    Main --> CloudLLM["云端 LLM API<br/>OpenAI-compatible / Anthropic"]
+
+    subgraph Volumes["Docker volume 和 bind mount"]
+        PGVol["postgres_data"]
+        QVol["qdrant_storage"]
+        S3Vol["minio_data"]
+        HFVol["huggingface_cache"]
+        DataBind["./data:/app/data:ro"]
+        ModelsBind["./models:/models:ro"]
+    end
+
+    PG --> PGVol
+    Qdrant --> QVol
+    MinIO --> S3Vol
+    Main --> DataBind
+    Main --> HFVol
+    Main --> ModelsBind
+    EmbedWorker --> HFVol
+    EmbedWorker --> ModelsBind
+    RerankWorker --> HFVol
+    RerankWorker --> ModelsBind
+```
+
 默认 Compose 启动和镜像绑定的文档初始化流程：
 
 ```mermaid
 flowchart TD
-    A["docker compose up --build"] --> B["构建 api 镜像"]
+    A["docker compose up --build"] --> B["构建 main 镜像"]
     B --> C["把 DOCS_INIT_BUILD_ID 写入 /app/.image_build_id"]
     A --> D["启动 postgres"]
     A --> E["启动 qdrant"]
     A --> F["启动 minio"]
+    A --> R["启动 Ray head 和模型 worker"]
     F --> G["minio-init 创建 bucket 并开启 versioning"]
-    D --> H["api entrypoint 等待 PostgreSQL"]
+    D --> H["main entrypoint 等待 PostgreSQL"]
     E --> H
     G --> H
+    R --> H
     H --> I{"DOCS_SOURCE=s3 且 DOCS_INIT_ON_IMAGE_BUILD=1?"}
     I -- "否" --> J["跳过自动文档初始化"]
     I -- "是" --> K{"S3 或本地 marker 已记录这个 build id?"}
@@ -176,7 +235,7 @@ flowchart TD
     N --> O
 ```
 
-普通 `docker compose restart` 不会重新扫描本地 Markdown。只有新的 API 镜像 build
+普通 `docker compose restart` 不会重新扫描本地 Markdown。只有新的 `main` 镜像 build
 id，或显式修改 `DOCS_INIT_BUILD_ID`，才会让启动阶段再次执行 S3 文档初始化。
 
 ## 登录和用户管理
@@ -288,6 +347,7 @@ INTENT_EMBEDDING_SUMMARY_MAX_CHARS=8000
 INTENT_EMBEDDING_TEXT_MAX_CHARS=12000
 
 INGEST_ON_STARTUP=0
+INGEST_USE_RAY=1
 RECREATE_COLLECTION=0
 WAIT_FOR_LLM=0
 ```
@@ -325,14 +385,12 @@ summary + 未压缩 history，并在扣除输出、当前 query、安全余量�
 预期引用 token 后接近上下文上限时才触发压缩。唯一 superuser 可以在 Admin UI
 修改运行时 LLM context window，后续回答会使用该值。
 
-`CUDA=TRUE` 是默认值，Jina embedding 模型和 Jina reranker 会在 PyTorch 能看到
-兼容 NVIDIA GPU 时优先使用 CUDA；如果 CUDA 不可见或模型迁移到 GPU 失败，会
-记录日志并回退到 CPU。设置 `CUDA=FALSE` 可强制全部使用 CPU。
-默认 API 镜像使用 PyTorch CUDA runtime 镜像，不需要在宿主机安装 CUDA toolkit。
-`RERANKER_PRELOAD=1` 时 API 会在启动阶段加载并预热 reranker，模型下载或加载
-错误会被记录为显式降级，服务仍会继续启动；运行时 reranker 失败时也会跳过精排，
-把未重排的 RRF 粗排结果按 `Final K` 直接交给 LLM。代码使用 Jina 模型原生的
-`AutoModel.rerank()` 接口执行重排。
+`CUDA=TRUE` 是默认值，Ray model worker 会暴露 GPU 资源，并把 Jina embedding
+和 Jina reranker 作为 detached named actor 常驻。`main` 容器只连接
+`ray://ray-head:10001`；默认 `RAY_LOCAL_FALLBACK=0`，Ray Actor 不可用时不会在
+API 进程本地加载这些模型。设置 `CUDA=FALSE` 可强制 Ray worker 和 actor 资源请求
+都走 CPU。默认镜像使用 PyTorch CUDA runtime 镜像，不需要在宿主机安装 CUDA
+toolkit。
 `jina-reranker-v3` 是 listwise reranker；召回数量超过
 `RERANKER_MAX_DOCUMENTS_PER_CALL` 时会分批重排，再按分数全局排序。
 
@@ -347,12 +405,12 @@ flowchart TD
     D --> E{"是否需要本地文档?"}
     E -- "否" --> Z["直接调用 LLM 对话"]
     E -- "是" --> F
-    F --> G["Jina retrieval query prompt embed 查询"]
+    F --> G["通过 Ray embedding actor embed 查询"]
     F --> H["BM25S 从 active Qdrant payload cache 做关键词召回"]
     G --> I["Qdrant 通过 tech_docs alias 做向量召回"]
     H --> J["RRF 融合"]
     I --> J
-    J --> K["Jina cross-encoder rerank"]
+    J --> K["通过 Ray reranker actor 精排"]
     K --> L["保留 Final K chunks"]
     L --> M["拼接引用、会话记忆和 prompt"]
     M --> N["LLM 生成回答"]
@@ -363,15 +421,16 @@ PostgreSQL 不保存文档 chunk 的 canonical 副本。PG 负责用户、会话
 和历史回答用到的 retrieved contexts 快照；当前 chunk text 存在 Qdrant payload
 里，并且可以从 S3 原文重新构建。
 
-检索降级不会 silent failure。Qdrant/vector recall 失败时，回答会降级为本地
-Markdown 的 BM25-only 召回；reranker 失败时，回答会使用 RRF 粗排结果并按
-`Final K` 截断。`/rag` 响应和存储的 assistant 消息会包含
+检索降级不会 silent failure。BM25S 关键词召回失败时，回答会继续使用
+Qdrant/vector-only 召回；Qdrant/vector recall 失败时，回答会降级为 BM25-only
+召回；reranker actor 失败时，回答会使用 RRF 粗排结果并按 `Final K` 截断。
+`/rag` 响应和存储的 assistant 消息会包含
 `retrieval_degraded`、`qdrant_degraded`、`reranker_degraded` 和
 `degradation_reason`；服务端日志也会写出这些布尔值，前端会在回答和引用区显示降级
 提示。
 
-默认 Compose 配置会给 API 容器设置 `gpus: all`，所以普通启动会在 Docker 能提供
-GPU 设备时直接使用 CUDA：
+默认 Compose 配置会把 GPU 暴露给 `ray-worker-embedding-1` 和
+`ray-worker-reranker-1`；`main` 容器只是 Ray client，不再申请 GPU：
 
 ```bash
 docker compose up --build
@@ -409,7 +468,7 @@ CODE_ROOT_DIR=/app/data/code
 CODE_FILES_COLLECTION=code_files
 CODE_FUNCTIONS_COLLECTION=code_functions
 CODE_EMBEDDING_MODEL=microsoft/codebert-base
-CODE_EMBEDDING_PRELOAD=1
+CODE_EMBEDDING_PRELOAD=0
 CODE_EMBEDDING_PRELOAD_RETRIES=3
 CODE_EMBEDDING_PRELOAD_RETRY_SECONDS=20
 CODE_SEARCH_FILE_TOP_K=20
@@ -417,6 +476,9 @@ CODE_SEARCH_FUNCTION_TOP_K=50
 CODE_SEARCH_FINAL_TOP_K=10
 CODE_CALL_GRAPH_DEPTH=3
 RAY_ENABLED=1
+RAY_ADDRESS=ray://ray-head:10001
+RAY_LOCAL_FALLBACK=0
+GRPC_ENABLE_FORK_SUPPORT=0
 RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS=0
 RAY_CODE_EMBEDDING_ACTOR_NAME=kba_code_embedding
 ```
@@ -671,8 +733,13 @@ HF_ENDPOINT=https://hf-mirror.com
 ```bash
 DOCKER_HTTP_PROXY=http://host.docker.internal:7890
 DOCKER_HTTPS_PROXY=http://host.docker.internal:7890
-DOCKER_NO_PROXY=postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+DOCKER_NO_PROXY=postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+GRPC_ENABLE_FORK_SUPPORT=0
 ```
+
+不要在容器内把代理地址写成 `127.0.0.1`，它指向容器自身。Compose 已经给 `main`、
+`ray-head` 和两个 Ray worker 配置 `host.docker.internal`，所以所有模型服务容器都能
+通过同一个宿主机代理下载模型。
 
 离线模型可挂载到 `./models:/models:ro`：
 
