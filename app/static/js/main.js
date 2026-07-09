@@ -1,14 +1,14 @@
 // Entry point: mount views, wire cross-cutting events, manage responsive
 // drawers, and restore the persisted auth session on load.
 
-import { state, on, emit, loadToken, setStatus } from "./store.js?v=20260620-rag-only";
-import { api } from "./api.js?v=20260620-rag-only";
-import { byId } from "./dom.js?v=20260620-rag-only";
-import { mountAuth, signOutLocal } from "./views/auth.js?v=20260620-rag-only";
-import { mountSessions, loadSessions } from "./views/sessions.js?v=20260620-rag-only";
-import { mountChat } from "./views/chat.js?v=20260620-rag-only";
-import { mountMeta, refreshHealth } from "./views/meta.js?v=20260620-rag-only";
-import { mountAdmin } from "./views/admin.js?v=20260620-rag-only";
+import { state, on, emit, loadToken, setStatus } from "./store.js?v=20260626-code-search";
+import { api } from "./api.js?v=20260626-code-search";
+import { byId } from "./dom.js?v=20260626-code-search";
+import { mountAuth, signOutLocal } from "./views/auth.js?v=20260626-code-search";
+import { mountSessions, loadSessions } from "./views/sessions.js?v=20260626-code-search";
+import { mountChat } from "./views/chat.js?v=20260626-code-search";
+import { mountMeta, refreshHealth } from "./views/meta.js?v=20260626-code-search";
+import { mountAdmin } from "./views/admin.js?v=20260626-code-search";
 
 mountAuth();
 mountMeta();

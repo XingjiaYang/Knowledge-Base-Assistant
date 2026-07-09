@@ -36,6 +36,8 @@ Compose profile 保留。
 - 唯一 superuser 可在 Admin UI 中修改全局 LLM provider、API URL、模型名、
   API key 和上下文窗口大小，保存后不需要 rebuild。
 - 支持 Hugging Face cache、离线模型目录、镜像和容器运行时代理配置。
+- 支持本地源码 Code Search：Python/C++ AST 符号抽取、CodeBERT 文件/函数向量、
+  PostgreSQL 原文存储、Qdrant 代码 collection 和静态调用图。
 
 ## 架构
 
@@ -70,6 +72,11 @@ Answer + retrieved references + compacted conversation memory
 - `app/reranker.py`：启动时预加载 Jina cross-encoder，并对召回 chunk 重排。
 - `app/vector_store.py`：Markdown 切块、Jina embeddings v5 task 路由、BM25
   索引、Qdrant collection 管理、向量搜索和 RRF 融合。
+- `app/code_indexer.py`：基于 tree-sitter 的 Python/C++ 源码解析、CodeBERT
+  embedding、Qdrant 代码索引和 PostgreSQL 代码文件/函数持久化。
+- `app/code_retrieval.py`：CodeBERT-first 的源码检索、repo-wide 函数召回、
+  lexical 候选扩展和显式 text-only 降级报告。
+- `app/call_graph.py`：AST 调用边抽取和 networkx 有向调用图查询。
 - `app/llm_client.py`：不同 LLM provider 的请求封装。
 - `scripts/`：ingest、服务启动、smoke test 和 intent-router A/B 评估脚本。
 - `data/docs/`：被 ingest 到 Qdrant 的 Markdown 语料。
@@ -305,6 +312,72 @@ CUDA=FALSE docker compose -f compose.yaml -f compose.cpu.yaml up --build
 
 如果 Docker 已经暴露 GPU，但 PyTorch 仍无法使用，或显卡架构太老不兼容当前
 CUDA/PyTorch 构建，应用启动后会回退到 CPU。
+
+## Code Search
+
+Code Search 和 Markdown RAG 是两条独立索引链路。`data/docs/` 继续走原有
+Markdown chunk、BM25S、Qdrant 文档向量和 RRF 融合；`data/code/` 下的源码仓库
+走代码索引链路。自然语言 README、安装文档和教程仍建议放进 `data/docs/` 或通过
+`DOCS_DIR` 指向对应文档目录。
+
+默认代码配置：
+
+```bash
+DOCS_DIR=/app/data/docs
+CODE_ROOT_DIR=/app/data/code
+# 可选：CODE_SOURCE_DIR=/app/data/code/specific-repo
+CODE_FILES_COLLECTION=code_files
+CODE_FUNCTIONS_COLLECTION=code_functions
+CODE_EMBEDDING_MODEL=microsoft/codebert-base
+CODE_EMBEDDING_PRELOAD=1
+CODE_EMBEDDING_PRELOAD_RETRIES=3
+CODE_EMBEDDING_PRELOAD_RETRY_SECONDS=20
+CODE_SEARCH_FILE_TOP_K=20
+CODE_SEARCH_FUNCTION_TOP_K=50
+CODE_SEARCH_FINAL_TOP_K=10
+CODE_CALL_GRAPH_DEPTH=3
+RAY_ENABLED=1
+RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS=0
+RAY_CODE_EMBEDDING_ACTOR_NAME=kba_code_embedding
+```
+
+推荐目录结构：
+
+```text
+data/docs/          # 原有 Markdown RAG 语料
+data/code/xgboost/  # 前端 Code 模式可选择的源码仓库
+data/code/lightgbm/ # 另一个源码仓库
+```
+
+启动时只会按原有逻辑 ingest `data/docs`。代码索引按需触发：打开浏览器 UI，切换到
+`Code`，选择 `data/code` 下的仓库并点击 `Index`。也可以登录后调用 API：
+
+```bash
+curl -sS http://localhost:8080/code/index \
+  -H "authorization: Bearer ${TOKEN}" \
+  -H 'content-type: application/json' \
+  -d '{"repository_ids":["xgboost"],"rebuild":true}'
+```
+
+代码索引会写入：
+
+- `code_files` 表和 `code_files` Qdrant collection：路径、语言、完整源码和
+  CodeBERT 文件向量。
+- `code_functions` 表和 `code_functions` Qdrant collection：函数/类名、签名、
+  body、docstring、行号和 CodeBERT 函数向量。
+- `code_call_edges` 表：基于 AST 提取的 caller 到 callee 调用边。
+
+当前 Code Search 是 CodeBERT-first，不是完整的 BM25S+dense hybrid search。
+正常请求会用 Ray 常驻的 CodeBERT Actor embed query，先搜 `code_files`，再搜
+top files 内的 `code_functions`，同时额外做一次 repo-wide `code_functions`
+向量召回。lexical 匹配只用于补充函数候选；这些候选会重新用 Qdrant 中的
+CodeBERT stored vector 和 query vector 计算相似度，再进入最终排序。最终分数是
+CodeBERT vector score 加一个较小的 code-aware lexical boost。
+
+如果 CodeBERT query embedding 失败，`/code/search` 会降级到 PostgreSQL 里的
+代码 lexical 扫描，并在响应中返回 `retrieval_mode="text_only"`、
+`code_embedding_degraded=true` 和 `degradation_reason`。这个 code lexical fallback
+目前不是 BM25S；BM25S 只用于 Markdown RAG。
 
 `LLM_PROVIDER=openai_compatible` 适用于 OpenAI-compatible 云端 API 和本地 vLLM。
 Anthropic 使用：

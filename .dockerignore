@@ -27,3 +27,4 @@ model_cache/
 hf_cache/
 data/raw/
 data/cache/
+data/code/

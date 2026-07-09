@@ -19,10 +19,12 @@ class Reranker:
         self,
         config: Settings = settings,
         model: object | None = None,
+        use_ray: bool = True,
     ) -> None:
         self.config = config
         self._model = model
         self._model_device = "cpu" if model is not None else None
+        self._use_ray = use_ray and model is None
         self._model_lock = Lock()
 
     @property
@@ -96,6 +98,22 @@ class Reranker:
         if not contexts:
             return []
 
+        if self._use_ray:
+            actor = self._reranker_actor()
+            if actor is not None:
+                try:
+                    from app.model_actors import mark_ray_unavailable, ray_get
+
+                    return ray_get(
+                        actor.rerank.remote(query, list(contexts), top_k),
+                        self.config,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Reranker Ray actor failed; falling back to local model."
+                    )
+                    mark_ray_unavailable()
+
         limit = max(1, top_k or self.config.retrieve_top_k)
         documents = [self._document_text(context) for context in contexts]
         batch_size = self.config.reranker_max_documents_per_call
@@ -144,6 +162,17 @@ class Reranker:
             )
             self._model_device = self._move_model_to_device(self.model, "cpu")
             return self.model.rerank(query, documents, top_n=top_n)
+
+    def _reranker_actor(self) -> object | None:
+        if not self._use_ray:
+            return None
+        try:
+            from app.model_actors import get_reranker_actor
+
+            return get_reranker_actor(self.config)
+        except Exception:
+            logger.exception("Reranker Ray actor setup failed.")
+            return None
 
     @staticmethod
     def _results_to_contexts(

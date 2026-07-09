@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
 from threading import Lock, Thread
@@ -14,6 +15,7 @@ from qdrant_client.models import PointStruct, Record
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+os.environ.setdefault("RAY_ENABLED", "0")
 
 from app.config import Settings
 from app.rag import RAGPipeline

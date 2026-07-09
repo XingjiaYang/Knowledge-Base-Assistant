@@ -526,6 +526,34 @@ kbd {
 }
 .header-actions { display: flex; align-items: center; gap: 4px; }
 
+.mode-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  padding: 2px;
+}
+.mode-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 72px;
+  height: 30px;
+  justify-content: center;
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+.mode-btn .icon { width: 15px; height: 15px; }
+.mode-btn:hover { background: var(--hover); color: var(--text); }
+.mode-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
 .chip {
   display: inline-flex;
   align-items: center;
@@ -564,6 +592,19 @@ kbd {
   text-transform: uppercase;
   color: var(--text-subtle);
 }
+.popover-title.compact { margin-bottom: -3px; }
+.popover .code-repo-select.compact {
+  width: 100%;
+  min-width: 0;
+}
+.popover .code-index-row {
+  justify-content: space-between;
+  min-width: 0;
+}
+.popover .code-index-status {
+  flex: 1;
+  text-align: right;
+}
 .popover-divider { height: 1px; background: var(--border); margin: 1px 0; }
 .meta-grid {
   display: grid;
@@ -596,6 +637,125 @@ kbd {
 .empty-state .brand-mark { width: 52px; height: 52px; }
 .empty-state h2 { margin: 0; font-size: 22px; letter-spacing: -0.02em; }
 .empty-state p { margin: 0; color: var(--text-muted); line-height: 1.6; }
+
+/* Code search */
+.code-search-shell {
+  max-width: 980px;
+  margin: 0 auto;
+  display: grid;
+  gap: 14px;
+}
+.code-search-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+.code-search-head h2 {
+  margin: 2px 0 0;
+  font-size: 18px;
+  line-height: 1.35;
+}
+.code-repo-picker {
+  display: inline-grid;
+  gap: 7px;
+  min-width: min(260px, 100%);
+  justify-items: start;
+}
+.code-repo-field {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+}
+.code-repo-select {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 6px 9px;
+  font: inherit;
+  font-size: 13px;
+}
+.code-repo-select.compact {
+  min-width: 180px;
+}
+.code-index-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.code-index-status {
+  min-width: 0;
+  color: var(--text-subtle);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.code-file-hits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.code-file-chip {
+  display: inline-flex;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  padding: 4px 9px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.code-result-list {
+  display: grid;
+  gap: 12px;
+}
+.code-result-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  padding: 13px 14px;
+  box-shadow: var(--shadow-sm);
+}
+.code-result-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.code-result-top h3 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.code-signature,
+.code-snippet {
+  margin: 10px 0 0;
+  border-radius: var(--r-sm);
+  background: var(--code-bg);
+  padding: 9px 10px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+.code-signature { color: var(--accent-text); }
+.code-snippet { color: var(--text-muted); max-height: 320px; }
+.code-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 11px;
+}
 
 /* Messages */
 .message {
@@ -791,6 +951,73 @@ kbd {
 }
 .refs-head .icon { width: 16px; height: 16px; color: var(--text-muted); }
 .reference-list { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 16px; }
+
+.code-graph-summary {
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  padding: 10px 11px;
+  margin-bottom: 11px;
+}
+.code-callers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  padding: 10px;
+  margin-bottom: 11px;
+}
+.code-callers .popover-title { flex-basis: 100%; }
+.caller-chip {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  padding: 4px 8px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+.caller-chip:hover {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-color: var(--accent-border);
+}
+.code-graph-canvas {
+  height: 520px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  overflow: hidden;
+  margin-bottom: 11px;
+}
+.graph-edge-list {
+  display: grid;
+  gap: 6px;
+}
+.graph-edge-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  padding: 7px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.graph-edge-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .ref-card {
   border: 1px solid var(--border);
@@ -1010,6 +1237,16 @@ main.admin { min-height: 100vh; min-height: 100dvh; background: var(--bg); }
   .sidebar.open { transform: translateX(0); }
   .scrim.show { display: block; }
   #sidebarToggle { display: inline-flex; }
+  .mode-btn {
+    min-width: 34px;
+    width: 34px;
+    padding: 0;
+    overflow: hidden;
+    color: transparent;
+    gap: 0;
+  }
+  .mode-btn .icon { color: var(--text-muted); }
+  .mode-btn.active .icon { color: var(--accent-text); }
   .admin-grid { grid-template-columns: 1fr; }
   .composer-hint { display: none; }
 }

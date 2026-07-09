@@ -242,6 +242,123 @@ class SessionStore:
                     )
                     """
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS code_files (
+                        id UUID PRIMARY KEY,
+                        repository_id TEXT NOT NULL DEFAULT '',
+                        repository_name TEXT NOT NULL DEFAULT '',
+                        source_root TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        language TEXT NOT NULL,
+                        full_content TEXT NOT NULL,
+                        content_sha256 TEXT NOT NULL,
+                        line_count INTEGER NOT NULL DEFAULT 0
+                            CHECK (line_count >= 0),
+                        indexed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE code_files
+                    ADD COLUMN IF NOT EXISTS repository_id TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE code_files
+                    ADD COLUMN IF NOT EXISTS repository_name TEXT NOT NULL DEFAULT ''
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE code_files
+                    DROP CONSTRAINT IF EXISTS code_files_path_key
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_code_files_repository_path
+                    ON code_files(repository_id, path)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_code_files_repository_id
+                    ON code_files(repository_id)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_code_files_language
+                    ON code_files(language)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS code_functions (
+                        id UUID PRIMARY KEY,
+                        file_id UUID NOT NULL REFERENCES code_files(id)
+                            ON DELETE CASCADE,
+                        name TEXT NOT NULL,
+                        qualified_name TEXT NOT NULL,
+                        kind TEXT NOT NULL DEFAULT 'function',
+                        signature TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        docstring TEXT NOT NULL DEFAULT '',
+                        start_line INTEGER NOT NULL CHECK (start_line >= 1),
+                        end_line INTEGER NOT NULL CHECK (end_line >= start_line),
+                        embedding_text TEXT NOT NULL,
+                        indexed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_code_functions_file_id
+                    ON code_functions(file_id)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_code_functions_name
+                    ON code_functions(name)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_code_functions_qualified_name
+                    ON code_functions(qualified_name)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS code_call_edges (
+                        id BIGSERIAL PRIMARY KEY,
+                        caller_id UUID NOT NULL REFERENCES code_functions(id)
+                            ON DELETE CASCADE,
+                        caller_name TEXT NOT NULL,
+                        callee_name TEXT NOT NULL,
+                        file_id UUID NOT NULL REFERENCES code_files(id)
+                            ON DELETE CASCADE,
+                        call_line INTEGER NOT NULL CHECK (call_line >= 1),
+                        UNIQUE (caller_id, callee_name, call_line)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_code_call_edges_callee
+                    ON code_call_edges(callee_name)
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_code_call_edges_caller
+                    ON code_call_edges(caller_name)
+                    """
+                )
             self._bootstrap_users(conn)
             self.delete_expired_auth_sessions(conn)
 

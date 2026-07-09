@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
 import math
@@ -327,59 +328,89 @@ class RAGPipeline:
             self.vector_store,
             "search",
         ):
-            bm25_start = time.perf_counter()
-            bm25_contexts = self.vector_store.search_bm25(
-                search_query,
-                top_k=bm25_limit,
-            )
-            bm25_ms = self._elapsed_ms(bm25_start)
-            try:
+            def run_bm25() -> tuple[list[SearchResult], float]:
+                bm25_start = time.perf_counter()
+                contexts = self.vector_store.search_bm25(
+                    search_query,
+                    top_k=bm25_limit,
+                )
+                return contexts, self._elapsed_ms(bm25_start)
+
+            def run_vector() -> tuple[
+                list[SearchResult],
+                float,
+                float,
+                float,
+            ]:
                 vector_start = time.perf_counter()
                 if hasattr(self.vector_store, "search_with_timing"):
                     vector_outcome = self.vector_store.search_with_timing(
                         search_query,
                         top_k=vector_limit,
                     )
-                    vector_contexts = vector_outcome.results
-                    vector_ms = vector_outcome.total_ms
-                    embedding_ms = vector_outcome.embedding_ms
-                    qdrant_ms = vector_outcome.qdrant_ms
-                else:
-                    vector_contexts = self.vector_store.search(
+                    return (
+                        vector_outcome.results,
+                        vector_outcome.total_ms,
+                        vector_outcome.embedding_ms,
+                        vector_outcome.qdrant_ms,
+                    )
+
+                return (
+                    self.vector_store.search(
                         search_query,
                         top_k=vector_limit,
-                    )
-                    vector_ms = self._elapsed_ms(vector_start)
-                    embedding_ms = 0.0
-                    qdrant_ms = 0.0
-            except Exception:
-                vector_ms = self._elapsed_ms(vector_start)
-                degradation_reasons.append(
-                    "Qdrant/vector recall failed; using BM25-only retrieval."
-                )
-                logger.exception(
-                    "Retrieval degraded: retrieval_degraded=True "
-                    "qdrant_degraded=True reranker_degraded=False "
-                    "fallback=bm25_only bm25_contexts=%s.",
-                    len(bm25_contexts),
-                )
-                return RecallOutcome(
-                    contexts=bm25_contexts,
-                    recall_ms=self._elapsed_ms(recall_start),
-                    bm25_ms=bm25_ms,
-                    vector_ms=vector_ms,
-                    embedding_ms=0.0,
-                    qdrant_ms=0.0,
-                    rrf_ms=0.0,
+                    ),
+                    self._elapsed_ms(vector_start),
+                    0.0,
+                    0.0,
                 )
 
-            rrf_start = time.perf_counter()
-            fused_contexts = VectorStore._rrf_fuse(
-                vector_contexts,
-                bm25_contexts,
-                top_k=rrf_limit,
-            )
-            rrf_ms = self._elapsed_ms(rrf_start)
+            vector_start = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                bm25_future = executor.submit(run_bm25)
+                vector_future = executor.submit(run_vector)
+                try:
+                    (
+                        vector_contexts,
+                        vector_ms,
+                        embedding_ms,
+                        qdrant_ms,
+                    ) = vector_future.result()
+                except Exception:
+                    vector_ms = self._elapsed_ms(vector_start)
+                    bm25_contexts, bm25_ms = bm25_future.result()
+                    degradation_reasons.append(
+                        "Qdrant/vector recall failed; using BM25-only retrieval."
+                    )
+                    logger.exception(
+                        "Retrieval degraded: retrieval_degraded=True "
+                        "qdrant_degraded=True reranker_degraded=False "
+                        "fallback=bm25_only bm25_contexts=%s.",
+                        len(bm25_contexts),
+                    )
+                    return RecallOutcome(
+                        contexts=bm25_contexts,
+                        recall_ms=self._elapsed_ms(recall_start),
+                        bm25_ms=bm25_ms,
+                        vector_ms=vector_ms,
+                        embedding_ms=0.0,
+                        qdrant_ms=0.0,
+                        rrf_ms=0.0,
+                    )
+
+                bm25_contexts, bm25_ms = bm25_future.result()
+
+            try:
+                rrf_start = time.perf_counter()
+                fused_contexts = VectorStore._rrf_fuse(
+                    vector_contexts,
+                    bm25_contexts,
+                    top_k=rrf_limit,
+                )
+                rrf_ms = self._elapsed_ms(rrf_start)
+            except Exception:
+                logger.exception("RRF fusion failed.")
+                raise
             logger.info(
                 "Hybrid recall fused bm25=%s vector=%s into rrf=%s contexts.",
                 len(bm25_contexts),

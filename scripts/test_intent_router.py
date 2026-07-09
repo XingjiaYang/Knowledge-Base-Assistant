@@ -105,6 +105,60 @@ class QdrantFailingVectorStore(FakeVectorStore):
         ][: top_k or 2]
 
 
+class SlowParallelVectorStore:
+    def __init__(self) -> None:
+        self.bm25_started_at = 0.0
+        self.vector_started_at = 0.0
+
+    def search_bm25(
+        self,
+        query: str,
+        top_k: int | None = None,
+    ) -> list[SearchResult]:
+        self.bm25_started_at = time.perf_counter()
+        time.sleep(0.25)
+        return [
+            SearchResult(
+                text="BM25 context",
+                source="bm25.md",
+                chunk_id=0,
+                score=3.0,
+                bm25_score=3.0,
+                retrieval_source="bm25",
+            )
+        ]
+
+    def search(self, query: str, top_k: int | None = None) -> list[SearchResult]:
+        return self.search_with_timing(query, top_k=top_k).results
+
+    def search_with_timing(
+        self,
+        query: str,
+        top_k: int | None = None,
+    ) -> object:
+        self.vector_started_at = time.perf_counter()
+        time.sleep(0.25)
+        return type(
+            "VectorOutcome",
+            (),
+            {
+                "results": [
+                    SearchResult(
+                        text="Vector context",
+                        source="vector.md",
+                        chunk_id=0,
+                        score=0.9,
+                        vector_score=0.9,
+                        retrieval_source="vector",
+                    )
+                ],
+                "total_ms": 250.0,
+                "embedding_ms": 100.0,
+                "qdrant_ms": 150.0,
+            },
+        )()
+
+
 class FakeLLMClient:
     def chat(
         self,
@@ -345,6 +399,31 @@ def assert_pipeline_retrieval_degradation_behavior() -> None:
         raise AssertionError("Reranker should receive coarse recall before fallback.")
 
     print("Retrieval degradation behavior -> ok")
+
+
+def assert_parallel_hybrid_recall_behavior() -> None:
+    config = Settings(reranker_enabled=False)
+    vector_store = SlowParallelVectorStore()
+    pipeline = RAGPipeline(
+        config,
+        vector_store=vector_store,
+        llm_client=FakeLLMClient(),
+        intent_router=IntentRouter(config, embedder=None, llm_client=None),
+        reranker=FakeReranker(),
+    )
+
+    started_at = time.perf_counter()
+    answer = pipeline.answer("force retrieval", rag_only=True)
+    elapsed = time.perf_counter() - started_at
+
+    if not answer.used_rag or len(answer.contexts) != 2:
+        raise AssertionError("Parallel recall should still return fused contexts.")
+    if elapsed >= 0.45:
+        raise AssertionError(f"Hybrid recall appears serial; elapsed={elapsed:.3f}s.")
+    if abs(vector_store.bm25_started_at - vector_store.vector_started_at) >= 0.15:
+        raise AssertionError("BM25 and vector recall should start concurrently.")
+
+    print("Parallel hybrid recall -> ok")
 
 
 def assert_embedding_context_behavior() -> None:
@@ -696,6 +775,7 @@ def main() -> None:
     assert_llm_fallback_behavior()
     assert_pipeline_search_behavior()
     assert_pipeline_retrieval_degradation_behavior()
+    assert_parallel_hybrid_recall_behavior()
 
 
 if __name__ == "__main__":

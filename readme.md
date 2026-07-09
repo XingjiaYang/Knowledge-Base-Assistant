@@ -46,6 +46,8 @@ boundaries that should be updated when `data/docs/` is replaced.
   and context-window size from the Admin UI without rebuilding containers.
 - Supports Hugging Face cache volumes, local model directories, mirrors, and
   host-side HTTP proxy settings for restricted networks.
+- Code Search for local source folders: CodeBERT file/function embeddings,
+  AST-based Python/C++ symbol extraction, and static call graphs.
 
 ## Architecture
 
@@ -85,6 +87,14 @@ Main modules:
   recalled chunks.
 - `app/vector_store.py`: Markdown chunking, Jina embeddings v5 task routing,
   BM25 indexing, Qdrant collection management, vector search, and RRF fusion.
+- `app/code_indexer.py`: tree-sitter based Python/C++ source parsing, CodeBERT
+  embeddings, Qdrant indexing, and PostgreSQL persistence for code files and
+  functions.
+- `app/code_retrieval.py`: CodeBERT-first source retrieval over files and
+  functions, repo-wide function recall, lexical candidate expansion, and
+  explicit text-only degradation reporting.
+- `app/call_graph.py`: tree-sitter based call extraction and networkx directed
+  call graph queries.
 - `app/llm_client.py`: provider-aware client for cloud APIs or local vLLM.
 - `scripts/`: manual service, ingest, retrieval smoke-test, and intent-router
   A/B evaluation commands.
@@ -215,6 +225,120 @@ For fast restarts after the image has already been built:
 ```bash
 docker compose up -d
 ```
+
+## Code Search
+
+Code Search is separate from the Markdown RAG index. Natural-language docs such
+as `README.md`, install docs, and tutorials should still be ingested with the
+existing Markdown path by setting `DOCS_DIR` to the relevant checkout or a
+documentation subdirectory. Source files are indexed into separate Qdrant
+collections and PostgreSQL tables. When `CODE_SOURCE_DIR` is empty, code search
+discovers source folders directly under `CODE_ROOT_DIR` and lets the browser
+select one folder or search across all indexed folders.
+
+Default code settings:
+
+```bash
+DOCS_DIR=/app/data/docs
+CODE_ROOT_DIR=/app/data/code
+# Optional: CODE_SOURCE_DIR=/app/data/code/specific-repo
+CODE_FILES_COLLECTION=code_files
+CODE_FUNCTIONS_COLLECTION=code_functions
+CODE_EMBEDDING_MODEL=microsoft/codebert-base
+CODE_EMBEDDING_PRELOAD=1
+CODE_EMBEDDING_PRELOAD_RETRIES=3
+CODE_EMBEDDING_PRELOAD_RETRY_SECONDS=20
+CODE_SEARCH_FILE_TOP_K=20
+CODE_SEARCH_FUNCTION_TOP_K=50
+CODE_SEARCH_FINAL_TOP_K=10
+CODE_CALL_GRAPH_DEPTH=3
+RAY_ENABLED=1
+RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS=0
+RAY_CODE_EMBEDDING_ACTOR_NAME=kba_code_embedding
+```
+
+The expected local data layout is:
+
+```text
+data/docs/         # original Markdown RAG corpus
+data/code/repo-a/  # source folder selectable in Code Search
+data/code/repo-b/  # another source folder
+```
+
+Run the stack with both folders mounted through `./data`:
+
+```bash
+docker compose up -d --build
+```
+
+Startup ingests Markdown from `data/docs` through the existing RAG path. Code
+indexes are built on demand: open the browser UI, switch to `Code`, select the
+repository under `data/code`, and click `Index`. Selecting `All code folders`
+indexes every discovered repository under `CODE_ROOT_DIR`.
+
+The same operation is available through the API after retrieving an auth token
+as shown below:
+
+```bash
+curl -sS http://localhost:8080/code/index \
+  -H "authorization: Bearer ${TOKEN}" \
+  -H 'content-type: application/json' \
+  -d '{"repository_ids":["xgboost"],"rebuild":true}'
+```
+
+For operational scripts or CI, you can still build from the container shell:
+
+```bash
+docker compose exec -T api python scripts/index_code.py \
+  --recreate
+```
+
+The indexer stores:
+
+- `code_files` PostgreSQL table and `code_files` Qdrant collection: path,
+  language, full source text in PostgreSQL, and a CodeBERT file embedding.
+- `code_functions` PostgreSQL table and `code_functions` Qdrant collection:
+  function/class name, signature, body, docstring, line range, and CodeBERT
+  embedding.
+- `code_call_edges` PostgreSQL table: AST-derived caller to callee edges.
+
+Current code retrieval is CodeBERT-first, not a full BM25S+dense hybrid search.
+On a normal request the API embeds the query with the Ray-hosted CodeBERT actor,
+searches `code_files`, searches `code_functions` inside the top files, performs
+an additional repo-wide `code_functions` vector search, and uses lexical matches
+only to add function candidates. Lexical candidates are re-scored with their
+stored CodeBERT vectors before final ranking. The final score is the CodeBERT
+vector score plus a small code-aware lexical boost.
+
+If CodeBERT query embedding fails, `/code/search` falls back to a PostgreSQL
+lexical scan over code files and functions. That fallback is reported with
+`retrieval_mode="text_only"`, `code_embedding_degraded=true`, and a
+`degradation_reason`. This code lexical fallback is not BM25S yet; Markdown RAG
+uses BM25S, while Code Search currently uses hand-scored code tokens for the
+fallback path.
+
+Test code search after login:
+
+```bash
+TOKEN=$(
+  curl -sS http://localhost:8080/auth/login \
+    -H 'content-type: application/json' \
+    -d '{"username":"admin","password":"123456"}' \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["token"])'
+)
+
+curl -sS http://localhost:8080/code/search \
+  -H "authorization: Bearer ${TOKEN}" \
+  -H 'content-type: application/json' \
+  -d '{"query":"DMatrix data handling"}'
+
+curl -sS 'http://localhost:8080/code/call-graph?function_name=DMatrix.__init__&depth=3' \
+  -H "authorization: Bearer ${TOKEN}"
+```
+
+The browser UI has a `Code` mode in the chat header. Code mode sends queries to
+`/code/search`, renders function-level results, and uses the right-side panel
+to render `/code/call-graph` with cytoscape.js.
 
 ## Configuration
 
