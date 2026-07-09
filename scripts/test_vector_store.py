@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
 import sys
 from threading import Lock, Thread
 import time
 from tempfile import TemporaryDirectory
+from uuid import NAMESPACE_URL, uuid5
 import warnings
 
 import numpy as np
@@ -19,6 +21,7 @@ os.environ.setdefault("RAY_ENABLED", "0")
 
 from app.config import Settings
 from app.rag import RAGPipeline
+from app.s3_documents import S3DocumentRecord, VersionedS3DocumentIndexer
 import app.vector_store as vector_store_module
 from app.vector_store import SearchResult, VectorStore
 
@@ -105,6 +108,69 @@ class FakeLLMClient:
         return "ok"
 
 
+class FakeS3DocumentStore:
+    def __init__(self, documents: dict[str, tuple[str, str]]) -> None:
+        self.active_manifest: dict[str, object] | None = None
+        self.version_manifests: list[dict[str, object]] = []
+        self.prune_calls: list[int] = []
+        self.fail_active_manifest_write = False
+        self.set_documents(documents)
+
+    def set_documents(self, documents: dict[str, tuple[str, str]]) -> None:
+        self.texts: dict[str, str] = {}
+        self.records: list[S3DocumentRecord] = []
+        for source, (version_id, text) in sorted(documents.items()):
+            key = f"docs/{source}"
+            content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            self.texts[key] = text
+            self.records.append(
+                S3DocumentRecord(
+                    source_doc_id=str(uuid5(NAMESPACE_URL, f"s3://bucket/{key}")),
+                    key=key,
+                    source=source,
+                    version_id=version_id,
+                    etag=version_id,
+                    size=len(text.encode("utf-8")),
+                    last_modified="2026-01-01T00:00:00+00:00",
+                    content_hash=content_hash,
+                )
+            )
+
+    def ensure_versioning_enabled(self) -> None:
+        return None
+
+    def list_current_markdown(self) -> list[S3DocumentRecord]:
+        return list(self.records)
+
+    def read_markdown(self, record: S3DocumentRecord) -> str:
+        return self.texts[record.key]
+
+    def load_active_manifest(self) -> dict[str, object] | None:
+        return self.active_manifest
+
+    def write_active_manifest(self, manifest: dict[str, object]) -> None:
+        if self.fail_active_manifest_write:
+            raise RuntimeError("active manifest write failed")
+        self.active_manifest = manifest
+
+    def write_version_manifest(self, manifest: dict[str, object]) -> None:
+        self.version_manifests.append(manifest)
+
+    def prune_document_versions(self, retain_versions: int) -> dict[str, int]:
+        self.prune_calls.append(retain_versions)
+        return {
+            "keys": len(self.records),
+            "deleted_versions": 0,
+            "retain_versions": retain_versions,
+        }
+
+    def find_manifest_by_collection(self, collection_name: str) -> dict[str, object] | None:
+        for manifest in self.version_manifests:
+            if manifest.get("qdrant_collection") == collection_name:
+                return manifest
+        return None
+
+
 def _records(client: QdrantClient, collection_name: str) -> list[Record]:
     records, _ = client.scroll(
         collection_name=collection_name,
@@ -113,6 +179,27 @@ def _records(client: QdrantClient, collection_name: str) -> list[Record]:
         with_vectors=False,
     )
     return records
+
+
+def _alias_target(client: QdrantClient, alias_name: str) -> str:
+    for alias in client.get_aliases().aliases:
+        if alias.alias_name == alias_name:
+            return alias.collection_name
+    return ""
+
+
+def _source_doc_ids(client: QdrantClient, collection_name: str) -> set[str]:
+    records, _ = client.scroll(
+        collection_name=collection_name,
+        limit=100,
+        with_payload=True,
+        with_vectors=False,
+    )
+    return {
+        str(record.payload.get("source_doc_id", ""))
+        for record in records
+        if record.payload
+    }
 
 
 def assert_incremental_ingest_replaces_source_points() -> None:
@@ -535,6 +622,181 @@ def assert_rrf_fuses_vector_and_bm25_results() -> None:
     print("RRF fusion -> ok")
 
 
+def assert_s3_versioned_ingest_switches_alias_and_removes_orphans() -> None:
+    client = QdrantClient(":memory:")
+    config = Settings(
+        docs_source="s3",
+        docs_s3_bucket="bucket",
+        docs_s3_prefix="docs",
+        docs_s3_require_versioning=False,
+        collection_name="s3_docs_test",
+        chunk_size=240,
+        chunk_overlap=20,
+    )
+    vector_store = VectorStore(
+        config,
+        client=client,
+        model=FakeEmbeddingModel(),
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Payload indexes have no effect in the local Qdrant.*",
+        )
+        vector_store.ensure_collection(recreate=True)
+    client.upsert(
+        collection_name="s3_docs_test",
+        points=[
+            PointStruct(
+                id="00000000-0000-0000-0000-000000000010",
+                vector=[1.0, 0.0],
+                payload={
+                    "source": "legacy.md",
+                    "chunk_id": 0,
+                    "text": "legacy pre-S3 chunk",
+                },
+            )
+        ],
+        wait=True,
+    )
+    document_store = FakeS3DocumentStore(
+        {
+            "a.md": ("a-v1", "# A\n\nalpha orphan text"),
+            "b.md": ("b-v1", "# B\n\nbeta stable text"),
+            "c.md": ("c-v1", "# C\n\ncharlie old text"),
+        }
+    )
+    indexer = VersionedS3DocumentIndexer(
+        config,
+        document_store=document_store,
+        vector_store=vector_store,
+    )
+
+    first = indexer.ingest()
+    first_collection = _alias_target(client, "s3_docs_test")
+    if not first_collection or first_collection != first.qdrant_collection:
+        raise AssertionError("S3 ingest should create and point the alias to v1.")
+    if first.total_chunks != 3:
+        raise AssertionError(f"Expected one chunk per initial document: {first}")
+    collection_names = {collection.name for collection in client.get_collections().collections}
+    if not any(name.startswith("s3_docs_test__vlegacy_") for name in collection_names):
+        raise AssertionError("Existing physical collection should be archived before alias creation.")
+
+    document_store.set_documents(
+        {
+            "b.md": ("b-v1", "# B\n\nbeta stable text"),
+            "c.md": ("c-v2", "# C\n\ncharlie modified text"),
+            "d.md": ("d-v1", "# D\n\ndelta new text"),
+        }
+    )
+    second = indexer.ingest()
+    second_collection = _alias_target(client, "s3_docs_test")
+    if second_collection == first_collection or second_collection != second.qdrant_collection:
+        raise AssertionError("S3 ingest should atomically switch the alias to v2.")
+    if (
+        second.added_docs != 1
+        or second.modified_docs != 1
+        or second.deleted_docs != 1
+        or second.unchanged_docs != 1
+        or second.copied_chunks != 1
+        or second.embedded_chunks != 2
+    ):
+        raise AssertionError(f"Unexpected S3 diff/index stats: {second}")
+
+    source_ids = _source_doc_ids(client, second_collection)
+    current_by_source = {record.source: record.source_doc_id for record in document_store.records}
+    deleted_a_id = str(uuid5(NAMESPACE_URL, "s3://bucket/docs/a.md"))
+    if deleted_a_id in source_ids:
+        raise AssertionError("Deleted S3 documents must not leave orphan chunks.")
+    for source in ("b.md", "c.md", "d.md"):
+        if current_by_source[source] not in source_ids:
+            raise AssertionError(f"Current S3 document {source} is missing chunks.")
+
+    deleted_results = vector_store.search_bm25("alpha orphan", top_k=5)
+    if any(result.source == "a.md" for result in deleted_results):
+        raise AssertionError("BM25 should rebuild from the active alias without deleted docs.")
+    fresh_results = vector_store.search_bm25("delta new", top_k=1)
+    if not fresh_results or fresh_results[0].source != "d.md":
+        raise AssertionError(f"BM25 should search the active S3 version: {fresh_results}")
+
+    document_store.set_documents(
+        {
+            "b.md": ("b-v2", "# B\n\nbeta changed again"),
+            "c.md": ("c-v2", "# C\n\ncharlie modified text"),
+            "d.md": ("d-v1", "# D\n\ndelta new text"),
+        }
+    )
+    third = indexer.ingest()
+    third_collection = _alias_target(client, "s3_docs_test")
+    if third_collection != third.qdrant_collection:
+        raise AssertionError("Third S3 ingest should switch to the latest version.")
+    retained_versions = [
+        collection.name
+        for collection in client.get_collections().collections
+        if collection.name.startswith("s3_docs_test__v")
+        and not collection.name.startswith("s3_docs_test__vlegacy_")
+    ]
+    if len(retained_versions) != 2:
+        raise AssertionError(f"Qdrant should retain exactly two S3 versions: {retained_versions}")
+    if document_store.prune_calls != [6, 5, 6, 5, 6, 5]:
+        raise AssertionError(f"S3 pruning should use processing/stable limits: {document_store.prune_calls}")
+
+    print("S3 versioned ingest alias/orphan behavior -> ok")
+
+
+def assert_s3_versioned_ingest_rolls_back_on_failure() -> None:
+    client = QdrantClient(":memory:")
+    config = Settings(
+        docs_source="s3",
+        docs_s3_bucket="bucket",
+        docs_s3_prefix="docs",
+        docs_s3_require_versioning=False,
+        collection_name="s3_rollback_test",
+        chunk_size=240,
+        chunk_overlap=20,
+    )
+    vector_store = VectorStore(
+        config,
+        client=client,
+        model=FakeEmbeddingModel(),
+    )
+    document_store = FakeS3DocumentStore(
+        {"a.md": ("a-v1", "# A\n\nalpha initial")}
+    )
+    indexer = VersionedS3DocumentIndexer(
+        config,
+        document_store=document_store,
+        vector_store=vector_store,
+    )
+
+    first = indexer.ingest()
+    first_collection = _alias_target(client, "s3_rollback_test")
+    if first_collection != first.qdrant_collection:
+        raise AssertionError("Initial S3 rollback test ingest should set the alias.")
+
+    document_store.set_documents({"a.md": ("a-v2", "# A\n\nalpha changed")})
+    document_store.fail_active_manifest_write = True
+    try:
+        indexer.ingest()
+    except RuntimeError as exc:
+        if "active manifest write failed" not in str(exc):
+            raise
+    else:
+        raise AssertionError("S3 ingest should fail when active manifest write fails.")
+
+    if _alias_target(client, "s3_rollback_test") != first_collection:
+        raise AssertionError("Failed S3 ingest should roll alias back to the previous collection.")
+    version_collections = [
+        collection.name
+        for collection in client.get_collections().collections
+        if collection.name.startswith("s3_rollback_test__v")
+    ]
+    if version_collections != [first_collection]:
+        raise AssertionError(f"Failed S3 ingest should delete the new collection: {version_collections}")
+
+    print("S3 versioned ingest rollback -> ok")
+
+
 def main() -> None:
     assert_vector_store_lazy_loads_dependencies()
     assert_vector_store_lazy_loads_once_under_concurrency()
@@ -547,6 +809,8 @@ def main() -> None:
     assert_bm25_recalls_keyword_matches()
     assert_rrf_fuses_vector_and_bm25_results()
     assert_incremental_ingest_replaces_source_points()
+    assert_s3_versioned_ingest_switches_alias_and_removes_orphans()
+    assert_s3_versioned_ingest_rolls_back_on_failure()
 
 
 if __name__ == "__main__":

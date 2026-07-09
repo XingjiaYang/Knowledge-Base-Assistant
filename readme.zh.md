@@ -21,7 +21,7 @@ Compose profile 保留。
 
 ## 功能概览
 
-- Docker Compose 一键启动 PostgreSQL、Qdrant、文档 ingest 和 FastAPI。
+- Docker Compose 一键启动 PostgreSQL、Qdrant、本机 MinIO S3 对象存储和 FastAPI。
 - 必须登录账号后才能使用 RAG 系统，没有匿名访问模式。
 - 默认管理员账号为 `admin / 123456`，可通过环境变量改默认密码。
 - 管理员可以在前端创建用户、删除用户、重置密码、切换管理员权限、清空用户会话。
@@ -108,7 +108,7 @@ administrator 同时是唯一 superuser；只有这个 superuser 能在前端 Ad
 中的 LLM 默认值，不需要 rebuild 容器；`.env` 仍作为首次启动和未配置时的
 fallback。API key 不会回显给浏览器，保存时 key 输入框留空表示保留当前 key。
 
-启动服务：
+启动 PostgreSQL、Qdrant、本机 MinIO S3 存储和 API：
 
 ```bash
 docker compose up --build
@@ -119,6 +119,14 @@ docker compose up --build
 ```text
 http://localhost:8080
 ```
+
+本机 S3 控制台：
+
+```text
+http://localhost:9001
+```
+
+默认 MinIO 账号密码是 `minioadmin` / `minioadmin`；离开本机 demo 前需要修改。
 
 使用其他宿主机端口：
 
@@ -138,11 +146,38 @@ docker compose up -d --build --force-recreate
 docker compose down
 ```
 
-清空 PostgreSQL、Qdrant 和 Hugging Face cache volume：
+清空 PostgreSQL、Qdrant、MinIO 和 Hugging Face cache volume：
 
 ```bash
 docker compose down -v
 ```
+
+默认 Compose 启动和镜像绑定的文档初始化流程：
+
+```mermaid
+flowchart TD
+    A["docker compose up --build"] --> B["构建 api 镜像"]
+    B --> C["把 DOCS_INIT_BUILD_ID 写入 /app/.image_build_id"]
+    A --> D["启动 postgres"]
+    A --> E["启动 qdrant"]
+    A --> F["启动 minio"]
+    F --> G["minio-init 创建 bucket 并开启 versioning"]
+    D --> H["api entrypoint 等待 PostgreSQL"]
+    E --> H
+    G --> H
+    H --> I{"DOCS_SOURCE=s3 且 DOCS_INIT_ON_IMAGE_BUILD=1?"}
+    I -- "否" --> J["跳过自动文档初始化"]
+    I -- "是" --> K{"S3 或本地 marker 已记录这个 build id?"}
+    K -- "是" --> J
+    K -- "否" --> L["把 DOCS_DIR Markdown 同步到 S3"]
+    L --> M["构建版本化 Qdrant 文档索引"]
+    M --> N["写入 build-init marker"]
+    J --> O["启动 FastAPI"]
+    N --> O
+```
+
+普通 `docker compose restart` 不会重新扫描本地 Markdown。只有新的 API 镜像 build
+id，或显式修改 `DOCS_INIT_BUILD_ID`，才会让启动阶段再次执行 S3 文档初始化。
 
 ## 登录和用户管理
 
@@ -181,6 +216,7 @@ AUTH_BOOTSTRAP_USERS=analyst:change-me,viewer:change-me-too
 ```bash
 DEBUG=0
 CUDA=TRUE
+DOCS_INIT_BUILD_ID=auto
 
 LLM_PROVIDER=openai_compatible
 LLM_BASE_URL=https://api.openai.com/v1
@@ -200,6 +236,23 @@ AUTH_DEFAULT_ADMIN_PASSWORD=123456
 AUTH_BOOTSTRAP_USERS=
 
 QDRANT_COLLECTION=tech_docs
+DOCS_SOURCE=s3
+DOCS_DIR=/app/data/docs
+DOCS_S3_BUCKET=kba-docs
+DOCS_S3_PREFIX=docs
+DOCS_S3_ENDPOINT_URL=http://minio:9000
+DOCS_S3_REGION=us-east-1
+DOCS_S3_ACCESS_KEY_ID=minioadmin
+DOCS_S3_SECRET_ACCESS_KEY=minioadmin
+DOCS_S3_FORCE_PATH_STYLE=1
+DOCS_S3_REQUIRE_VERSIONING=1
+DOCS_S3_RETAIN_VERSIONS=5
+DOCS_S3_PROCESSING_RETAIN_VERSIONS=6
+DOCS_S3_MANIFEST_PREFIX=_kba/manifests/docs
+DOCS_INIT_ON_IMAGE_BUILD=1
+DOCS_INIT_DELETE_REMOVED=1
+QDRANT_RETAIN_VERSIONS=2
+QDRANT_PROCESSING_RETAIN_VERSIONS=3
 EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-small
 EMBEDDING_TRUST_REMOTE_CODE=1
 EMBEDDING_QUERY_TASK=retrieval
@@ -234,7 +287,7 @@ INTENT_EMBEDDING_HISTORY_MAX_CHARS=8000
 INTENT_EMBEDDING_SUMMARY_MAX_CHARS=8000
 INTENT_EMBEDDING_TEXT_MAX_CHARS=12000
 
-INGEST_ON_STARTUP=1
+INGEST_ON_STARTUP=0
 RECREATE_COLLECTION=0
 WAIT_FOR_LLM=0
 ```
@@ -282,6 +335,33 @@ summary + 未压缩 history，并在扣除输出、当前 query、安全余量�
 `AutoModel.rerank()` 接口执行重排。
 `jina-reranker-v3` 是 listwise reranker；召回数量超过
 `RERANKER_MAX_DOCUMENTS_PER_CALL` 时会分批重排，再按分数全局排序。
+
+Query 时的文档 RAG pipeline：
+
+```mermaid
+flowchart TD
+    A["浏览器 / POST /rag"] --> B["从 PostgreSQL 读取会话、压缩记忆和运行配置"]
+    B --> C{"开启 RAG-only?"}
+    C -- "是" --> F["强制 RAG route"]
+    C -- "否" --> D["意图路由"]
+    D --> E{"是否需要本地文档?"}
+    E -- "否" --> Z["直接调用 LLM 对话"]
+    E -- "是" --> F
+    F --> G["Jina retrieval query prompt embed 查询"]
+    F --> H["BM25S 从 active Qdrant payload cache 做关键词召回"]
+    G --> I["Qdrant 通过 tech_docs alias 做向量召回"]
+    H --> J["RRF 融合"]
+    I --> J
+    J --> K["Jina cross-encoder rerank"]
+    K --> L["保留 Final K chunks"]
+    L --> M["拼接引用、会话记忆和 prompt"]
+    M --> N["LLM 生成回答"]
+    N --> O["把消息、route metadata 和 retrieved contexts 快照写入 PostgreSQL"]
+```
+
+PostgreSQL 不保存文档 chunk 的 canonical 副本。PG 负责用户、会话、运行设置、消息
+和历史回答用到的 retrieved contexts 快照；当前 chunk text 存在 Qdrant payload
+里，并且可以从 S3 原文重新构建。
 
 检索降级不会 silent failure。Qdrant/vector recall 失败时，回答会降级为本地
 Markdown 的 BM25-only 召回；reranker 失败时，回答会使用 RRF 粗排结果并按
@@ -349,8 +429,13 @@ data/code/xgboost/  # 前端 Code 模式可选择的源码仓库
 data/code/lightgbm/ # 另一个源码仓库
 ```
 
-启动时只会按原有逻辑 ingest `data/docs`。代码索引按需触发：打开浏览器 UI，切换到
-`Code`，选择 `data/code` 下的仓库并点击 `Index`。也可以登录后调用 API：
+普通重启不会扫描本地 Markdown。local 模式下，文档索引用
+`python scripts/ingest_docs.py` 手动触发。S3 模式下，容器只会按 Docker image
+build id 初始化一次文档：`docker compose up --build` 生成镜像 marker，第一次启动
+会把 `DOCS_DIR` 同步到 S3 并构建版本化索引；之后 `docker compose restart` 会直接
+跳过，不扫描文档。如果源码没有变化但需要强制重新初始化 S3，可在
+`docker compose up --build` 前把 `DOCS_INIT_BUILD_ID` 改成新值。代码索引按需触发：
+打开浏览器 UI，切换到 `Code`，选择 `data/code` 下的仓库并点击 `Index`。也可以登录后调用 API：
 
 ```bash
 curl -sS http://localhost:8080/code/index \
@@ -393,19 +478,28 @@ OpenAI-compatible 使用 `GET /models`，Anthropic 使用
 
 ## 替换知识库
 
-`data/docs/` 下的 Markdown 文件是 RAG 语料来源。当前提交的样例语料是家是本
-餐饮创业案例，包含公司概览、FAQ、菜单与定价、顾客评价、B站评论、社交媒体
-存档、财务模拟、时间线、朱剑秋人物侧写、勇哥连线事件、“巨大历史机遇/巨大历史
-鲫鱼”梗文档和歌曲文档。检索链路
-使用 BM25 关键词召回、Qdrant 向量召回、RRF 融合和可选 reranker。
+local 模式下，`data/docs/` 下的 Markdown 文件是 RAG 语料来源。S3 模式下，
+配置的 S3 bucket/prefix 是语料真源，`QDRANT_COLLECTION` 会作为稳定 alias 指向
+当前生效的版本化 Qdrant collection。当前提交的样例语料是家是本餐饮创业案例，
+包含公司概览、FAQ、菜单与定价、顾客评价、B站评论、社交媒体存档、财务模拟、
+时间线、朱剑秋人物侧写、勇哥连线事件、“巨大历史机遇/巨大历史鲫鱼”梗文档和
+歌曲文档。检索链路使用 BM25 关键词召回、Qdrant 向量召回、RRF 融合和可选
+reranker。
 
 替换知识库步骤：
 
 1. 替换或编辑 `data/docs/` 下的 Markdown 文件。
-2. 重建 Qdrant collection：
+2. local 模式下重建 Qdrant collection：
 
    ```bash
    python scripts/ingest_docs.py --recreate
+   ```
+
+   S3 模式下先同步对象存储，再构建新索引版本：
+
+   ```bash
+   python scripts/sync_docs_to_s3.py --docs-dir data/docs --delete-removed
+   python scripts/ingest_docs.py --source s3
    ```
 
 3. 如需让意图路由识别新语料主题，更新 `app/intent_router.py` 中的
@@ -416,9 +510,56 @@ OpenAI-compatible 使用 `GET /models`，Anthropic 使用
    encoder 对比。
 6. 通过浏览器或 `/rag` API 提问。
 
-Ingest 会递归扫描子目录。增量 ingest 会用当前 Markdown 文件替换同一 source 的旧
-chunk，避免修改或缩短文件后留下陈旧 chunk。删除文档、整体替换语料或修改
-embedding 模型维度时，请使用 `--recreate`。
+S3 增量更新 pipeline：
+
+```mermaid
+flowchart TD
+    A["编辑 data/docs 下的 Markdown"] --> B["sync_docs_to_s3.py --delete-removed"]
+    B --> C["上传新增或变更的 .md 对象，并写 content-sha256 metadata"]
+    B --> D["为已删除的 Markdown 写 delete marker"]
+    C --> E["S3 当前对象列表"]
+    D --> E
+    E --> F["ingest_docs.py --source s3"]
+    F --> G["读取 active manifest"]
+    F --> H["完整扫描当前 S3 .md 列表"]
+    G --> I["按 source_doc_id、VersionId、ETag、size、content hash 做 diff"]
+    H --> I
+    I --> J["新增或修改文档"]
+    I --> K["未变化文档"]
+    I --> L["已删除文档"]
+    J --> M["按精确 S3 VersionId 读取、Markdown chunk、embed、upsert"]
+    K --> N["从上一版 collection 复制已有 Qdrant points 和 vectors"]
+    L --> O["不复制已删除文档的 chunks"]
+    M --> P["新的候选 Qdrant collection"]
+    N --> P
+    O --> P
+    P --> Q{"校验 chunk 数量"}
+    Q -- "失败" --> R["删除候选 collection，alias 保持上一版 active"]
+    Q -- "通过" --> S["写 version manifest"]
+    S --> T["把 Qdrant alias 切到候选 collection"]
+    T --> U["写 active manifest"]
+    U --> V["稳定保留: S3 每 key 5 版; Qdrant 当前版加回滚版"]
+```
+
+local ingest 会递归扫描子目录，并用当前 Markdown 文件替换同一 source 的旧 chunk，
+避免修改或缩短文件后留下陈旧 chunk。删除文档、整体替换语料或修改 embedding
+模型维度时，local 模式请使用 `--recreate`。
+
+本机 demo 默认用 MinIO 作为 S3 兼容对象存储；生产或远端部署只需要把
+`DOCS_S3_ENDPOINT_URL`、bucket 和凭据换成对应服务。S3 ingest 每次都会扫描当前
+S3 文件列表生成 manifest，而不是只扫描“变动/新增”的文件，所以能检测已经消失的
+对象。上一版 manifest 存在
+`DOCS_S3_MANIFEST_PREFIX` 下；每个 chunk payload 都带 `source_doc_id` 和
+`version_id`。构建新版本时，会创建新的物理 Qdrant collection：未变更文档从旧
+collection 复制已有向量，新增/修改文档重新 chunk + embed，删除文档不会被复制进
+新 collection。验证通过后才把 `QDRANT_COLLECTION` alias 切到新 collection；旧
+collection 和 S3 对象版本会保留，方便回滚。
+
+版本保留策略默认开启。稳定状态下，S3 每个 Markdown key 保留最新 5 个对象版本
+（包含最新可用版本）；Qdrant 保留最新 2 个文档索引 collection（包含当前 alias
+指向的可用版本）。ingest 处理中会临时放宽到 S3 6 个版本、Qdrant 3 个 collection，
+给候选新版本留空间。若构建或切换后失败，系统会把 alias 回滚到上一版可用
+collection，并删除本次失败的新 collection。
 
 ## API 使用
 

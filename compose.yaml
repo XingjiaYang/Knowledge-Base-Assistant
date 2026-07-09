@@ -20,6 +20,49 @@ services:
       - "6333"
       - "6334"
 
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:latest}
+    restart: unless-stopped
+    command:
+      - server
+      - /data
+      - --console-address
+      - ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    expose:
+      - "9000"
+      - "9001"
+
+  minio-init:
+    image: ${MINIO_MC_IMAGE:-minio/mc:latest}
+    depends_on:
+      - minio
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      DOCS_S3_BUCKET: ${DOCS_S3_BUCKET:-kba-docs}
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - |
+        set -e
+        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do
+          echo "Waiting for MinIO..."
+          sleep 2
+        done
+        mc mb --ignore-existing "local/$${DOCS_S3_BUCKET}"
+        mc version enable "local/$${DOCS_S3_BUCKET}"
+        mc anonymous set none "local/$${DOCS_S3_BUCKET}"
+
   vllm:
     profiles:
       - local-llm
@@ -35,10 +78,10 @@ services:
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: ${DOCKER_NO_PROXY:-postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      NO_PROXY: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: ${DOCKER_NO_PROXY:-postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       VLLM_USE_FLASHINFER_SAMPLER: ${VLLM_USE_FLASHINFER_SAMPLER:-0}
     volumes:
       - huggingface_cache:/root/.cache/huggingface
@@ -66,10 +109,15 @@ services:
       dockerfile: Dockerfile
       args:
         API_BASE_IMAGE: ${API_BASE_IMAGE:-pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime}
+        DOCS_INIT_BUILD_ID: ${DOCS_INIT_BUILD_ID:-auto}
     restart: unless-stopped
     depends_on:
-      - qdrant
-      - postgres
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
     gpus: all
     shm_size: "10gb"
     extra_hosts:
@@ -80,8 +128,25 @@ services:
       API_PORT: "8080"
       CUDA: ${CUDA:-TRUE}
       DOCS_DIR: ${DOCS_DIR:-/app/data/docs}
+      DOCS_SOURCE: ${DOCS_SOURCE:-s3}
+      DOCS_S3_BUCKET: ${DOCS_S3_BUCKET:-kba-docs}
+      DOCS_S3_PREFIX: ${DOCS_S3_PREFIX:-docs}
+      DOCS_S3_ENDPOINT_URL: ${DOCS_S3_ENDPOINT_URL:-http://minio:9000}
+      DOCS_S3_REGION: ${DOCS_S3_REGION:-us-east-1}
+      DOCS_S3_ACCESS_KEY_ID: ${DOCS_S3_ACCESS_KEY_ID:-minioadmin}
+      DOCS_S3_SECRET_ACCESS_KEY: ${DOCS_S3_SECRET_ACCESS_KEY:-minioadmin}
+      DOCS_S3_SESSION_TOKEN: ${DOCS_S3_SESSION_TOKEN:-}
+      DOCS_S3_FORCE_PATH_STYLE: ${DOCS_S3_FORCE_PATH_STYLE:-1}
+      DOCS_S3_REQUIRE_VERSIONING: ${DOCS_S3_REQUIRE_VERSIONING:-1}
+      DOCS_S3_RETAIN_VERSIONS: ${DOCS_S3_RETAIN_VERSIONS:-5}
+      DOCS_S3_PROCESSING_RETAIN_VERSIONS: ${DOCS_S3_PROCESSING_RETAIN_VERSIONS:-6}
+      DOCS_S3_MANIFEST_PREFIX: ${DOCS_S3_MANIFEST_PREFIX:-_kba/manifests/docs}
+      DOCS_INIT_ON_IMAGE_BUILD: ${DOCS_INIT_ON_IMAGE_BUILD:-1}
+      DOCS_INIT_DELETE_REMOVED: ${DOCS_INIT_DELETE_REMOVED:-1}
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-tech_docs}
+      QDRANT_RETAIN_VERSIONS: ${QDRANT_RETAIN_VERSIONS:-2}
+      QDRANT_PROCESSING_RETAIN_VERSIONS: ${QDRANT_PROCESSING_RETAIN_VERSIONS:-3}
       CODE_ROOT_DIR: ${CODE_ROOT_DIR:-/app/data/code}
       CODE_SOURCE_DIR: ${CODE_SOURCE_DIR:-}
       CODE_FILES_COLLECTION: ${CODE_FILES_COLLECTION:-code_files}
@@ -185,7 +250,7 @@ services:
       INTENT_EMBEDDING_RAG_THRESHOLD: ${INTENT_EMBEDDING_RAG_THRESHOLD:-0.38}
       INTENT_EMBEDDING_DIRECT_THRESHOLD: ${INTENT_EMBEDDING_DIRECT_THRESHOLD:-0.40}
       INTENT_EMBEDDING_MARGIN: ${INTENT_EMBEDDING_MARGIN:-0.06}
-      INGEST_ON_STARTUP: ${INGEST_ON_STARTUP:-1}
+      INGEST_ON_STARTUP: ${INGEST_ON_STARTUP:-0}
       INGEST_USE_RAY: ${INGEST_USE_RAY:-0}
       RECREATE_COLLECTION: ${RECREATE_COLLECTION:-0}
       WAIT_FOR_LLM: ${WAIT_FOR_LLM:-0}
@@ -197,10 +262,10 @@ services:
       HF_HUB_DISABLE_XET: ${HF_HUB_DISABLE_XET:-1}
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: ${DOCKER_NO_PROXY:-postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      NO_PROXY: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: ${DOCKER_NO_PROXY:-postgres,qdrant,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
     volumes:
       - ./data:/app/data:ro
       - huggingface_cache:/root/.cache/huggingface
@@ -209,4 +274,5 @@ services:
 volumes:
   postgres_data:
   qdrant_storage:
+  minio_data:
   huggingface_cache:

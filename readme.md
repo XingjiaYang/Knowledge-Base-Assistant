@@ -25,7 +25,7 @@ boundaries that should be updated when `data/docs/` is replaced.
 
 ## Highlights
 
-- Docker Compose deployment for PostgreSQL, Qdrant, document ingestion, and FastAPI.
+- Docker Compose deployment for PostgreSQL, Qdrant, local MinIO S3 storage, and FastAPI.
 - Configurable cloud LLM providers with an optional local vLLM profile.
 - Jina embeddings v5 text small by default, with task/prompt routing for
   retrieval-query, retrieval-passage, and classification embeddings.
@@ -148,7 +148,7 @@ local development. If the PostgreSQL volume already contains an `admin` user,
 startup keeps that user's existing password. PostgreSQL runs inside Docker
 Compose; you do not need to install PostgreSQL on the host.
 
-Start PostgreSQL, Qdrant, and the API:
+Start PostgreSQL, Qdrant, MinIO-backed S3 storage, and the API:
 
 ```bash
 docker compose up --build
@@ -159,6 +159,15 @@ Open the app:
 ```text
 http://localhost:8080
 ```
+
+For the local S3 console, open:
+
+```text
+http://localhost:9001
+```
+
+Default MinIO credentials are `minioadmin` / `minioadmin`; change them before
+using the stack outside a local demo.
 
 Use a different host port:
 
@@ -181,7 +190,7 @@ Stop services:
 docker compose down
 ```
 
-Reset persisted PostgreSQL, Qdrant, and Hugging Face cache volumes:
+Reset persisted PostgreSQL, Qdrant, MinIO, and Hugging Face cache volumes:
 
 ```bash
 docker compose down -v
@@ -189,13 +198,46 @@ docker compose down -v
 
 ## Startup Behavior
 
-`compose.yaml` starts three services by default:
+`compose.yaml` starts four long-running services and one one-shot initializer by
+default:
 
 - `postgres`: runs PostgreSQL inside Docker and stores users, login tokens, and
   chat sessions in the `postgres_data` Docker volume.
 - `qdrant`: stores vectors in the `qdrant_storage` Docker volume.
-- `api`: waits for Qdrant and PostgreSQL, optionally ingests Markdown under
-  `data/docs/`, and starts FastAPI on container port `8080`.
+- `minio`: provides local S3-compatible object storage in the `minio_data`
+  Docker volume.
+- `minio-init`: creates the configured document bucket and enables S3 object
+  versioning before the API starts.
+- `api`: waits for Qdrant, PostgreSQL, and MinIO initialization, optionally
+  runs document initialization, and starts FastAPI on container port `8080`.
+
+Startup and image-bound document initialization:
+
+```mermaid
+flowchart TD
+    A["docker compose up --build"] --> B["Build api image"]
+    B --> C["Bake DOCS_INIT_BUILD_ID into /app/.image_build_id"]
+    A --> D["Start postgres"]
+    A --> E["Start qdrant"]
+    A --> F["Start minio"]
+    F --> G["minio-init creates bucket and enables versioning"]
+    D --> H["api entrypoint waits for PostgreSQL"]
+    E --> H
+    G --> H
+    H --> I{"DOCS_SOURCE=s3 and DOCS_INIT_ON_IMAGE_BUILD=1?"}
+    I -- "no" --> J["Skip automatic document initialization"]
+    I -- "yes" --> K{"Build id already marked in S3 or local marker?"}
+    K -- "yes" --> J
+    K -- "no" --> L["Sync DOCS_DIR Markdown files into S3"]
+    L --> M["Build versioned Qdrant document index"]
+    M --> N["Write build-init marker"]
+    J --> O["Start FastAPI"]
+    N --> O
+```
+
+Plain `docker compose restart` does not rescan local Markdown. A new image build
+id, or an explicit `DOCS_INIT_BUILD_ID` change, is what makes the S3
+initialization path run again during startup.
 
 The `vllm` service is optional and only starts under the `local-llm` profile:
 
@@ -212,12 +254,17 @@ docker compose --profile local-llm up --build
 Important startup flags:
 
 ```bash
-INGEST_ON_STARTUP=1      # ingest docs before API starts
-RECREATE_COLLECTION=0    # set to 1 to rebuild the collection during startup
+INGEST_ON_STARTUP=0      # manual document ingest is the default
+RECREATE_COLLECTION=0    # local mode: rebuild collection; S3 mode: rebuild version
+DOCS_INIT_ON_IMAGE_BUILD=1 # S3 mode: initialize docs once per image build id
+DOCS_INIT_DELETE_REMOVED=1 # S3 build init removes remote docs missing locally
 WAIT_FOR_LLM=0           # set to 1 when a local LLM service must be ready first
 APP_PORT=8080            # host port mapped to FastAPI/UI
 QDRANT_IMAGE=qdrant/qdrant:v1.18.1
 POSTGRES_IMAGE=postgres:17-alpine
+MINIO_IMAGE=minio/minio:latest
+MINIO_API_PORT=9000      # local S3 API
+MINIO_CONSOLE_PORT=9001  # local MinIO browser console
 ```
 
 For fast restarts after the image has already been built:
@@ -271,10 +318,16 @@ Run the stack with both folders mounted through `./data`:
 docker compose up -d --build
 ```
 
-Startup ingests Markdown from `data/docs` through the existing RAG path. Code
-indexes are built on demand: open the browser UI, switch to `Code`, select the
-repository under `data/code`, and click `Index`. Selecting `All code folders`
-indexes every discovered repository under `CODE_ROOT_DIR`.
+Startup does not scan local Markdown on ordinary restarts. In local mode, run
+`python scripts/ingest_docs.py` manually. In S3 mode, the container initializes
+documents only once per Docker image build id: `docker compose up --build`
+creates the image marker, the first container start syncs `DOCS_DIR` to S3 and
+builds the versioned index, and later `docker compose restart` runs skip
+without scanning. If you need to force S3 initialization without changing source
+files, set `DOCS_INIT_BUILD_ID` to a new value before `docker compose up
+--build`. Code indexes are built on demand: open the browser UI, switch to
+`Code`, select the repository under `data/code`, and click `Index`. Selecting
+`All code folders` indexes every discovered repository under `CODE_ROOT_DIR`.
 
 The same operation is available through the API after retrieving an auth token
 as shown below:
@@ -348,6 +401,7 @@ Common settings from `.env.example`:
 DEBUG=0
 CUDA=TRUE
 QDRANT_IMAGE=qdrant/qdrant:v1.18.1
+DOCS_INIT_BUILD_ID=auto
 
 LLM_PROVIDER=openai_compatible
 LLM_BASE_URL=https://api.openai.com/v1
@@ -386,7 +440,24 @@ AUTH_SESSION_TTL_SECONDS=604800
 SESSION_LIST_LIMIT=50
 SESSION_TITLE_MAX_CHARS=80
 
+DOCS_SOURCE=s3
+DOCS_DIR=/app/data/docs
+DOCS_S3_BUCKET=kba-docs
+DOCS_S3_PREFIX=docs
+DOCS_S3_ENDPOINT_URL=http://minio:9000
+DOCS_S3_REGION=us-east-1
+DOCS_S3_ACCESS_KEY_ID=minioadmin
+DOCS_S3_SECRET_ACCESS_KEY=minioadmin
+DOCS_S3_FORCE_PATH_STYLE=1
+DOCS_S3_REQUIRE_VERSIONING=1
+DOCS_S3_RETAIN_VERSIONS=5
+DOCS_S3_PROCESSING_RETAIN_VERSIONS=6
+DOCS_S3_MANIFEST_PREFIX=_kba/manifests/docs
+DOCS_INIT_ON_IMAGE_BUILD=1
+DOCS_INIT_DELETE_REMOVED=1
 QDRANT_COLLECTION=tech_docs
+QDRANT_RETAIN_VERSIONS=2
+QDRANT_PROCESSING_RETAIN_VERSIONS=3
 EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-small
 EMBEDDING_TRUST_REMOTE_CODE=1
 EMBEDDING_QUERY_TASK=retrieval
@@ -502,6 +573,34 @@ the same `Final K` limit.
 batches of `RERANKER_MAX_DOCUMENTS_PER_CALL` when recall returns more than the
 model should process in one call.
 
+Query-time document RAG pipeline:
+
+```mermaid
+flowchart TD
+    A["Browser / POST /rag"] --> B["Load session, compact memory, and settings from PostgreSQL"]
+    B --> C{"RAG-only enabled?"}
+    C -- "yes" --> F["Force RAG route"]
+    C -- "no" --> D["Intent router"]
+    D --> E{"Needs local documents?"}
+    E -- "no" --> Z["Direct chat with LLM"]
+    E -- "yes" --> F
+    F --> G["Embed query with Jina retrieval query prompt"]
+    F --> H["BM25S keyword recall from active Qdrant payload cache"]
+    G --> I["Qdrant vector recall through tech_docs alias"]
+    H --> J["RRF fusion"]
+    I --> J
+    J --> K["Jina cross-encoder rerank"]
+    K --> L["Keep Final K chunks"]
+    L --> M["Build prompt with references and conversation memory"]
+    M --> N["LLM answer"]
+    N --> O["Store message, route metadata, and retrieved context snapshot in PostgreSQL"]
+```
+
+PostgreSQL does not store the canonical document chunks. It stores users,
+sessions, runtime settings, messages, and retrieved-context snapshots for past
+answers. The current chunk text lives in Qdrant payloads and is rebuildable
+from the S3 source documents.
+
 Retrieval degrades explicitly instead of failing silently. If Qdrant/vector
 recall fails, the answer falls back to BM25-only recall from local Markdown. If
 the reranker fails, the pipeline skips reranking and uses the coarse RRF result
@@ -587,7 +686,10 @@ made into RAG content.
 To use another subject:
 
 1. Replace or edit the Markdown files under `data/docs/`.
-2. Rebuild the Qdrant collection with `python scripts/ingest_docs.py --recreate`.
+2. For local mode, rebuild the Qdrant collection with
+   `python scripts/ingest_docs.py --recreate`. For S3 mode, sync the files with
+   `python scripts/sync_docs_to_s3.py --delete-removed`, then run
+   `python scripts/ingest_docs.py --source s3`.
 3. Update the corpus keyword hints in `app/intent_router.py`
    (`DOMAIN_RAG_PHRASES` and `DOMAIN_RAG_PATTERNS`), the LLM fallback corpus
    description, and `data/eval/intent_router_cases.jsonl` if first-pass,
@@ -813,13 +915,15 @@ python -m compileall app scripts
 
 ## Document Corpus
 
-Markdown files in `data/docs/` are the RAG source of truth. The bundled sample
-files cover a generated Chinese restaurant/business case: company overview,
-FAQ, menu and pricing, customer reviews, Bilibili comments, social-media
-archives, financial simulation, a timeline, a profile of 朱剑秋, the Yongge
-livestream incident, the 巨大历史机遇/巨大历史鲫鱼 meme document, and a song
-document. Retrieval uses BM25 keyword recall plus Qdrant vector recall, RRF
-fusion, and optional reranking.
+In local mode, Markdown files in `data/docs/` are the RAG source of truth. In
+S3 mode, the configured S3 bucket/prefix is the source of truth and
+`QDRANT_COLLECTION` is treated as a stable Qdrant alias that points at the
+active versioned collection. The bundled sample files cover a generated Chinese
+restaurant/business case: company overview, FAQ, menu and pricing, customer
+reviews, Bilibili comments, social-media archives, financial simulation, a
+timeline, a profile of 朱剑秋, the Yongge livestream incident, the 巨大历史机遇/巨大历史鲫鱼
+meme document, and a song document. Retrieval uses BM25 keyword recall plus
+Qdrant vector recall, RRF fusion, and optional reranking.
 
 The keyword intent layer contains domain hints for this bundled corpus in
 `app/intent_router.py`. Those hints only decide whether to use RAG; they do not
@@ -834,22 +938,91 @@ but kept separate from stored chunk text to avoid duplicating titles in every
 chunk. Oversized text chunks use an effective chunk budget that leaves room for
 overlap, while fenced code chunks preserve complete fences.
 
-After adding or editing documents, run an incremental ingest:
+Local filesystem ingest remains available for small corpora:
 
 ```bash
 python scripts/ingest_docs.py
 ```
 
 Each current Markdown file replaces all previously indexed chunks with the same
-`source`, so edited or shortened files do not leave stale chunks behind. Use
-`--recreate` when deleting documents, replacing the whole corpus, or changing
-the embedding model's vector size:
+`source`, so edited or shortened files do not leave stale chunks behind. Local
+mode still requires `--recreate` when deleting documents, replacing the whole
+corpus, or changing the embedding model's vector size:
 
 ```bash
 python scripts/ingest_docs.py --recreate
 ```
 
-The equivalent Compose setting is `RECREATE_COLLECTION=1`.
+The local demo uses MinIO as an S3-compatible store by default. For
+production-style document updates, point the same S3 versioned ingest path at a
+real bucket or another S3-compatible service:
+
+```bash
+DOCS_SOURCE=s3
+DOCS_S3_BUCKET=my-docs-bucket
+DOCS_S3_PREFIX=docs
+DOCS_S3_ENDPOINT_URL=        # leave blank for AWS S3, or set your compatible endpoint
+QDRANT_COLLECTION=tech_docs
+```
+
+Enable bucket versioning before ingest. Then sync local Markdown into S3 and
+build a new index version manually:
+
+```bash
+python scripts/sync_docs_to_s3.py --docs-dir data/docs --delete-removed
+python scripts/ingest_docs.py --source s3
+```
+
+Incremental S3 document update:
+
+```mermaid
+flowchart TD
+    A["Edit Markdown under data/docs"] --> B["sync_docs_to_s3.py --delete-removed"]
+    B --> C["Upload added or changed .md objects with content-sha256 metadata"]
+    B --> D["Write delete markers for removed Markdown objects"]
+    C --> E["S3 current object list"]
+    D --> E
+    E --> F["ingest_docs.py --source s3"]
+    F --> G["Load active manifest"]
+    F --> H["Scan full current S3 .md list"]
+    G --> I["Diff by source_doc_id, VersionId, ETag, size, and content hash"]
+    H --> I
+    I --> J["Added or modified docs"]
+    I --> K["Unchanged docs"]
+    I --> L["Deleted docs"]
+    J --> M["Read exact S3 VersionId, chunk Markdown, embed, and upsert"]
+    K --> N["Copy existing Qdrant points and vectors from previous collection"]
+    L --> O["Do not copy deleted document chunks"]
+    M --> P["New candidate Qdrant collection"]
+    N --> P
+    O --> P
+    P --> Q{"Validate chunk count"}
+    Q -- "fail" --> R["Delete candidate and keep alias on previous active collection"]
+    Q -- "pass" --> S["Write version manifest"]
+    S --> T["Switch Qdrant alias to candidate"]
+    T --> U["Write active manifest"]
+    U --> V["Stable retention: S3 keeps 5 versions per key; Qdrant keeps active plus rollback"]
+```
+
+The S3 indexer always scans the current S3 object list to detect additions,
+modifications, and deletions. It does not only scan changed objects. The
+previous active manifest is stored under `DOCS_S3_MANIFEST_PREFIX`; every chunk
+payload includes `source_doc_id` and `version_id`. A new physical Qdrant
+collection is created for each index version. Unchanged document chunks are
+copied from the previous collection with their vectors, added/modified
+documents are chunked and embedded, and deleted documents are not copied. After
+the new collection validates successfully, the `QDRANT_COLLECTION` alias is
+switched to the new collection. Old physical collections and S3 object versions
+remain available for rollback.
+
+Retention is enabled by default. Stable S3 document object versions keep the
+latest 5 versions per Markdown key, including the latest usable version.
+Stable Qdrant document indexes keep the latest 2 version collections, including
+the active alias target. During an ingest run the limits are temporarily relaxed
+to 6 S3 versions and 3 Qdrant collections, so the new candidate version can be
+built without deleting the last known-good version. If the ingest fails after
+creating a collection or switching the alias, the alias is rolled back to the
+previous collection and the failed candidate collection is deleted.
 
 ## Before Pushing to GitHub
 
