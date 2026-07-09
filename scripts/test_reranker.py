@@ -116,7 +116,11 @@ class FakeRuntimeCudaRerankerModel:
 
 
 class MissingRayActorReranker(Reranker):
-    def _reranker_actor(self) -> object | None:
+    def _reranker_actor(
+        self,
+        *,
+        exclude_names: set[str] | None = None,
+    ) -> tuple[str, object] | None:
         return None
 
 

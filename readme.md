@@ -199,7 +199,7 @@ docker compose down -v
 
 ## Startup Behavior
 
-`compose.yaml` starts eight long-running services and one one-shot initializer
+`compose.yaml` starts nine long-running services and one one-shot initializer
 by default:
 
 - `postgres`: runs PostgreSQL inside Docker and stores users, login tokens, and
@@ -212,8 +212,9 @@ by default:
 - `ray-head`: owns the Ray cluster control plane and Ray client endpoint.
 - `ray-worker-embedding-1`: runs the named document embedding actor and is
   tagged with Ray resource `ray_worker_embedding`.
-- `ray-worker-reranker-1`: runs the named reranker actor and is tagged with Ray
-  resource `ray_worker_reranker`.
+- `ray-worker-reranker-1` and `ray-worker-reranker-2`: run two reranker actor
+  replicas, pinned to Ray resources `ray_worker_reranker_1` and
+  `ray_worker_reranker_2`.
 - `autoheal`: watches Docker healthchecks and restarts services that are safe
   to heal as a single container, such as `qdrant` and `main`.
 - `main`: waits for Qdrant, PostgreSQL, and MinIO initialization, optionally
@@ -234,7 +235,9 @@ flowchart TD
         MinIOInit["minio-init<br/>one-shot bucket init<br/>enable versioning"]
         RayHead["ray-head<br/>Ray control plane<br/>ray://ray-head:10001"]
         EmbedWorker["ray-worker-embedding-1<br/>Ray worker<br/>resource: ray_worker_embedding<br/>hosts kba_embedding actor"]
-        RerankWorker["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker<br/>hosts kba_reranker actor"]
+        RerankWorker1["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker_1<br/>hosts kba_reranker_1 actor"]
+        RerankWorker2["ray-worker-reranker-2<br/>Ray worker<br/>resource: ray_worker_reranker_2<br/>hosts kba_reranker_2 actor"]
+        HealthSupervisor["main health supervisor<br/>embedding / qdrant / reranker<br/>independent lightweight probes"]
         Autoheal["autoheal<br/>Docker healthcheck watcher<br/>restarts unhealthy containers"]
         VLLM["vllm<br/>optional local-llm profile<br/>OpenAI-compatible LLM server"]
     end
@@ -245,7 +248,13 @@ flowchart TD
     Main --> RayHead
     MinIOInit --> MinIO
     RayHead --> EmbedWorker
-    RayHead --> RerankWorker
+    RayHead --> RerankWorker1
+    RayHead --> RerankWorker2
+    Main --> HealthSupervisor
+    HealthSupervisor -. "collection / alias metadata" .-> Qdrant
+    HealthSupervisor -. "embedding actor readiness" .-> EmbedWorker
+    HealthSupervisor -. "parallel reranker readiness<br/>any replica healthy" .-> RerankWorker1
+    HealthSupervisor -. "parallel reranker readiness<br/>any replica healthy" .-> RerankWorker2
     Autoheal -. healthcheck .-> Main
     Autoheal -. healthcheck .-> Qdrant
     Main -. optional .-> VLLM
@@ -268,8 +277,10 @@ flowchart TD
     Main --> ModelsBind
     EmbedWorker --> HFVol
     EmbedWorker --> ModelsBind
-    RerankWorker --> HFVol
-    RerankWorker --> ModelsBind
+    RerankWorker1 --> HFVol
+    RerankWorker1 --> ModelsBind
+    RerankWorker2 --> HFVol
+    RerankWorker2 --> ModelsBind
 ```
 
 Startup and image-bound document initialization:
@@ -336,7 +347,8 @@ RAY_ADDRESS=ray://ray-head:10001
 RAY_LOCAL_FALLBACK=0     # do not load embedding/reranker models in main
 GRPC_ENABLE_FORK_SUPPORT=0 # keep Ray Client stable inside Compose containers
 RAY_EMBEDDING_ACTOR_RESOURCE=ray_worker_embedding
-RAY_RERANKER_ACTOR_RESOURCE=ray_worker_reranker
+RAY_RERANKER_ACTOR_REPLICAS=2
+RAY_RERANKER_ACTOR_RESOURCE=ray_worker_reranker # base; replicas use _1 and _2
 HEALTH_PROBE_INTERVAL_SECONDS=10
 HEALTH_PROBE_DEGRADED_INTERVAL_SECONDS=3
 HEALTH_PROBE_TIMEOUT_SECONDS=2
@@ -630,8 +642,8 @@ prompt overhead, and expected retrieved references. The superuser can override
 the runtime LLM context-window size from the Admin UI.
 
 When intent routing chooses RAG, the pipeline now performs hybrid recall before
-reranking. It recalls `BM25_TOP_K` keyword candidates from the local Markdown
-chunks with BM25, recalls `RECALL_TOP_K` cosine-similarity candidates from
+reranking. It recalls `BM25_TOP_K` keyword candidates from the active Markdown
+chunks with BM25S, recalls `RECALL_TOP_K` cosine-similarity candidates from
 Qdrant, fuses both ranked lists with reciprocal rank fusion, keeps
 `RRF_TOP_K` fused candidates, reranks those candidates with the multilingual
 `jinaai/jina-reranker-v3` cross-encoder, then keeps `RETRIEVE_TOP_K` chunks for
@@ -640,8 +652,8 @@ the LLM prompt and response references. The browser UI exposes these values as
 and `5`. Set `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector
 results before fusion. `/health/details` returns the active defaults so the UI
 can initialize all four controls after login. With `CUDA=TRUE` (the default),
-the Ray model workers expose GPU resources and run the Jina embedding model and
-Jina reranker as detached named actors. The `main` container connects to
+the Ray model workers expose GPU resources and run one Jina embedding actor plus
+two Jina reranker actor replicas as detached named actors. The `main` container connects to
 `ray://ray-head:10001` and, with `RAY_LOCAL_FALLBACK=0`, does not load those
 models locally. Set `CUDA=FALSE` to force the Ray workers and actor resource
 requests to CPU. The default API image uses the PyTorch CUDA runtime image, so
@@ -655,7 +667,7 @@ Query-time document RAG pipeline:
 ```mermaid
 flowchart TD
     A["Browser / POST /rag"] --> B["Load session, compact memory, and settings from PostgreSQL"]
-    P["Background component health<br/>embedding / qdrant / reranker<br/>10s healthy probes, 3s degraded probes"]
+    P["Background component health<br/>embedding / qdrant / reranker<br/>10s healthy probes, 3s degraded probes<br/>reranker replicas probed independently"]
     B --> C{"RAG-only enabled?"}
     C -- "yes" --> F["Force RAG route"]
     C -- "no" --> D["Intent router"]
@@ -663,15 +675,21 @@ flowchart TD
     E -- "no" --> Z["Direct chat with LLM"]
     E -- "yes" --> F
     F --> G["Embed query through Ray embedding actor"]
-    F --> H["BM25S keyword recall from active Qdrant payload cache"]
+    F --> H["BM25S keyword recall<br/>S3 active manifest + Markdown first<br/>Qdrant payload scroll fallback"]
     G --> I["Qdrant vector recall through tech_docs alias"]
     P -. "embedding or qdrant degraded skips vector recall" .-> G
     P -. "qdrant degraded skips vector recall" .-> I
     H --> J["RRF fusion"]
     I --> J
-    J --> K["Rerank through Ray reranker actor"]
-    P -. "reranker degraded skips rerank" .-> K
-    K --> L["Keep Final K chunks"]
+    J --> R{"Reranker component healthy?<br/>at least one replica ready"}
+    P -. "latest health snapshot" .-> R
+    R -- "yes" --> K["Rerank through Ray replicas<br/>round-robin kba_reranker_1/_2"]
+    K --> S{"Selected replica succeeds?"}
+    S -- "yes" --> L["Keep Final K chunks"]
+    S -- "fails; survivor exists" --> K
+    S -- "all replicas fail" --> U["RRF-only Final K<br/>reranker_degraded=true"]
+    R -- "no" --> U
+    U --> L
     L --> M["Build prompt with references and conversation memory"]
     M --> N["LLM answer"]
     N --> O["Store message, route metadata, and retrieved context snapshot in PostgreSQL"]
@@ -688,14 +706,25 @@ are probed every 10 seconds, two consecutive failures enter degraded state,
 degraded components are probed every 3 seconds, and two consecutive successful
 probes recover the component. Probes are lightweight: Qdrant checks collection
 or alias metadata, and embedding/reranker probes check Ray actor readiness
-without running a real user query, real embedding workload, or real rerank.
-Request handling only reads the latest health snapshot.
+without running a real user query, real embedding workload, or real rerank. The
+reranker component is considered healthy as long as at least one reranker
+replica is ready. Reranker replica probes are isolated from each other and
+accept the first successful readiness result, so a paused or hung reranker
+worker does not block a healthy sibling replica. Request handling only reads
+the latest health snapshot.
 
 Fallback is per component. If BM25S keyword recall fails, the answer continues
 with Qdrant/vector-only recall. If embedding or Qdrant is degraded, vector
-recall is skipped and the answer uses BM25-only recall. If the reranker is
-degraded or fails during a request, the pipeline skips reranking and uses the
-coarse RRF result list, capped by `Final K`. Responses and stored assistant
+recall is skipped and the answer uses BM25-only recall. If one reranker replica
+fails during a request, the request retries another replica before falling back.
+If all reranker replicas are degraded or fail during a request, the pipeline
+skips reranking and uses the coarse RRF result list, capped by `Final K`.
+Fault injection expectations match this behavior: pausing or stopping only
+`ray-worker-reranker-1` or only `ray-worker-reranker-2` should keep
+`reranker_degraded=false` and still return `rerank_score`; pausing or stopping
+both reranker workers should set `reranker_degraded=true`, return
+`reranker_ms=0`, and leave `rerank_score=null`.
+Responses and stored assistant
 messages include `retrieval_degraded`, `embedding_degraded`, `qdrant_degraded`,
 `reranker_degraded`, and `degradation_reason`; server logs write the same
 booleans, and the browser shows a degraded retrieval notice beside the answer
@@ -713,8 +742,9 @@ monitor/fallback path, avoiding a standalone head restart that would leave old
 workers and actor handles attached to the previous cluster.
 
 The default Compose configuration exposes NVIDIA GPU devices to
-`ray-worker-embedding-1` and `ray-worker-reranker-1`, while the `main` container
-remains a Ray client and does not request GPUs:
+`ray-worker-embedding-1`, `ray-worker-reranker-1`, and
+`ray-worker-reranker-2`, while the `main` container remains a Ray client and
+does not request GPUs:
 
 ```bash
 docker compose up --build
@@ -819,14 +849,14 @@ For host-side Mihomo, enable Allow LAN / bind to `0.0.0.0`, then set:
 ```bash
 DOCKER_HTTP_PROXY=http://host.docker.internal:7890
 DOCKER_HTTPS_PROXY=http://host.docker.internal:7890
-DOCKER_NO_PROXY=postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+DOCKER_NO_PROXY=postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 GRPC_ENABLE_FORK_SUPPORT=0
 ```
 
 Do not use `127.0.0.1` for the proxy host inside containers; it points to the
 container itself. The Compose file maps `host.docker.internal` for `main`,
-`ray-head`, and both Ray workers so model downloads can use the same host-side
-proxy from every model-serving container.
+`ray-head`, and all three Ray workers so model downloads can use the same
+host-side proxy from every model-serving container.
 
 ## Offline Models
 

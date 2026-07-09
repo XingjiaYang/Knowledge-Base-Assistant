@@ -112,6 +112,7 @@ def assert_llm_settings() -> None:
         ray_actor_num_cpus=2.0,
         ray_embedding_actor_num_gpus=0.25,
         ray_reranker_actor_num_gpus=0.75,
+        ray_reranker_actor_replicas=3,
         ray_code_embedding_actor_num_gpus=0.0,
         ray_embedding_actor_name="embedding-test",
         ray_code_embedding_actor_name="code-embedding-test",
@@ -219,6 +220,7 @@ def assert_llm_settings() -> None:
         config.ray_actor_num_cpus != 2.0
         or config.ray_embedding_actor_num_gpus != 0.25
         or config.ray_reranker_actor_num_gpus != 0.75
+        or config.ray_reranker_actor_replicas != 3
         or config.ray_code_embedding_actor_num_gpus != 0.0
         or config.ray_task_timeout_seconds != 12.5
     ):
@@ -733,6 +735,7 @@ def assert_invalid_settings_rejected() -> None:
         {"ray_actor_num_cpus": 0},
         {"ray_embedding_actor_num_gpus": -0.1},
         {"ray_reranker_actor_num_gpus": -0.1},
+        {"ray_reranker_actor_replicas": 0},
         {"ray_code_embedding_actor_num_gpus": -0.1},
         {"ray_namespace": ""},
         {"ray_embedding_actor_name": ""},
@@ -850,6 +853,8 @@ def assert_default_embedding_settings() -> None:
         raise AssertionError("Default embedding actor should request fractional GPU.")
     if config.ray_reranker_actor_num_gpus != 0.5:
         raise AssertionError("Default reranker actor should request fractional GPU.")
+    if config.ray_reranker_actor_replicas != 2:
+        raise AssertionError("Default reranker actor replicas should be two.")
     if config.health_probe_interval_seconds != 10.0:
         raise AssertionError("Default healthy probe interval should be 10 seconds.")
     if config.health_probe_degraded_interval_seconds != 3.0:
@@ -890,6 +895,26 @@ def assert_component_health_thresholds() -> None:
     print("Component health thresholds -> ok")
 
 
+def assert_reranker_actor_replica_names() -> None:
+    from app.model_actors import reranker_actor_names
+
+    multi_config = Settings(
+        ray_reranker_actor_name="reranker-test",
+        ray_reranker_actor_replicas=2,
+    )
+    if reranker_actor_names(multi_config) != ("reranker-test_1", "reranker-test_2"):
+        raise AssertionError("Multiple reranker replicas should get stable suffixes.")
+
+    single_config = Settings(
+        ray_reranker_actor_name="reranker-test",
+        ray_reranker_actor_replicas=1,
+    )
+    if reranker_actor_names(single_config) != ("reranker-test",):
+        raise AssertionError("Single reranker replica should preserve the base name.")
+
+    print("Reranker actor replica names -> ok")
+
+
 def main() -> None:
     assert_api_limits()
     assert_llm_settings()
@@ -912,6 +937,7 @@ def main() -> None:
     assert_default_conversation_summary_budget()
     assert_default_embedding_settings()
     assert_component_health_thresholds()
+    assert_reranker_actor_replica_names()
 
 
 if __name__ == "__main__":

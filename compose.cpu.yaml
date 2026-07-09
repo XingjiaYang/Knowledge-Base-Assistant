@@ -11,6 +11,12 @@ services:
       CUDA: "FALSE"
       RAY_WORKER_RERANKER_NUM_GPUS: "0"
 
+  ray-worker-reranker-2:
+    gpus: []
+    environment:
+      CUDA: "FALSE"
+      RAY_WORKER_RERANKER_NUM_GPUS: "0"
+
   main:
     gpus: []
     environment:

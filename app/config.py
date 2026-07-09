@@ -248,6 +248,10 @@ class Settings:
         "RAY_RERANKER_ACTOR_NUM_GPUS",
         0.5 if _env_bool("CUDA", True) else 0.0,
     )
+    ray_reranker_actor_replicas: int = _env_int(
+        "RAY_RERANKER_ACTOR_REPLICAS",
+        2,
+    )
     ray_code_embedding_actor_num_gpus: float = _env_float(
         "RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS",
         0.0,
@@ -502,6 +506,8 @@ class Settings:
             raise ValueError(
                 "RAY_RERANKER_ACTOR_NUM_GPUS must be greater than or equal to 0."
             )
+        if self.ray_reranker_actor_replicas <= 0:
+            raise ValueError("RAY_RERANKER_ACTOR_REPLICAS must be greater than 0.")
         if self.ray_code_embedding_actor_num_gpus < 0:
             raise ValueError(
                 "RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS must be greater than or equal to 0."

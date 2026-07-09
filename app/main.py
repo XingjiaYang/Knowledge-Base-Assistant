@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 import csv
 from datetime import datetime, timezone
@@ -31,8 +32,10 @@ from app.code_retrieval import (
 from app.llm_client import LLMClient
 from app.model_actors import (
     get_embedding_actor,
-    get_reranker_actor,
+    get_reranker_actors,
+    mark_ray_unavailable,
     ray_get,
+    reranker_actor_names,
     reset_embedding_actor,
     reset_reranker_actor,
     warmup_model_actors,
@@ -1178,8 +1181,10 @@ async def health_details(request: Request) -> dict[str, object]:
         "ray_namespace": settings.ray_namespace,
         "ray_embedding_actor_num_gpus": settings.ray_embedding_actor_num_gpus,
         "ray_reranker_actor_num_gpus": settings.ray_reranker_actor_num_gpus,
+        "ray_reranker_actor_replicas": settings.ray_reranker_actor_replicas,
         "ray_embedding_actor_name": settings.ray_embedding_actor_name,
         "ray_reranker_actor_name": settings.ray_reranker_actor_name,
+        "ray_reranker_actor_names": list(reranker_actor_names(settings)),
         "ray_embedding_actor_resource": settings.ray_embedding_actor_resource,
         "ray_reranker_actor_resource": settings.ray_reranker_actor_resource,
         "health_probe_interval_seconds": settings.health_probe_interval_seconds,
@@ -1567,26 +1572,73 @@ def _probe_embedding_component() -> None:
 
 
 def _probe_reranker_component() -> None:
-    actor = get_reranker_actor(settings)
-    if actor is None:
+    actors = get_reranker_actors(settings, retry_unavailable=True)
+    if not actors:
         reset_reranker_actor(settings)
-        actor = get_reranker_actor(settings)
-    if actor is None:
-        raise RuntimeError("Ray reranker actor is unavailable.")
+        actors = get_reranker_actors(settings, retry_unavailable=True)
+    if not actors:
+        raise RuntimeError("Ray reranker actors are unavailable.")
+
+    errors: list[str] = []
+    executor = ThreadPoolExecutor(max_workers=max(1, len(actors)))
+    futures = {
+        executor.submit(_probe_single_reranker_actor, actor): (actor_name, actor)
+        for actor_name, actor in actors
+    }
+    pending = set(futures)
+    deadline = time.monotonic() + max(
+        0.1,
+        settings.health_probe_timeout_seconds * 0.75,
+    )
     try:
-        ray_get(
-            actor.health.remote(),
-            settings,
-            timeout_seconds=settings.health_probe_timeout_seconds,
-        )
-    except Exception as exc:
-        _schedule_actor_recovery_warmup(
-            actor,
-            actor_name=settings.ray_reranker_actor_name,
-            component_name="reranker",
-            error=exc,
-        )
-        raise
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = wait(
+                pending,
+                timeout=remaining,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for future in done:
+                actor_name, actor = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(f"{actor_name}: {exc}")
+                    mark_ray_unavailable(actor_name)
+                    _schedule_actor_recovery_warmup(
+                        actor,
+                        actor_name=actor_name,
+                        component_name=f"reranker {actor_name}",
+                        error=exc,
+                    )
+                    continue
+                for pending_future in pending:
+                    pending_actor_name, _pending_actor = futures[pending_future]
+                    mark_ray_unavailable(pending_actor_name)
+                    errors.append(f"{pending_actor_name}: health check timed out")
+                    pending_future.cancel()
+                return
+
+        for future in pending:
+            actor_name, _actor = futures[future]
+            mark_ray_unavailable(actor_name)
+            errors.append(f"{actor_name}: health check timed out")
+            future.cancel()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    raise RuntimeError("All Ray reranker actors are unhealthy: " + "; ".join(errors))
+
+
+def _probe_single_reranker_actor(actor: Any) -> None:
+    ray_get(
+        actor.health.remote(),
+        settings,
+        timeout_seconds=max(0.1, settings.health_probe_timeout_seconds * 0.6),
+    )
 
 
 def _schedule_actor_recovery_warmup(
