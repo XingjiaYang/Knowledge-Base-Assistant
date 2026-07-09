@@ -99,8 +99,15 @@ class Reranker:
             return []
 
         if self._use_ray:
-            actor = self._reranker_actor()
-            if actor is not None:
+            attempted_actor_names: set[str] = set()
+            while True:
+                selected_actor = self._reranker_actor(
+                    exclude_names=attempted_actor_names,
+                )
+                if selected_actor is None:
+                    break
+                actor_name, actor = selected_actor
+                attempted_actor_names.add(actor_name)
                 try:
                     from app.model_actors import mark_ray_unavailable, ray_get
 
@@ -110,17 +117,22 @@ class Reranker:
                     )
                 except Exception:
                     logger.exception(
-                        "Reranker Ray actor failed; local_model_fallback=%s.",
+                        "Reranker Ray actor %s failed; local_model_fallback=%s.",
+                        actor_name,
                         self.config.ray_local_fallback,
                     )
-                    mark_ray_unavailable(self.config.ray_reranker_actor_name)
-                    if not self.config.ray_local_fallback:
+                    mark_ray_unavailable(actor_name)
+                    if (
+                        not self.config.ray_local_fallback
+                        and len(attempted_actor_names)
+                        >= self.config.ray_reranker_actor_replicas
+                    ):
                         raise RuntimeError(
-                            "Reranker Ray actor failed and RAY_LOCAL_FALLBACK=0."
+                            "All Reranker Ray actors failed and RAY_LOCAL_FALLBACK=0."
                         )
-            elif not self.config.ray_local_fallback:
+            if not self.config.ray_local_fallback:
                 raise RuntimeError(
-                    "Reranker Ray actor is unavailable and RAY_LOCAL_FALLBACK=0."
+                    "Reranker Ray actors are unavailable and RAY_LOCAL_FALLBACK=0."
                 )
 
         limit = max(1, top_k or self.config.retrieve_top_k)
@@ -172,13 +184,20 @@ class Reranker:
             self._model_device = self._move_model_to_device(self.model, "cpu")
             return self.model.rerank(query, documents, top_n=top_n)
 
-    def _reranker_actor(self) -> object | None:
+    def _reranker_actor(
+        self,
+        *,
+        exclude_names: set[str] | None = None,
+    ) -> tuple[str, object] | None:
         if not self._use_ray:
             return None
         try:
-            from app.model_actors import get_reranker_actor
+            from app.model_actors import get_reranker_actor_for_request
 
-            return get_reranker_actor(self.config)
+            return get_reranker_actor_for_request(
+                self.config,
+                exclude_names=exclude_names,
+            )
         except Exception:
             logger.exception("Reranker Ray actor setup failed.")
             return None

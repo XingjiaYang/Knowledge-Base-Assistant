@@ -153,10 +153,11 @@ docker compose down
 docker compose down -v
 ```
 
-默认 `compose.yaml` 会启动 PostgreSQL、Qdrant、MinIO、Ray head、两个 Ray
+默认 `compose.yaml` 会启动 PostgreSQL、Qdrant、MinIO、Ray head、三个 Ray
 model worker 和 `main` API 服务。`ray-worker-embedding-1` 带 Ray resource
-`ray_worker_embedding`，用于文档 embedding actor；`ray-worker-reranker-1`
-带 `ray_worker_reranker`，用于 reranker actor。`main` 容器只连接
+`ray_worker_embedding`，用于文档 embedding actor；`ray-worker-reranker-1` 和
+`ray-worker-reranker-2` 分别带 `ray_worker_reranker_1` 和
+`ray_worker_reranker_2`，用于两个 reranker actor replica。`main` 容器只连接
 `ray://ray-head:10001`，默认 `RAY_LOCAL_FALLBACK=0`，不会把 embedding/reranker
 模型加载回 API 进程。Compose 还会启动 `autoheal`，它根据 Docker healthcheck
 重启适合单容器自愈的服务，例如 `qdrant` 和 `main`；Ray head/worker 不交给
@@ -176,7 +177,9 @@ flowchart TD
         MinIOInit["minio-init<br/>一次性 bucket 初始化<br/>开启 versioning"]
         RayHead["ray-head<br/>Ray 控制面<br/>ray://ray-head:10001"]
         EmbedWorker["ray-worker-embedding-1<br/>Ray worker<br/>resource: ray_worker_embedding<br/>承载 kba_embedding actor"]
-        RerankWorker["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker<br/>承载 kba_reranker actor"]
+        RerankWorker1["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker_1<br/>承载 kba_reranker_1 actor"]
+        RerankWorker2["ray-worker-reranker-2<br/>Ray worker<br/>resource: ray_worker_reranker_2<br/>承载 kba_reranker_2 actor"]
+        HealthSupervisor["main health supervisor<br/>embedding / qdrant / reranker<br/>独立轻量探测"]
         Autoheal["autoheal<br/>监控 Docker healthcheck<br/>重启 unhealthy 容器"]
         VLLM["vllm<br/>可选 local-llm profile<br/>OpenAI-compatible LLM 服务"]
     end
@@ -187,7 +190,13 @@ flowchart TD
     Main --> RayHead
     MinIOInit --> MinIO
     RayHead --> EmbedWorker
-    RayHead --> RerankWorker
+    RayHead --> RerankWorker1
+    RayHead --> RerankWorker2
+    Main --> HealthSupervisor
+    HealthSupervisor -. "collection / alias 元信息" .-> Qdrant
+    HealthSupervisor -. "embedding actor readiness" .-> EmbedWorker
+    HealthSupervisor -. "并行 reranker readiness<br/>任一 replica 健康即可" .-> RerankWorker1
+    HealthSupervisor -. "并行 reranker readiness<br/>任一 replica 健康即可" .-> RerankWorker2
     Autoheal -. healthcheck .-> Main
     Autoheal -. healthcheck .-> Qdrant
     Main -. 可选 .-> VLLM
@@ -210,8 +219,10 @@ flowchart TD
     Main --> ModelsBind
     EmbedWorker --> HFVol
     EmbedWorker --> ModelsBind
-    RerankWorker --> HFVol
-    RerankWorker --> ModelsBind
+    RerankWorker1 --> HFVol
+    RerankWorker1 --> ModelsBind
+    RerankWorker2 --> HFVol
+    RerankWorker2 --> ModelsBind
 ```
 
 默认 Compose 启动和镜像绑定的文档初始化流程：
@@ -340,6 +351,7 @@ RERANKER_PRELOAD=1
 RERANKER_TRUST_REMOTE_CODE=1
 RERANKER_DTYPE=auto
 RERANKER_MAX_DOCUMENTS_PER_CALL=64
+RAY_RERANKER_ACTOR_REPLICAS=2
 
 HISTORY_RECENT_TURNS=16
 HISTORY_MAX_MESSAGES=0
@@ -366,7 +378,7 @@ HEALTH_PROBE_FAILURE_THRESHOLD=2
 HEALTH_PROBE_RECOVERY_THRESHOLD=2
 ```
 
-当意图路由判断需要 RAG 时，系统会先用 BM25 从本地 Markdown chunk 召回
+当意图路由判断需要 RAG 时，系统会先用 BM25S 从当前生效的 Markdown chunk 召回
 `BM25_TOP_K` 个关键词候选，再从 Qdrant 召回 `RECALL_TOP_K` 个余弦相似度候选，
 然后用 RRF（reciprocal rank fusion）融合两路排序并保留 `RRF_TOP_K` 个候选，
 再使用多语言 `jinaai/jina-reranker-v3` cross-encoder 重排，最后只保留
@@ -399,8 +411,9 @@ summary + 未压缩 history，并在扣除输出、当前 query、安全余量�
 预期引用 token 后接近上下文上限时才触发压缩。唯一 superuser 可以在 Admin UI
 修改运行时 LLM context window，后续回答会使用该值。
 
-`CUDA=TRUE` 是默认值，Ray model worker 会暴露 GPU 资源，并把 Jina embedding
-和 Jina reranker 作为 detached named actor 常驻。`main` 容器只连接
+`CUDA=TRUE` 是默认值，Ray model worker 会暴露 GPU 资源，并把 1 个 Jina
+embedding actor 和 2 个 Jina reranker actor replica 作为 detached named actor
+常驻。`main` 容器只连接
 `ray://ray-head:10001`；默认 `RAY_LOCAL_FALLBACK=0`，Ray Actor 不可用时不会在
 API 进程本地加载这些模型。设置 `CUDA=FALSE` 可强制 Ray worker 和 actor 资源请求
 都走 CPU。默认镜像使用 PyTorch CUDA runtime 镜像，不需要在宿主机安装 CUDA
@@ -413,7 +426,7 @@ Query 时的文档 RAG pipeline：
 ```mermaid
 flowchart TD
     A["浏览器 / POST /rag"] --> B["从 PostgreSQL 读取会话、压缩记忆和运行配置"]
-    P["后台组件健康状态<br/>embedding / qdrant / reranker<br/>正常 10s 探测，降级 3s 探测"]
+    P["后台组件健康状态<br/>embedding / qdrant / reranker<br/>正常 10s 探测，降级 3s 探测<br/>reranker replicas 独立探测"]
     B --> C{"开启 RAG-only?"}
     C -- "是" --> F["强制 RAG route"]
     C -- "否" --> D["意图路由"]
@@ -421,15 +434,21 @@ flowchart TD
     E -- "否" --> Z["直接调用 LLM 对话"]
     E -- "是" --> F
     F --> G["通过 Ray embedding actor embed 查询"]
-    F --> H["BM25S 从 active Qdrant payload cache 做关键词召回"]
+    F --> H["BM25S 关键词召回<br/>优先 S3 active manifest + Markdown<br/>Qdrant payload scroll 兜底"]
     G --> I["Qdrant 通过 tech_docs alias 做向量召回"]
     P -. "embedding 或 qdrant degraded 时跳过向量召回" .-> G
     P -. "qdrant degraded 时跳过向量召回" .-> I
     H --> J["RRF 融合"]
     I --> J
-    J --> K["通过 Ray reranker actor 精排"]
-    P -. "reranker degraded 时跳过精排" .-> K
-    K --> L["保留 Final K chunks"]
+    J --> R{"reranker 组件健康?<br/>至少一个 replica ready"}
+    P -. "最近一次健康快照" .-> R
+    R -- "是" --> K["通过 Ray replicas 精排<br/>轮转 kba_reranker_1/_2"]
+    K --> S{"选中的 replica 调用成功?"}
+    S -- "成功" --> L["保留 Final K chunks"]
+    S -- "失败；还有存活 replica" --> K
+    S -- "全部失败" --> U["RRF-only Final K<br/>reranker_degraded=true"]
+    R -- "否" --> U
+    U --> L
     L --> M["拼接引用、会话记忆和 prompt"]
     M --> N["LLM 生成回答"]
     N --> O["把消息、route metadata 和 retrieved contexts 快照写入 PostgreSQL"]
@@ -443,12 +462,20 @@ PostgreSQL 不保存文档 chunk 的 canonical 副本。PG 负责用户、会话
 `reranker` 三个组件：正常状态每 10 秒探测一次，连续 2 次失败后才进入 degraded；
 degraded 后每 3 秒探测一次，连续 2 次恢复成功后才退出 degraded。探测是轻量的：
 Qdrant 只查 collection/alias 元信息，embedding/reranker 只检查 Ray actor readiness，
-不执行真实用户 query、真实代码 embedding 或真实 rerank。请求路径只读取最近一次
-健康状态，不在每次 query 上额外探测。
+不执行真实用户 query、真实代码 embedding 或真实 rerank。reranker 组件只要至少一个
+replica ready 就仍视为可用。reranker replica 之间的健康探测相互隔离，并接受最先
+成功的 readiness 结果，所以单个被 `docker compose pause` 冻结或 hang 住的 reranker
+worker 不会拖住仍健康的另一个 replica。请求路径只读取最近一次健康状态，不在每次
+query 上额外探测。
 
 进入 degraded 后，各组件独立 fallback：BM25S 关键词召回失败时继续使用
 Qdrant/vector-only；embedding 或 Qdrant degraded 时跳过向量召回并使用 BM25-only；
-reranker degraded 或调用失败时使用 RRF 粗排结果并按 `Final K` 截断。`/rag` 响应和
+单个 reranker replica 请求失败时会先尝试另一个 replica；全部 reranker replica
+degraded 或调用失败时才使用 RRF 粗排结果并按 `Final K` 截断。
+故障注入期望也按这个语义：只 pause/stop `ray-worker-reranker-1` 或只 pause/stop
+`ray-worker-reranker-2` 时，`reranker_degraded=false`，结果仍应包含 `rerank_score`；
+两个 reranker worker 都 pause/stop 时，才应进入 `reranker_degraded=true`、
+`reranker_ms=0`，并返回 `rerank_score=null` 的 RRF-only 结果。`/rag` 响应和
 存储的 assistant 消息会包含 `retrieval_degraded`、`embedding_degraded`、
 `qdrant_degraded`、`reranker_degraded` 和 `degradation_reason`；服务端日志也会写出
 这些布尔值，前端会在回答和引用区显示降级提示。`/health/details` 的
@@ -461,8 +488,9 @@ reranker degraded 或调用失败时使用 RRF 粗排结果并按 `Final K` 截�
 Ray 进程退出时由 Docker 重启。Ray actor 级异常由 Ray 的 actor restart 和应用健康
 探测/fallback 处理，避免单独重启 head 后留下旧 worker/actor 连接。
 
-默认 Compose 配置会把 GPU 暴露给 `ray-worker-embedding-1` 和
-`ray-worker-reranker-1`；`main` 容器只是 Ray client，不再申请 GPU：
+默认 Compose 配置会把 GPU 暴露给 `ray-worker-embedding-1`、
+`ray-worker-reranker-1` 和 `ray-worker-reranker-2`；`main` 容器只是 Ray client，
+不再申请 GPU：
 
 ```bash
 docker compose up --build
@@ -765,12 +793,12 @@ HF_ENDPOINT=https://hf-mirror.com
 ```bash
 DOCKER_HTTP_PROXY=http://host.docker.internal:7890
 DOCKER_HTTPS_PROXY=http://host.docker.internal:7890
-DOCKER_NO_PROXY=postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+DOCKER_NO_PROXY=postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 GRPC_ENABLE_FORK_SUPPORT=0
 ```
 
 不要在容器内把代理地址写成 `127.0.0.1`，它指向容器自身。Compose 已经给 `main`、
-`ray-head` 和两个 Ray worker 配置 `host.docker.internal`，所以所有模型服务容器都能
+`ray-head` 和三个 Ray worker 配置 `host.docker.internal`，所以所有模型服务容器都能
 通过同一个宿主机代理下载模型。
 
 离线模型可挂载到 `./models:/models:ro`：

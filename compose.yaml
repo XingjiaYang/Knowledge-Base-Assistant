@@ -15,10 +15,10 @@ x-ray-worker-env: &ray-worker-env
   GRPC_ENABLE_FORK_SUPPORT: ${GRPC_ENABLE_FORK_SUPPORT:-0}
   HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
   HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-  NO_PROXY: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+  NO_PROXY: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
   http_proxy: ${DOCKER_HTTP_PROXY:-}
   https_proxy: ${DOCKER_HTTPS_PROXY:-}
-  no_proxy: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+  no_proxy: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
 
 services:
   postgres:
@@ -213,7 +213,52 @@ services:
           --address=ray-head:6379 \
           --num-cpus="$${RAY_WORKER_RERANKER_NUM_CPUS:-2}" \
           --num-gpus="$${RAY_WORKER_RERANKER_NUM_GPUS:-1}" \
-          --resources='{"ray_worker_reranker": 1}' \
+          --resources='{"ray_worker_reranker_1": 1}' \
+          --block; do
+          echo "Waiting for ray-head..."
+          sleep 3
+        done
+    environment:
+      <<: *ray-worker-env
+      RAY_WORKER_RERANKER_NUM_CPUS: ${RAY_WORKER_RERANKER_NUM_CPUS:-2}
+      RAY_WORKER_RERANKER_NUM_GPUS: ${RAY_WORKER_RERANKER_NUM_GPUS:-1}
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+      - ./models:/models:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import socket;
+          s=socket.create_connection(('ray-head', 6379), 2);
+          s.close()"
+      interval: 10s
+      timeout: 3s
+      retries: 2
+      start_period: 60s
+
+  ray-worker-reranker-2:
+    build: *main-build
+    container_name: ray-worker-reranker-2
+    hostname: ray-worker-reranker-2
+    restart: unless-stopped
+    depends_on:
+      ray-head:
+        condition: service_started
+    gpus: all
+    shm_size: "10gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - |
+        until ray start \
+          --address=ray-head:6379 \
+          --num-cpus="$${RAY_WORKER_RERANKER_NUM_CPUS:-2}" \
+          --num-gpus="$${RAY_WORKER_RERANKER_NUM_GPUS:-1}" \
+          --resources='{"ray_worker_reranker_2": 1}' \
           --block; do
           echo "Waiting for ray-head..."
           sleep 3
@@ -297,6 +342,8 @@ services:
         condition: service_started
       ray-worker-reranker-1:
         condition: service_started
+      ray-worker-reranker-2:
+        condition: service_started
     shm_size: "10gb"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -371,6 +418,7 @@ services:
       RAY_ACTOR_NUM_CPUS: ${RAY_ACTOR_NUM_CPUS:-1}
       RAY_EMBEDDING_ACTOR_NUM_GPUS: ${RAY_EMBEDDING_ACTOR_NUM_GPUS:-0.5}
       RAY_RERANKER_ACTOR_NUM_GPUS: ${RAY_RERANKER_ACTOR_NUM_GPUS:-0.5}
+      RAY_RERANKER_ACTOR_REPLICAS: ${RAY_RERANKER_ACTOR_REPLICAS:-2}
       RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS: ${RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS:-0}
       RAY_EMBEDDING_ACTOR_NAME: ${RAY_EMBEDDING_ACTOR_NAME:-kba_embedding}
       RAY_CODE_EMBEDDING_ACTOR_NAME: ${RAY_CODE_EMBEDDING_ACTOR_NAME:-kba_code_embedding}
@@ -450,10 +498,10 @@ services:
       HF_HUB_DISABLE_XET: ${HF_HUB_DISABLE_XET:-1}
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      NO_PROXY: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
     volumes:
       - ./data:/app/data:ro
       - huggingface_cache:/root/.cache/huggingface

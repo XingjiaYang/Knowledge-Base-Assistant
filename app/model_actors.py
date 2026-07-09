@@ -13,7 +13,8 @@ logger = logging.getLogger(__name__)
 _ray_lock = Lock()
 _embedding_actor: Any | None = None
 _code_embedding_actor: Any | None = None
-_reranker_actor: Any | None = None
+_reranker_actors: dict[str, Any] = {}
+_reranker_round_robin_index = 0
 _unavailable_actor_names: set[str] = set()
 
 
@@ -154,27 +155,102 @@ def reset_embedding_actor(config: Settings = settings) -> None:
         _unavailable_actor_names.discard(config.ray_embedding_actor_name)
 
 
-def reset_reranker_actor(config: Settings = settings) -> None:
-    global _reranker_actor
+def reset_reranker_actor(
+    config: Settings = settings,
+    actor_name: str | None = None,
+) -> None:
     with _ray_lock:
-        _reranker_actor = None
-        _unavailable_actor_names.discard(config.ray_reranker_actor_name)
+        actor_names = (
+            (actor_name,)
+            if actor_name is not None
+            else _reranker_actor_names(config)
+        )
+        for name in actor_names:
+            _reranker_actors.pop(name, None)
+            _unavailable_actor_names.discard(name)
 
 
 def get_reranker_actor(config: Settings = settings) -> Any | None:
-    global _reranker_actor
+    selected = get_reranker_actor_for_request(config)
+    if selected is None:
+        return None
+    _name, actor = selected
+    return actor
+
+
+def get_reranker_actor_for_request(
+    config: Settings = settings,
+    *,
+    exclude_names: set[str] | None = None,
+) -> tuple[str, Any] | None:
+    global _reranker_round_robin_index
     if not config.ray_enabled:
         return None
+    excluded = exclude_names or set()
     with _ray_lock:
-        if _reranker_actor is None:
-            _reranker_actor = _get_or_create_actor(
+        actors = _get_reranker_actors_locked(config)
+        actors = [(name, actor) for name, actor in actors if name not in excluded]
+        if not actors:
+            return None
+        index = _reranker_round_robin_index % len(actors)
+        _reranker_round_robin_index += 1
+        return actors[index]
+
+
+def get_reranker_actors(
+    config: Settings = settings,
+    *,
+    retry_unavailable: bool = False,
+) -> list[tuple[str, Any]]:
+    if not config.ray_enabled:
+        return []
+    with _ray_lock:
+        if retry_unavailable:
+            for name in _reranker_actor_names(config):
+                _unavailable_actor_names.discard(name)
+        return _get_reranker_actors_locked(config)
+
+
+def reranker_actor_names(config: Settings = settings) -> tuple[str, ...]:
+    return _reranker_actor_names(config)
+
+
+def _get_reranker_actors_locked(config: Settings) -> list[tuple[str, Any]]:
+    actors: list[tuple[str, Any]] = []
+    for index, actor_name in enumerate(_reranker_actor_names(config), start=1):
+        if actor_name in _unavailable_actor_names:
+            continue
+        actor = _reranker_actors.get(actor_name)
+        if actor is None:
+            actor = _get_or_create_actor(
                 config,
                 RerankerActor,
-                config.ray_reranker_actor_name,
+                actor_name,
                 num_gpus=config.ray_reranker_actor_num_gpus,
-                node_resource=config.ray_reranker_actor_resource,
+                node_resource=_reranker_actor_resource(config, index),
             )
-        return _reranker_actor
+            if actor is not None:
+                _reranker_actors[actor_name] = actor
+        if actor is not None:
+            actors.append((actor_name, actor))
+    return actors
+
+
+def _reranker_actor_names(config: Settings) -> tuple[str, ...]:
+    replicas = max(1, config.ray_reranker_actor_replicas)
+    base_name = config.ray_reranker_actor_name.strip()
+    if replicas == 1:
+        return (base_name,)
+    return tuple(f"{base_name}_{index}" for index in range(1, replicas + 1))
+
+
+def _reranker_actor_resource(config: Settings, replica_index: int) -> str:
+    base_resource = config.ray_reranker_actor_resource.strip()
+    if not base_resource:
+        return ""
+    if config.ray_reranker_actor_replicas <= 1:
+        return base_resource
+    return f"{base_resource}_{replica_index}"
 
 
 def ray_get(
@@ -199,7 +275,7 @@ def mark_ray_unavailable(actor_name: str | None = None, config: Settings = setti
         actor_names = (
             config.ray_embedding_actor_name,
             config.ray_code_embedding_actor_name,
-            config.ray_reranker_actor_name,
+            *_reranker_actor_names(config),
         )
     else:
         actor_names = (actor_name,)
@@ -210,7 +286,7 @@ def mark_ray_unavailable(actor_name: str | None = None, config: Settings = setti
 def warmup_model_actors(config: Settings = settings) -> None:
     embedding_ref: Any | None = None
     code_embedding_actor: Any | None = None
-    reranker_ref: Any | None = None
+    reranker_refs: list[tuple[str, Any]] = []
 
     try:
         embedding_actor = get_embedding_actor(config)
@@ -227,9 +303,8 @@ def warmup_model_actors(config: Settings = settings) -> None:
 
     if config.reranker_enabled:
         try:
-            reranker_actor = get_reranker_actor(config)
-            if reranker_actor is not None:
-                reranker_ref = reranker_actor.warmup.remote()
+            for actor_name, reranker_actor in get_reranker_actors(config):
+                reranker_refs.append((actor_name, reranker_actor.warmup.remote()))
         except Exception:
             logger.exception("Ray reranker actor startup failed.")
 
@@ -258,11 +333,11 @@ def warmup_model_actors(config: Settings = settings) -> None:
         except Exception:
             logger.exception("Ray document embedding actor warmup failed.")
 
-    if reranker_ref is not None:
+    for actor_name, reranker_ref in reranker_refs:
         try:
             ray_get(reranker_ref, config)
         except Exception:
-            logger.exception("Ray reranker actor warmup failed.")
+            logger.exception("Ray reranker actor %s warmup failed.", actor_name)
 
 
 def _get_or_create_actor(
