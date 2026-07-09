@@ -277,6 +277,26 @@ class Settings:
         "",
     )
     ray_task_timeout_seconds: float = _env_float("RAY_TASK_TIMEOUT_SECONDS", 300.0)
+    health_probe_interval_seconds: float = _env_float(
+        "HEALTH_PROBE_INTERVAL_SECONDS",
+        10.0,
+    )
+    health_probe_degraded_interval_seconds: float = _env_float(
+        "HEALTH_PROBE_DEGRADED_INTERVAL_SECONDS",
+        3.0,
+    )
+    health_probe_timeout_seconds: float = _env_float(
+        "HEALTH_PROBE_TIMEOUT_SECONDS",
+        2.0,
+    )
+    health_probe_failure_threshold: int = _env_int(
+        "HEALTH_PROBE_FAILURE_THRESHOLD",
+        2,
+    )
+    health_probe_recovery_threshold: int = _env_int(
+        "HEALTH_PROBE_RECOVERY_THRESHOLD",
+        2,
+    )
 
     llm_provider: str = os.getenv("LLM_PROVIDER", "openai_compatible")
     llm_base_url: str = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
@@ -506,6 +526,22 @@ class Settings:
                 raise ValueError(
                     f"{field_name} must contain only letters, numbers, or underscores."
                 )
+        if self.ray_task_timeout_seconds < 0:
+            raise ValueError(
+                "RAY_TASK_TIMEOUT_SECONDS must be greater than or equal to 0."
+            )
+        if self.health_probe_interval_seconds <= 0:
+            raise ValueError("HEALTH_PROBE_INTERVAL_SECONDS must be greater than 0.")
+        if self.health_probe_degraded_interval_seconds <= 0:
+            raise ValueError(
+                "HEALTH_PROBE_DEGRADED_INTERVAL_SECONDS must be greater than 0."
+            )
+        if self.health_probe_timeout_seconds <= 0:
+            raise ValueError("HEALTH_PROBE_TIMEOUT_SECONDS must be greater than 0.")
+        if self.health_probe_failure_threshold <= 0:
+            raise ValueError("HEALTH_PROBE_FAILURE_THRESHOLD must be greater than 0.")
+        if self.health_probe_recovery_threshold <= 0:
+            raise ValueError("HEALTH_PROBE_RECOVERY_THRESHOLD must be greater than 0.")
         if self.llm_timeout_seconds <= 0:
             raise ValueError("LLM_TIMEOUT_SECONDS must be greater than 0.")
         if self.llm_retry_attempts <= 0:

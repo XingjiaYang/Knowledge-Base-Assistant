@@ -176,6 +176,11 @@ class FakeS3DocumentStore:
         return None
 
 
+class FailingQdrantClient:
+    def __getattr__(self, name: str) -> object:
+        raise RuntimeError(f"Qdrant should not be used during this test: {name}")
+
+
 def _records(client: QdrantClient, collection_name: str) -> list[Record]:
     records, _ = client.scroll(
         collection_name=collection_name,
@@ -656,10 +661,18 @@ def assert_s3_versioned_ingest_switches_alias_and_removes_orphans() -> None:
         chunk_size=240,
         chunk_overlap=20,
     )
+    document_store = FakeS3DocumentStore(
+        {
+            "a.md": ("a-v1", "# A\n\nalpha orphan text"),
+            "b.md": ("b-v1", "# B\n\nbeta stable text"),
+            "c.md": ("c-v1", "# C\n\ncharlie old text"),
+        }
+    )
     vector_store = VectorStore(
         config,
         client=client,
         model=FakeEmbeddingModel(),
+        document_store=document_store,
     )
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -681,13 +694,6 @@ def assert_s3_versioned_ingest_switches_alias_and_removes_orphans() -> None:
             )
         ],
         wait=True,
-    )
-    document_store = FakeS3DocumentStore(
-        {
-            "a.md": ("a-v1", "# A\n\nalpha orphan text"),
-            "b.md": ("b-v1", "# B\n\nbeta stable text"),
-            "c.md": ("c-v1", "# C\n\ncharlie old text"),
-        }
     )
     indexer = VersionedS3DocumentIndexer(
         config,
@@ -741,6 +747,18 @@ def assert_s3_versioned_ingest_switches_alias_and_removes_orphans() -> None:
     fresh_results = vector_store.search_bm25("delta new", top_k=1)
     if not fresh_results or fresh_results[0].source != "d.md":
         raise AssertionError(f"BM25 should search the active S3 version: {fresh_results}")
+    offline_store = VectorStore(
+        config,
+        client=FailingQdrantClient(),  # type: ignore[arg-type]
+        model=FakeEmbeddingModel(),
+        document_store=document_store,
+    )
+    offline_results = offline_store.search_bm25("delta new", top_k=1)
+    if not offline_results or offline_results[0].source != "d.md":
+        raise AssertionError(
+            "BM25 should build from S3 active manifest without Qdrant: "
+            f"{offline_results}"
+        )
 
     document_store.set_documents(
         {
@@ -778,13 +796,14 @@ def assert_s3_versioned_ingest_rolls_back_on_failure() -> None:
         chunk_size=240,
         chunk_overlap=20,
     )
+    document_store = FakeS3DocumentStore(
+        {"a.md": ("a-v1", "# A\n\nalpha initial")}
+    )
     vector_store = VectorStore(
         config,
         client=client,
         model=FakeEmbeddingModel(),
-    )
-    document_store = FakeS3DocumentStore(
-        {"a.md": ("a-v1", "# A\n\nalpha initial")}
+        document_store=document_store,
     )
     indexer = VersionedS3DocumentIndexer(
         config,

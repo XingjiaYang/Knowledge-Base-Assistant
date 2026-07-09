@@ -113,7 +113,7 @@ class Reranker:
                         "Reranker Ray actor failed; local_model_fallback=%s.",
                         self.config.ray_local_fallback,
                     )
-                    mark_ray_unavailable()
+                    mark_ray_unavailable(self.config.ray_reranker_actor_name)
                     if not self.config.ray_local_fallback:
                         raise RuntimeError(
                             "Reranker Ray actor failed and RAY_LOCAL_FALLBACK=0."

@@ -158,7 +158,9 @@ model worker 和 `main` API 服务。`ray-worker-embedding-1` 带 Ray resource
 `ray_worker_embedding`，用于文档 embedding actor；`ray-worker-reranker-1`
 带 `ray_worker_reranker`，用于 reranker actor。`main` 容器只连接
 `ray://ray-head:10001`，默认 `RAY_LOCAL_FALLBACK=0`，不会把 embedding/reranker
-模型加载回 API 进程。
+模型加载回 API 进程。Compose 还会启动 `autoheal`，它根据 Docker healthcheck
+重启适合单容器自愈的服务，例如 `qdrant` 和 `main`；Ray head/worker 不交给
+autoheal 单独重启，避免把已有 Ray cluster 连接关系打散。
 
 Docker 服务架构：
 
@@ -175,6 +177,7 @@ flowchart TD
         RayHead["ray-head<br/>Ray 控制面<br/>ray://ray-head:10001"]
         EmbedWorker["ray-worker-embedding-1<br/>Ray worker<br/>resource: ray_worker_embedding<br/>承载 kba_embedding actor"]
         RerankWorker["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker<br/>承载 kba_reranker actor"]
+        Autoheal["autoheal<br/>监控 Docker healthcheck<br/>重启 unhealthy 容器"]
         VLLM["vllm<br/>可选 local-llm profile<br/>OpenAI-compatible LLM 服务"]
     end
 
@@ -185,6 +188,8 @@ flowchart TD
     MinIOInit --> MinIO
     RayHead --> EmbedWorker
     RayHead --> RerankWorker
+    Autoheal -. healthcheck .-> Main
+    Autoheal -. healthcheck .-> Qdrant
     Main -. 可选 .-> VLLM
     Main --> CloudLLM["云端 LLM API<br/>OpenAI-compatible / Anthropic"]
 
@@ -289,6 +294,9 @@ LLM_CONTEXT_PROMPT_OVERHEAD_TOKENS=2048
 POSTGRES_USER=kba
 POSTGRES_PASSWORD=kba_password
 POSTGRES_DB=kba
+AUTOHEAL_IMAGE=willfarrell/autoheal:1.2.0
+AUTOHEAL_INTERVAL=10
+AUTOHEAL_START_PERIOD=30
 AUTH_DEFAULT_ADMIN_ENABLED=1
 AUTH_DEFAULT_ADMIN_USERNAME=admin
 AUTH_DEFAULT_ADMIN_PASSWORD=123456
@@ -350,6 +358,12 @@ INGEST_ON_STARTUP=0
 INGEST_USE_RAY=1
 RECREATE_COLLECTION=0
 WAIT_FOR_LLM=0
+
+HEALTH_PROBE_INTERVAL_SECONDS=10
+HEALTH_PROBE_DEGRADED_INTERVAL_SECONDS=3
+HEALTH_PROBE_TIMEOUT_SECONDS=2
+HEALTH_PROBE_FAILURE_THRESHOLD=2
+HEALTH_PROBE_RECOVERY_THRESHOLD=2
 ```
 
 当意图路由判断需要 RAG 时，系统会先用 BM25 从本地 Markdown chunk 召回
@@ -399,6 +413,7 @@ Query 时的文档 RAG pipeline：
 ```mermaid
 flowchart TD
     A["浏览器 / POST /rag"] --> B["从 PostgreSQL 读取会话、压缩记忆和运行配置"]
+    P["后台组件健康状态<br/>embedding / qdrant / reranker<br/>正常 10s 探测，降级 3s 探测"]
     B --> C{"开启 RAG-only?"}
     C -- "是" --> F["强制 RAG route"]
     C -- "否" --> D["意图路由"]
@@ -408,9 +423,12 @@ flowchart TD
     F --> G["通过 Ray embedding actor embed 查询"]
     F --> H["BM25S 从 active Qdrant payload cache 做关键词召回"]
     G --> I["Qdrant 通过 tech_docs alias 做向量召回"]
+    P -. "embedding 或 qdrant degraded 时跳过向量召回" .-> G
+    P -. "qdrant degraded 时跳过向量召回" .-> I
     H --> J["RRF 融合"]
     I --> J
     J --> K["通过 Ray reranker actor 精排"]
+    P -. "reranker degraded 时跳过精排" .-> K
     K --> L["保留 Final K chunks"]
     L --> M["拼接引用、会话记忆和 prompt"]
     M --> N["LLM 生成回答"]
@@ -421,13 +439,27 @@ PostgreSQL 不保存文档 chunk 的 canonical 副本。PG 负责用户、会话
 和历史回答用到的 retrieved contexts 快照；当前 chunk text 存在 Qdrant payload
 里，并且可以从 S3 原文重新构建。
 
-检索降级不会 silent failure。BM25S 关键词召回失败时，回答会继续使用
-Qdrant/vector-only 召回；Qdrant/vector recall 失败时，回答会降级为 BM25-only
-召回；reranker actor 失败时，回答会使用 RRF 粗排结果并按 `Final K` 截断。
-`/rag` 响应和存储的 assistant 消息会包含
-`retrieval_degraded`、`qdrant_degraded`、`reranker_degraded` 和
-`degradation_reason`；服务端日志也会写出这些布尔值，前端会在回答和引用区显示降级
-提示。
+检索降级不会 silent failure。后台会独立探测 `embedding`、`qdrant` 和
+`reranker` 三个组件：正常状态每 10 秒探测一次，连续 2 次失败后才进入 degraded；
+degraded 后每 3 秒探测一次，连续 2 次恢复成功后才退出 degraded。探测是轻量的：
+Qdrant 只查 collection/alias 元信息，embedding/reranker 只检查 Ray actor readiness，
+不执行真实用户 query、真实代码 embedding 或真实 rerank。请求路径只读取最近一次
+健康状态，不在每次 query 上额外探测。
+
+进入 degraded 后，各组件独立 fallback：BM25S 关键词召回失败时继续使用
+Qdrant/vector-only；embedding 或 Qdrant degraded 时跳过向量召回并使用 BM25-only；
+reranker degraded 或调用失败时使用 RRF 粗排结果并按 `Final K` 截断。`/rag` 响应和
+存储的 assistant 消息会包含 `retrieval_degraded`、`embedding_degraded`、
+`qdrant_degraded`、`reranker_degraded` 和 `degradation_reason`；服务端日志也会写出
+这些布尔值，前端会在回答和引用区显示降级提示。`/health/details` 的
+`component_health` 会展示每个组件的状态、连续失败/成功次数、最近错误和当前探测
+间隔。
+
+容器级自愈由 Docker 层处理，但 Ray cluster 不做单容器 autoheal：`qdrant` 和
+`main` 带 healthcheck 与 `autoheal=true` label，`autoheal` 容器通过 Docker socket
+重启 unhealthy 容器；`ray-head` 和 Ray worker 保留 `restart: unless-stopped`，仅在
+Ray 进程退出时由 Docker 重启。Ray actor 级异常由 Ray 的 actor restart 和应用健康
+探测/fallback 处理，避免单独重启 head 后留下旧 worker/actor 连接。
 
 默认 Compose 配置会把 GPU 暴露给 `ray-worker-embedding-1` 和
 `ray-worker-reranker-1`；`main` 容器只是 Ray client，不再申请 GPU：

@@ -199,7 +199,7 @@ docker compose down -v
 
 ## Startup Behavior
 
-`compose.yaml` starts seven long-running services and one one-shot initializer
+`compose.yaml` starts eight long-running services and one one-shot initializer
 by default:
 
 - `postgres`: runs PostgreSQL inside Docker and stores users, login tokens, and
@@ -214,6 +214,8 @@ by default:
   tagged with Ray resource `ray_worker_embedding`.
 - `ray-worker-reranker-1`: runs the named reranker actor and is tagged with Ray
   resource `ray_worker_reranker`.
+- `autoheal`: watches Docker healthchecks and restarts services that are safe
+  to heal as a single container, such as `qdrant` and `main`.
 - `main`: waits for Qdrant, PostgreSQL, and MinIO initialization, optionally
   runs document initialization, connects to Ray, and starts FastAPI on
   container port `8080`.
@@ -233,6 +235,7 @@ flowchart TD
         RayHead["ray-head<br/>Ray control plane<br/>ray://ray-head:10001"]
         EmbedWorker["ray-worker-embedding-1<br/>Ray worker<br/>resource: ray_worker_embedding<br/>hosts kba_embedding actor"]
         RerankWorker["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker<br/>hosts kba_reranker actor"]
+        Autoheal["autoheal<br/>Docker healthcheck watcher<br/>restarts unhealthy containers"]
         VLLM["vllm<br/>optional local-llm profile<br/>OpenAI-compatible LLM server"]
     end
 
@@ -243,6 +246,8 @@ flowchart TD
     MinIOInit --> MinIO
     RayHead --> EmbedWorker
     RayHead --> RerankWorker
+    Autoheal -. healthcheck .-> Main
+    Autoheal -. healthcheck .-> Qdrant
     Main -. optional .-> VLLM
     Main --> CloudLLM["Cloud LLM API<br/>OpenAI-compatible / Anthropic"]
 
@@ -322,6 +327,9 @@ APP_PORT=8080            # host port mapped to FastAPI/UI
 QDRANT_IMAGE=qdrant/qdrant:v1.18.1
 POSTGRES_IMAGE=postgres:17-alpine
 MINIO_IMAGE=minio/minio:latest
+AUTOHEAL_IMAGE=willfarrell/autoheal:1.2.0
+AUTOHEAL_INTERVAL=10
+AUTOHEAL_START_PERIOD=30
 MINIO_API_PORT=9000      # local S3 API
 MINIO_CONSOLE_PORT=9001  # local MinIO browser console
 RAY_ADDRESS=ray://ray-head:10001
@@ -329,6 +337,11 @@ RAY_LOCAL_FALLBACK=0     # do not load embedding/reranker models in main
 GRPC_ENABLE_FORK_SUPPORT=0 # keep Ray Client stable inside Compose containers
 RAY_EMBEDDING_ACTOR_RESOURCE=ray_worker_embedding
 RAY_RERANKER_ACTOR_RESOURCE=ray_worker_reranker
+HEALTH_PROBE_INTERVAL_SECONDS=10
+HEALTH_PROBE_DEGRADED_INTERVAL_SECONDS=3
+HEALTH_PROBE_TIMEOUT_SECONDS=2
+HEALTH_PROBE_FAILURE_THRESHOLD=2
+HEALTH_PROBE_RECOVERY_THRESHOLD=2
 ```
 
 For fast restarts after the image has already been built:
@@ -642,6 +655,7 @@ Query-time document RAG pipeline:
 ```mermaid
 flowchart TD
     A["Browser / POST /rag"] --> B["Load session, compact memory, and settings from PostgreSQL"]
+    P["Background component health<br/>embedding / qdrant / reranker<br/>10s healthy probes, 3s degraded probes"]
     B --> C{"RAG-only enabled?"}
     C -- "yes" --> F["Force RAG route"]
     C -- "no" --> D["Intent router"]
@@ -651,9 +665,12 @@ flowchart TD
     F --> G["Embed query through Ray embedding actor"]
     F --> H["BM25S keyword recall from active Qdrant payload cache"]
     G --> I["Qdrant vector recall through tech_docs alias"]
+    P -. "embedding or qdrant degraded skips vector recall" .-> G
+    P -. "qdrant degraded skips vector recall" .-> I
     H --> J["RRF fusion"]
     I --> J
     J --> K["Rerank through Ray reranker actor"]
+    P -. "reranker degraded skips rerank" .-> K
     K --> L["Keep Final K chunks"]
     L --> M["Build prompt with references and conversation memory"]
     M --> N["LLM answer"]
@@ -665,14 +682,35 @@ sessions, runtime settings, messages, and retrieved-context snapshots for past
 answers. The current chunk text lives in Qdrant payloads and is rebuildable
 from the S3 source documents.
 
-Retrieval degrades explicitly instead of failing silently. If BM25S keyword
-recall fails, the answer continues with Qdrant/vector-only recall. If
-Qdrant/vector recall fails, the answer falls back to BM25-only recall. If the
-reranker actor fails, the pipeline skips reranking and uses the coarse RRF
-result list, capped by `Final K`. Responses and stored assistant messages include
-`retrieval_degraded`, `qdrant_degraded`, `reranker_degraded`, and
-`degradation_reason`; server logs write the same booleans, and the browser
-shows a degraded retrieval notice beside the answer and references.
+Retrieval degrades explicitly instead of failing silently. A background monitor
+checks `embedding`, `qdrant`, and `reranker` independently: healthy components
+are probed every 10 seconds, two consecutive failures enter degraded state,
+degraded components are probed every 3 seconds, and two consecutive successful
+probes recover the component. Probes are lightweight: Qdrant checks collection
+or alias metadata, and embedding/reranker probes check Ray actor readiness
+without running a real user query, real embedding workload, or real rerank.
+Request handling only reads the latest health snapshot.
+
+Fallback is per component. If BM25S keyword recall fails, the answer continues
+with Qdrant/vector-only recall. If embedding or Qdrant is degraded, vector
+recall is skipped and the answer uses BM25-only recall. If the reranker is
+degraded or fails during a request, the pipeline skips reranking and uses the
+coarse RRF result list, capped by `Final K`. Responses and stored assistant
+messages include `retrieval_degraded`, `embedding_degraded`, `qdrant_degraded`,
+`reranker_degraded`, and `degradation_reason`; server logs write the same
+booleans, and the browser shows a degraded retrieval notice beside the answer
+and references. `/health/details` exposes `component_health` with each
+component's status, consecutive failure/success counts, last error, and current
+probe interval.
+
+Container self-healing remains a Docker-layer concern, but Ray is not autohealed
+one container at a time. `qdrant` and `main` have healthchecks plus the
+`autoheal=true` label, and the `autoheal` container restarts those unhealthy
+containers through the Docker socket. `ray-head` and the Ray workers keep
+`restart: unless-stopped`, so Docker restarts them when the Ray process exits.
+Ray actor failures are handled by Ray actor restart and the application health
+monitor/fallback path, avoiding a standalone head restart that would leave old
+workers and actor handles attached to the previous cluster.
 
 The default Compose configuration exposes NVIDIA GPU devices to
 `ray-worker-embedding-1` and `ray-worker-reranker-1`, while the `main` container

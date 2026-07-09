@@ -418,12 +418,14 @@ class VectorStore:
         client: QdrantClient | None = None,
         model: SentenceTransformer | None = None,
         use_ray: bool = True,
+        document_store: object | None = None,
     ) -> None:
         self.config = config
         self._client = client
         self._model = model
         self._model_device = "cpu" if model is not None else None
         self._use_ray = use_ray and model is None
+        self._document_store = document_store
         self._client_lock = Lock()
         self._model_lock = Lock()
         self._bm25_lock = Lock()
@@ -541,7 +543,7 @@ class VectorStore:
                         "local_model_fallback=%s.",
                         self.config.ray_local_fallback,
                     )
-                    mark_ray_unavailable()
+                    mark_ray_unavailable(self.config.ray_embedding_actor_name)
                     if not self.config.ray_local_fallback:
                         raise RuntimeError(
                             "Embedding Ray actor failed during dimension probe and "
@@ -1057,7 +1059,7 @@ class VectorStore:
                         "local_model_fallback=%s.",
                         self.config.ray_local_fallback,
                     )
-                    mark_ray_unavailable()
+                    mark_ray_unavailable(self.config.ray_embedding_actor_name)
                     if not self.config.ray_local_fallback:
                         raise RuntimeError(
                             "Embedding Ray actor failed during encode and "
@@ -1288,7 +1290,14 @@ class VectorStore:
             ) from exc
 
         if self.config.docs_source == "s3":
-            return self._build_bm25_index_from_qdrant(signature, bm25s)
+            try:
+                return self._build_bm25_index_from_s3_manifest(signature, bm25s)
+            except Exception:
+                logger.exception(
+                    "Failed to build BM25S index from active S3 manifest; "
+                    "falling back to Qdrant payload scroll."
+                )
+                return self._build_bm25_index_from_qdrant(signature, bm25s)
 
         documents: list[SearchResult] = []
         tokenized_documents: list[list[str]] = []
@@ -1404,9 +1413,71 @@ class VectorStore:
             documents=tuple(documents),
         )
 
+    def _build_bm25_index_from_s3_manifest(
+        self,
+        signature: tuple[tuple[str, int, int], ...],
+        bm25s_module: object,
+    ) -> _BM25Index:
+        records = self._s3_active_records()
+        documents: list[SearchResult] = []
+        tokenized_documents: list[list[str]] = []
+
+        document_store = self._s3_document_store()
+        for record in records:
+            text = document_store.read_markdown(record)
+            chunks = chunk_markdown(
+                text,
+                chunk_size=self.config.chunk_size,
+                overlap=self.config.chunk_overlap,
+            )
+            for idx, chunk in enumerate(chunks):
+                tokens = _bm25_tokens(chunk.embedding_text)
+                if not tokens:
+                    continue
+
+                documents.append(
+                    SearchResult(
+                        text=chunk.text,
+                        source=record.source,
+                        chunk_id=idx,
+                        score=0.0,
+                        content_type=chunk.content_type,
+                        h1=chunk.h1,
+                        h2=chunk.h2,
+                        h3=chunk.h3,
+                        headings=chunk.headings,
+                        start_line=chunk.start_line,
+                        end_line=chunk.end_line,
+                        retrieval_source="bm25",
+                    )
+                )
+                tokenized_documents.append(tokens)
+
+        retriever = None
+        if documents:
+            retriever = bm25s_module.BM25(corpus=documents)
+            retriever.index(tokenized_documents, show_progress=False)
+
+        logger.info(
+            "Built BM25S index from %s S3 manifest chunks in %s.",
+            len(documents),
+            self.config.docs_s3_bucket,
+        )
+        return _BM25Index(
+            signature=signature,
+            retriever=retriever,
+            documents=tuple(documents),
+        )
+
     def _docs_signature(self) -> tuple[tuple[str, int, int], ...]:
         if self.config.docs_source == "s3":
-            return self._qdrant_docs_signature()
+            try:
+                return self._s3_docs_signature()
+            except Exception:
+                logger.exception(
+                    "Failed to inspect active S3 document manifest for BM25."
+                )
+                return self._qdrant_docs_signature()
 
         docs_dir = self.config.docs_dir
         if not docs_dir.exists():
@@ -1431,6 +1502,73 @@ class VectorStore:
         points_count = int(getattr(info, "points_count", 0) or 0)
         vectors_count = int(getattr(info, "vectors_count", 0) or 0)
         return ((f"qdrant:{active_collection}", points_count, vectors_count),)
+
+    def _s3_document_store(self) -> object:
+        if self._document_store is None:
+            from app.s3_documents import S3DocumentStore
+
+            self._document_store = S3DocumentStore(self.config)
+        return self._document_store
+
+    def _s3_active_records(self) -> list[object]:
+        from app.s3_documents import S3DocumentRecord
+
+        manifest = self._s3_document_store().load_active_manifest()
+        if not manifest:
+            raise RuntimeError("No active S3 document manifest is available.")
+        docs = manifest.get("documents", [])
+        if not isinstance(docs, list):
+            raise RuntimeError("Active S3 document manifest has invalid documents.")
+
+        records: list[object] = []
+        for item in docs:
+            if not isinstance(item, dict):
+                continue
+            source_doc_id = str(item.get("source_doc_id", ""))
+            key = str(item.get("key", ""))
+            source = str(item.get("source", ""))
+            if not source_doc_id or not key or not source:
+                continue
+            records.append(
+                S3DocumentRecord(
+                    source_doc_id=source_doc_id,
+                    key=key,
+                    source=source,
+                    version_id=str(item.get("version_id", "")),
+                    etag=str(item.get("etag", "")),
+                    size=int(item.get("size", 0) or 0),
+                    last_modified=str(item.get("last_modified", "")),
+                    content_hash=str(item.get("content_hash", "")),
+                )
+            )
+        return records
+
+    def _s3_docs_signature(self) -> tuple[tuple[str, int, int], ...]:
+        records = self._s3_active_records()
+        signature: list[tuple[str, int, int]] = []
+        for record in records:
+            version = (
+                getattr(record, "version_id", "")
+                or getattr(record, "etag", "")
+                or getattr(record, "content_hash", "")
+            )
+            identity = "|".join(
+                (
+                    str(getattr(record, "source_doc_id", "")),
+                    str(getattr(record, "key", "")),
+                    str(version),
+                    str(getattr(record, "content_hash", "")),
+                )
+            )
+            digest = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12], 16)
+            signature.append(
+                (
+                    f"s3:{getattr(record, 'key', '')}",
+                    int(getattr(record, "size", 0) or 0),
+                    digest,
+                )
+            )
+        return tuple(signature)
 
     def _active_collection_name(self, collection_or_alias: str) -> str:
         try:
