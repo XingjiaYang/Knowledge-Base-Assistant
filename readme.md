@@ -90,8 +90,9 @@ Main modules:
 - `app/code_indexer.py`: tree-sitter based Python/C++ source parsing, CodeBERT
   embeddings, Qdrant indexing, and PostgreSQL persistence for code files and
   functions.
-- `app/code_retrieval.py`: two-stage code retrieval over files then functions,
-  followed by cross-encoder reranking.
+- `app/code_retrieval.py`: CodeBERT-first source retrieval over files and
+  functions, repo-wide function recall, lexical candidate expansion, and
+  explicit text-only degradation reporting.
 - `app/call_graph.py`: tree-sitter based call extraction and networkx directed
   call graph queries.
 - `app/llm_client.py`: provider-aware client for cloud APIs or local vLLM.
@@ -244,10 +245,16 @@ CODE_ROOT_DIR=/app/data/code
 CODE_FILES_COLLECTION=code_files
 CODE_FUNCTIONS_COLLECTION=code_functions
 CODE_EMBEDDING_MODEL=microsoft/codebert-base
+CODE_EMBEDDING_PRELOAD=1
+CODE_EMBEDDING_PRELOAD_RETRIES=3
+CODE_EMBEDDING_PRELOAD_RETRY_SECONDS=20
 CODE_SEARCH_FILE_TOP_K=20
 CODE_SEARCH_FUNCTION_TOP_K=50
 CODE_SEARCH_FINAL_TOP_K=10
 CODE_CALL_GRAPH_DEPTH=3
+RAY_ENABLED=1
+RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS=0
+RAY_CODE_EMBEDDING_ACTOR_NAME=kba_code_embedding
 ```
 
 The expected local data layout is:
@@ -294,6 +301,21 @@ The indexer stores:
   function/class name, signature, body, docstring, line range, and CodeBERT
   embedding.
 - `code_call_edges` PostgreSQL table: AST-derived caller to callee edges.
+
+Current code retrieval is CodeBERT-first, not a full BM25S+dense hybrid search.
+On a normal request the API embeds the query with the Ray-hosted CodeBERT actor,
+searches `code_files`, searches `code_functions` inside the top files, performs
+an additional repo-wide `code_functions` vector search, and uses lexical matches
+only to add function candidates. Lexical candidates are re-scored with their
+stored CodeBERT vectors before final ranking. The final score is the CodeBERT
+vector score plus a small code-aware lexical boost.
+
+If CodeBERT query embedding fails, `/code/search` falls back to a PostgreSQL
+lexical scan over code files and functions. That fallback is reported with
+`retrieval_mode="text_only"`, `code_embedding_degraded=true`, and a
+`degradation_reason`. This code lexical fallback is not BM25S yet; Markdown RAG
+uses BM25S, while Code Search currently uses hand-scored code tokens for the
+fallback path.
 
 Test code search after login:
 

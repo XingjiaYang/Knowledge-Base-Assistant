@@ -208,6 +208,8 @@ async function searchCode(query) {
     if (data.session_id) state.activeSessionId = data.session_id;
     state.codeFiles = data.files || [];
     state.codeResults = data.functions || [];
+    state.codeGraph = data.graph || null;
+    state.codeGraphFunction = data.graph?.function_name || query;
     assistant.content = data.answer || formatCodeAnswer(state.codeResults);
     assistant.contexts = data.contexts || [];
     assistant.codeFiles = state.codeFiles;
@@ -743,50 +745,113 @@ function renderCytoscapeGraph(container, graph) {
   const muted = theme.getPropertyValue("--text-subtle").trim() || "#8a939e";
   const text = theme.getPropertyValue("--text").trim() || "#18212b";
   const surface = theme.getPropertyValue("--surface").trim() || "#ffffff";
+  const border = theme.getPropertyValue("--border").trim() || "#d7dde4";
 
-  const elements = normalizeGraphElements(graph);
+  const elements = layoutGraphElements(normalizeGraphElements(graph), container);
 
   codeCy = window.cytoscape({
     container,
     elements,
-    layout: { name: "breadthfirst", directed: true, padding: 18, spacingFactor: 1.15 },
+    layout: { name: "preset", fit: true, padding: 24 },
     style: [
       {
         selector: "node",
         style: {
-          "background-color": accent,
+          shape: "roundrectangle",
+          "background-color": surface,
           "border-color": accentBorder,
-          "border-width": 2,
+          "border-width": 1.5,
           color: text,
           label: "data(label)",
-          "font-size": 10,
+          "font-size": 11,
+          "font-weight": 600,
           "text-wrap": "wrap",
-          "text-max-width": 96,
-          "text-valign": "bottom",
-          "text-margin-y": 6,
-          width: 24,
-          height: 24,
+          "text-max-width": 124,
+          "text-valign": "center",
+          "text-halign": "center",
+          width: 148,
+          height: 54,
+          padding: "8px",
         },
       },
       {
-        selector: 'node[kind = "external"]',
+        selector: 'node[type = "class"]',
         style: {
-          "background-color": muted,
-          "border-color": accentBorder,
+          "background-color": "#f4efff",
+          "border-color": "#a855f7",
+        },
+      },
+      {
+        selector: 'node[type = "component"]',
+        style: {
+          "background-color": "#fff7ed",
+          "border-color": "#f97316",
+        },
+      },
+      {
+        selector: 'node[type = "file"]',
+        style: {
+          "background-color": "#eff6ff",
+          "border-color": "#3b82f6",
+        },
+      },
+      {
+        selector: 'node[type = "function"]',
+        style: {
+          "background-color": "#ecfdf5",
+          "border-color": accent,
+        },
+      },
+      {
+        selector: 'node[indexed = "false"]',
+        style: {
+          "background-color": "#f8fafc",
+          "border-color": border,
+          color: muted,
         },
       },
       {
         selector: "edge",
         style: {
-          width: 1.6,
+          width: 2,
           "line-color": muted,
           "target-arrow-color": muted,
           "target-arrow-shape": "triangle",
-          "curve-style": "bezier",
+          "curve-style": "taxi",
+          "taxi-direction": "downward",
+          "taxi-turn": 36,
           label: "data(label)",
           "font-size": 8,
           "text-background-color": surface,
           "text-background-opacity": 0.75,
+        },
+      },
+      {
+        selector: 'edge[type = "calls"]',
+        style: {
+          "line-color": accent,
+          "target-arrow-color": accent,
+        },
+      },
+      {
+        selector: 'edge[type = "imports"]',
+        style: {
+          "line-color": "#3b82f6",
+          "target-arrow-color": "#3b82f6",
+        },
+      },
+      {
+        selector: 'edge[type = "extends"]',
+        style: {
+          "line-color": "#a855f7",
+          "target-arrow-color": "#a855f7",
+        },
+      },
+      {
+        selector: 'edge[type = "uses"]',
+        style: {
+          "line-color": "#f59e0b",
+          "target-arrow-color": "#f59e0b",
         },
       },
     ],
@@ -806,6 +871,8 @@ function normalizeGraphElements(graph) {
             ...element.data,
             label: compactNodeLabel(element.data?.label || element.data?.id),
             kind: element.data?.kind || "external",
+            type: graphNodeType(element.data),
+            indexed: String(element.data?.indexed !== false),
           },
         };
       }
@@ -813,7 +880,8 @@ function normalizeGraphElements(graph) {
         ...element,
         data: {
           ...element.data,
-          label: element.data?.label || (element.data?.lines || []).join(", "),
+          label: edgeDisplayLabel(element.data),
+          type: graphEdgeType(element.data),
         },
       };
     });
@@ -826,6 +894,11 @@ function normalizeGraphElements(graph) {
         id: node.id,
         label: compactNodeLabel(node.label || node.id),
         kind: node.kind || "external",
+        type: graphNodeType(node),
+        indexed: String(node.indexed !== false),
+        filePath: node.filePath || node.path || "",
+        codeSnippet: node.codeSnippet || "",
+        description: node.description || "",
       },
     })),
     ...(graph.edges || []).map((edge, index) => ({
@@ -834,16 +907,97 @@ function normalizeGraphElements(graph) {
         id: `${edge.source}->${edge.target}:${index}`,
         source: edge.source,
         target: edge.target,
-        label: (edge.lines || []).join(", "),
+        label: edgeDisplayLabel(edge),
+        type: graphEdgeType(edge),
       },
     })),
   ];
 }
 
+function layoutGraphElements(elements, container) {
+  const nodes = elements.filter((item) => item.group === "nodes");
+  const edges = elements.filter((item) => item.group === "edges");
+  const nodeIds = new Set(nodes.map((node) => node.data.id));
+  const incoming = new Map(nodes.map((node) => [node.data.id, []]));
+  const outgoing = new Map(nodes.map((node) => [node.data.id, []]));
+
+  for (const edge of edges) {
+    if (!nodeIds.has(edge.data.source) || !nodeIds.has(edge.data.target)) continue;
+    incoming.get(edge.data.target)?.push(edge.data.source);
+    outgoing.get(edge.data.source)?.push(edge.data.target);
+  }
+
+  const ranks = new Map();
+  let roots = nodes
+    .map((node) => node.data.id)
+    .filter((id) => !(incoming.get(id)?.length));
+  if (!roots.length && nodes.length) roots = [nodes[0].data.id];
+
+  const queue = [];
+  for (const id of roots) {
+    if (ranks.has(id)) continue;
+    ranks.set(id, 0);
+    queue.push(id);
+  }
+  while (queue.length) {
+    const id = queue.shift();
+    const rank = ranks.get(id) || 0;
+    for (const target of outgoing.get(id) || []) {
+      if (ranks.has(target)) continue;
+      ranks.set(target, rank + 1);
+      queue.push(target);
+    }
+  }
+  for (const node of nodes) {
+    if (!ranks.has(node.data.id)) ranks.set(node.data.id, 0);
+  }
+
+  const layers = new Map();
+  for (const node of nodes) {
+    const rank = ranks.get(node.data.id) || 0;
+    if (!layers.has(rank)) layers.set(rank, []);
+    layers.get(rank).push(node);
+  }
+
+  const width = Math.max(container.clientWidth || 320, 320);
+  const layerGap = 116;
+  const nodeGap = 172;
+  for (const rank of [...layers.keys()].sort((a, b) => a - b)) {
+    const layer = layers.get(rank);
+    const layerWidth = Math.max(0, (layer.length - 1) * nodeGap);
+    layer.forEach((node, index) => {
+      node.position = {
+        x: width / 2 - layerWidth / 2 + index * nodeGap,
+        y: 48 + rank * layerGap,
+      };
+    });
+  }
+
+  return [...nodes, ...edges];
+}
+
+function graphNodeType(data) {
+  const type = data?.type || data?.kind;
+  if (["file", "function", "class", "component"].includes(type)) return type;
+  return "function";
+}
+
+function graphEdgeType(data) {
+  const type = data?.type || "";
+  if (["imports", "calls", "extends", "uses"].includes(type)) return type;
+  return "calls";
+}
+
+function edgeDisplayLabel(data) {
+  if (data?.label) return data.label;
+  if (Array.isArray(data?.lines) && data.lines.length) return data.lines.join(", ");
+  return graphEdgeType(data);
+}
+
 function renderGraphEdges(edges) {
   const wrap = el("div", { class: "graph-edge-list" });
   if (!edges.length) {
-    wrap.append(el("div", { class: "empty", text: "No outgoing calls found." }));
+    wrap.append(el("div", { class: "empty", text: "No graph relationships found." }));
     return wrap;
   }
   for (const edge of edges.slice(0, 30)) {

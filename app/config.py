@@ -172,6 +172,15 @@ class Settings:
         "CODE_EMBEDDING_MODEL",
         "microsoft/codebert-base",
     )
+    code_embedding_preload: bool = _env_bool("CODE_EMBEDDING_PRELOAD", True)
+    code_embedding_preload_retries: int = _env_int(
+        "CODE_EMBEDDING_PRELOAD_RETRIES",
+        3,
+    )
+    code_embedding_preload_retry_seconds: float = _env_float(
+        "CODE_EMBEDDING_PRELOAD_RETRY_SECONDS",
+        20.0,
+    )
     code_embedding_batch_size: int = _env_int("CODE_EMBEDDING_BATCH_SIZE", 8)
     code_embedding_max_tokens: int = _env_int("CODE_EMBEDDING_MAX_TOKENS", 512)
     code_file_embedding_max_chars: int = _env_int(
@@ -211,9 +220,17 @@ class Settings:
         "RAY_RERANKER_ACTOR_NUM_GPUS",
         0.5 if _env_bool("CUDA", True) else 0.0,
     )
+    ray_code_embedding_actor_num_gpus: float = _env_float(
+        "RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS",
+        0.0,
+    )
     ray_embedding_actor_name: str = os.getenv(
         "RAY_EMBEDDING_ACTOR_NAME",
         "kba_embedding",
+    )
+    ray_code_embedding_actor_name: str = os.getenv(
+        "RAY_CODE_EMBEDDING_ACTOR_NAME",
+        "kba_code_embedding",
     )
     ray_reranker_actor_name: str = os.getenv(
         "RAY_RERANKER_ACTOR_NAME",
@@ -359,6 +376,12 @@ class Settings:
             raise ValueError("CODE_FUNCTIONS_COLLECTION must not be empty.")
         if not self.code_embedding_model.strip():
             raise ValueError("CODE_EMBEDDING_MODEL must not be empty.")
+        if self.code_embedding_preload_retries <= 0:
+            raise ValueError("CODE_EMBEDDING_PRELOAD_RETRIES must be greater than 0.")
+        if self.code_embedding_preload_retry_seconds < 0:
+            raise ValueError(
+                "CODE_EMBEDDING_PRELOAD_RETRY_SECONDS must be greater than or equal to 0."
+            )
         if self.code_embedding_batch_size <= 0:
             raise ValueError("CODE_EMBEDDING_BATCH_SIZE must be greater than 0.")
         if self.code_embedding_max_tokens <= 0:
@@ -397,10 +420,16 @@ class Settings:
             raise ValueError(
                 "RAY_RERANKER_ACTOR_NUM_GPUS must be greater than or equal to 0."
             )
+        if self.ray_code_embedding_actor_num_gpus < 0:
+            raise ValueError(
+                "RAY_CODE_EMBEDDING_ACTOR_NUM_GPUS must be greater than or equal to 0."
+            )
         if not self.ray_namespace.strip():
             raise ValueError("RAY_NAMESPACE must not be empty.")
         if not self.ray_embedding_actor_name.strip():
             raise ValueError("RAY_EMBEDDING_ACTOR_NAME must not be empty.")
+        if not self.ray_code_embedding_actor_name.strip():
+            raise ValueError("RAY_CODE_EMBEDDING_ACTOR_NAME must not be empty.")
         if not self.ray_reranker_actor_name.strip():
             raise ValueError("RAY_RERANKER_ACTOR_NAME must not be empty.")
         if self.llm_timeout_seconds <= 0:

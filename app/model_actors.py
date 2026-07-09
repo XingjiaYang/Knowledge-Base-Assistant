@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from threading import Lock
+import time
 from typing import Any
 
 from app.config import Settings, settings
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 _ray_lock = Lock()
 _embedding_actor: Any | None = None
+_code_embedding_actor: Any | None = None
 _reranker_actor: Any | None = None
 _ray_unavailable = False
 
@@ -60,6 +62,22 @@ class RerankerActor:
         self.reranker.warmup()
 
 
+class CodeEmbeddingActor:
+    def __init__(self, config: Settings = settings) -> None:
+        from app.code_indexer import CodeEmbedder
+
+        self.embedder = CodeEmbedder(config)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self.embedder.embed(texts)
+
+    def vector_size(self) -> int:
+        return self.embedder.vector_size
+
+    def warmup(self) -> int:
+        return self.embedder.warmup()
+
+
 def get_embedding_actor(config: Settings = settings) -> Any | None:
     global _embedding_actor
     if not config.ray_enabled:
@@ -73,6 +91,27 @@ def get_embedding_actor(config: Settings = settings) -> Any | None:
                 num_gpus=config.ray_embedding_actor_num_gpus,
             )
         return _embedding_actor
+
+
+def get_code_embedding_actor(config: Settings = settings) -> Any | None:
+    global _code_embedding_actor
+    if not config.ray_enabled:
+        return None
+    with _ray_lock:
+        if _code_embedding_actor is None:
+            _code_embedding_actor = _get_or_create_actor(
+                config,
+                CodeEmbeddingActor,
+                config.ray_code_embedding_actor_name,
+                num_gpus=config.ray_code_embedding_actor_num_gpus,
+            )
+        return _code_embedding_actor
+
+
+def reset_code_embedding_actor() -> None:
+    global _code_embedding_actor
+    with _ray_lock:
+        _code_embedding_actor = None
 
 
 def get_reranker_actor(config: Settings = settings) -> Any | None:
@@ -105,14 +144,61 @@ def mark_ray_unavailable() -> None:
 
 
 def warmup_model_actors(config: Settings = settings) -> None:
-    embedding_actor = get_embedding_actor(config)
-    if embedding_actor is not None:
-        ray_get(embedding_actor.warmup.remote(), config)
+    embedding_ref: Any | None = None
+    code_embedding_actor: Any | None = None
+    reranker_ref: Any | None = None
+
+    try:
+        embedding_actor = get_embedding_actor(config)
+        if embedding_actor is not None:
+            embedding_ref = embedding_actor.warmup.remote()
+    except Exception:
+        logger.exception("Ray document embedding actor startup failed.")
+
+    if config.code_embedding_preload:
+        try:
+            code_embedding_actor = get_code_embedding_actor(config)
+        except Exception:
+            logger.exception("Ray CodeBERT embedding actor startup failed.")
 
     if config.reranker_enabled:
-        reranker_actor = get_reranker_actor(config)
-        if reranker_actor is not None:
-            ray_get(reranker_actor.warmup.remote(), config)
+        try:
+            reranker_actor = get_reranker_actor(config)
+            if reranker_actor is not None:
+                reranker_ref = reranker_actor.warmup.remote()
+        except Exception:
+            logger.exception("Ray reranker actor startup failed.")
+
+    if code_embedding_actor is not None:
+        for attempt in range(1, config.code_embedding_preload_retries + 1):
+            try:
+                ray_get(code_embedding_actor.warmup.remote(), config)
+                break
+            except Exception as exc:
+                if attempt >= config.code_embedding_preload_retries:
+                    logger.exception("Ray CodeBERT embedding actor warmup failed.")
+                    break
+                logger.warning(
+                    "Ray CodeBERT embedding actor warmup failed; retrying "
+                    "attempt %s/%s in %.1fs: %s",
+                    attempt + 1,
+                    config.code_embedding_preload_retries,
+                    config.code_embedding_preload_retry_seconds,
+                    exc,
+                )
+                time.sleep(config.code_embedding_preload_retry_seconds)
+
+    if embedding_ref is not None:
+        try:
+            ray_get(embedding_ref, config)
+        except Exception:
+            logger.exception("Ray document embedding actor warmup failed.")
+
+    if reranker_ref is not None:
+        try:
+            ray_get(reranker_ref, config)
+        except Exception:
+            logger.exception("Ray reranker actor warmup failed.")
 
 
 def _get_or_create_actor(

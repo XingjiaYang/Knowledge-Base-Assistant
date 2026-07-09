@@ -988,7 +988,7 @@ kbd {
   border-color: var(--accent-border);
 }
 .code-graph-canvas {
-  height: 360px;
+  height: 520px;
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   background: var(--surface);

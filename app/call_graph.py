@@ -78,6 +78,74 @@ class CallGraphStore:
             ],
         }
 
+    def get_relevant_graph(
+        self,
+        function_names: Sequence[str],
+        repository_ids: Sequence[str] | None = None,
+        *,
+        max_nodes: int = 28,
+        neighbors_per_seed: int = 4,
+    ) -> dict[str, list[dict[str, object]]]:
+        graph = self._load_graph(repository_ids)
+        seeds: list[str] = []
+        seen_seeds: set[str] = set()
+        for function_name in function_names:
+            for node in self._matching_nodes(graph, function_name):
+                if node not in seen_seeds:
+                    seeds.append(node)
+                    seen_seeds.add(node)
+
+        if not seeds:
+            return {"nodes": [], "edges": []}
+
+        selected: list[str] = []
+        selected_set: set[str] = set()
+
+        def add_node(node: str) -> None:
+            if node in graph and node not in selected_set and len(selected) < max_nodes:
+                selected.append(node)
+                selected_set.add(node)
+
+        for seed in seeds:
+            add_node(seed)
+
+        queue: deque[tuple[str, int]] = deque((seed, 0) for seed in seeds)
+        while queue and len(selected) < max_nodes:
+            node, node_depth = queue.popleft()
+            if node_depth >= 2:
+                continue
+
+            neighbours = self._rank_graph_neighbours(
+                graph,
+                node,
+                seeds,
+                neighbors_per_seed,
+            )
+            for neighbour in neighbours:
+                if len(selected) >= max_nodes:
+                    break
+                if neighbour in selected_set:
+                    continue
+                add_node(neighbour)
+                queue.append((neighbour, node_depth + 1))
+
+        edge_payloads: dict[tuple[str, str], dict[str, object]] = {}
+        for source, target, data in graph.edges(data=True):
+            if source in selected_set and target in selected_set:
+                edge_payloads[(source, target)] = self._edge_payload(
+                    source,
+                    target,
+                    data,
+                )
+
+        return {
+            "nodes": [self._node_payload(graph, node) for node in selected],
+            "edges": [
+                edge_payloads[key]
+                for key in sorted(edge_payloads)
+            ],
+        }
+
     def _load_graph(self, repository_ids: Sequence[str] | None = None) -> nx.DiGraph:
         graph = nx.DiGraph()
         selected_repository_ids = self._selected_repository_ids(repository_ids)
@@ -93,6 +161,9 @@ class CallGraphStore:
                        f.name,
                        f.qualified_name,
                        f.kind,
+                       f.signature,
+                       f.body,
+                       f.docstring,
                        f.start_line,
                        f.end_line,
                        cf.repository_id,
@@ -127,6 +198,13 @@ class CallGraphStore:
                 label=row["qualified_name"],
                 name=row["name"],
                 kind=row["kind"],
+                type=_graph_node_type(row["kind"], row["path"]),
+                filePath=row["path"],
+                codeSnippet=_code_snippet(
+                    row["signature"],
+                    row["body"],
+                ),
+                description=_node_description(row["kind"], row["path"]),
                 repository_id=row["repository_id"],
                 repository_name=row["repository_name"],
                 path=row["path"],
@@ -194,6 +272,28 @@ class CallGraphStore:
         return sorted(set(matches))
 
     @staticmethod
+    def _rank_graph_neighbours(
+        graph: nx.DiGraph,
+        node: str,
+        seeds: Sequence[str],
+        limit: int,
+    ) -> list[str]:
+        seed_paths = {
+            str(graph.nodes[seed].get("path", ""))
+            for seed in seeds
+            if seed in graph
+        }
+        neighbours = set(graph.successors(node)) | set(graph.predecessors(node))
+
+        def rank(candidate: str) -> tuple[int, int, str]:
+            data = graph.nodes[candidate]
+            same_path = str(data.get("path", "")) in seed_paths
+            degree = graph.in_degree(candidate) + graph.out_degree(candidate)
+            return (0 if same_path else 1, -degree, str(data.get("label", candidate)))
+
+        return sorted(neighbours, key=rank)[:limit]
+
+    @staticmethod
     def _node_payload(graph: nx.DiGraph, node: str) -> dict[str, object]:
         data = graph.nodes[node]
         return {
@@ -201,6 +301,10 @@ class CallGraphStore:
             "label": data.get("label", node),
             "name": data.get("name", node),
             "kind": data.get("kind", "external"),
+            "type": data.get("type", "function"),
+            "filePath": data.get("filePath", data.get("path", "")),
+            "codeSnippet": data.get("codeSnippet", ""),
+            "description": data.get("description", ""),
             "path": data.get("path", ""),
             "repository_id": data.get("repository_id", ""),
             "repository_name": data.get("repository_name", ""),
@@ -375,6 +479,29 @@ def _strip_template_args(text: str) -> str:
         if depth == 0:
             output.append(char)
     return "".join(output).strip()
+
+
+def _graph_node_type(kind: str, path: str) -> str:
+    if kind == "class":
+        return "class"
+    suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if suffix in {"tsx", "jsx"}:
+        return "component"
+    return "function"
+
+
+def _code_snippet(signature: object, body: object, max_lines: int = 10) -> str:
+    signature_text = str(signature or "").strip()
+    body_text = str(body or "").strip()
+    text = body_text or signature_text
+    lines = text.splitlines()
+    if signature_text and not text.startswith(signature_text):
+        lines = signature_text.splitlines() + lines
+    return "\n".join(lines[:max_lines]).strip()
+
+
+def _node_description(kind: object, path: object) -> str:
+    return f"{kind or 'function'} in {path or 'code'}"
 
 
 def _clean_repository_ids(repository_ids: Sequence[str] | None) -> list[str]:

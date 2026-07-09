@@ -88,6 +88,9 @@ def assert_llm_settings() -> None:
         code_files_collection="code-file-test",
         code_functions_collection="code-function-test",
         code_embedding_model="microsoft/codebert-base",
+        code_embedding_preload=True,
+        code_embedding_preload_retries=2,
+        code_embedding_preload_retry_seconds=1.5,
         code_embedding_batch_size=4,
         code_embedding_max_tokens=256,
         code_file_embedding_max_chars=6000,
@@ -107,7 +110,9 @@ def assert_llm_settings() -> None:
         ray_actor_num_cpus=2.0,
         ray_embedding_actor_num_gpus=0.25,
         ray_reranker_actor_num_gpus=0.75,
+        ray_code_embedding_actor_num_gpus=0.0,
         ray_embedding_actor_name="embedding-test",
+        ray_code_embedding_actor_name="code-embedding-test",
         ray_reranker_actor_name="reranker-test",
         ray_task_timeout_seconds=12.5,
     )
@@ -164,6 +169,12 @@ def assert_llm_settings() -> None:
     if config.code_embedding_model != "microsoft/codebert-base":
         raise AssertionError("Code embedding model should be configurable.")
     if (
+        not config.code_embedding_preload
+        or config.code_embedding_preload_retries != 2
+        or config.code_embedding_preload_retry_seconds != 1.5
+    ):
+        raise AssertionError("Code embedding preload should be configurable.")
+    if (
         config.code_embedding_batch_size != 4
         or config.code_embedding_max_tokens != 256
         or config.code_file_embedding_max_chars != 6000
@@ -191,6 +202,7 @@ def assert_llm_settings() -> None:
     if (
         config.ray_namespace != "test-ns"
         or config.ray_embedding_actor_name != "embedding-test"
+        or config.ray_code_embedding_actor_name != "code-embedding-test"
         or config.ray_reranker_actor_name != "reranker-test"
     ):
         raise AssertionError("Ray actor names and namespace should be configurable.")
@@ -198,6 +210,7 @@ def assert_llm_settings() -> None:
         config.ray_actor_num_cpus != 2.0
         or config.ray_embedding_actor_num_gpus != 0.25
         or config.ray_reranker_actor_num_gpus != 0.75
+        or config.ray_code_embedding_actor_num_gpus != 0.0
         or config.ray_task_timeout_seconds != 12.5
     ):
         raise AssertionError("Ray actor resource settings should be configurable.")
@@ -688,6 +701,8 @@ def assert_invalid_settings_rejected() -> None:
         {"code_files_collection": ""},
         {"code_functions_collection": ""},
         {"code_embedding_model": ""},
+        {"code_embedding_preload_retries": 0},
+        {"code_embedding_preload_retry_seconds": -0.1},
         {"code_embedding_batch_size": 0},
         {"code_embedding_max_tokens": 0},
         {"code_file_embedding_max_chars": 0},
@@ -700,6 +715,14 @@ def assert_invalid_settings_rejected() -> None:
         {"reranker_model": ""},
         {"reranker_dtype": ""},
         {"reranker_max_documents_per_call": 0},
+        {"ray_actor_num_cpus": 0},
+        {"ray_embedding_actor_num_gpus": -0.1},
+        {"ray_reranker_actor_num_gpus": -0.1},
+        {"ray_code_embedding_actor_num_gpus": -0.1},
+        {"ray_namespace": ""},
+        {"ray_embedding_actor_name": ""},
+        {"ray_code_embedding_actor_name": ""},
+        {"ray_reranker_actor_name": ""},
     ]
     for kwargs in invalid_configs:
         try:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
+from pathlib import Path
 import re
 from typing import Any
 from uuid import UUID
@@ -13,7 +15,14 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.code_indexer import CodeEmbedder, CodeRepository, discover_code_repositories
 from app.config import Settings, settings
+from app.model_actors import (
+    get_code_embedding_actor,
+    ray_get,
+    reset_code_embedding_actor,
+)
 
+
+logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+")
 _QUERY_SYNONYMS = {
@@ -73,6 +82,9 @@ class CodeSearchOutcome:
     query: str
     files: list[CodeFileHit]
     functions: list[CodeSearchHit]
+    retrieval_mode: str = "codebert_vector"
+    code_embedding_degraded: bool = False
+    degradation_reason: str = ""
 
 
 class CodeIndexUnavailable(RuntimeError):
@@ -101,6 +113,13 @@ class CodeRetrieval:
     def embedder(self) -> CodeEmbedder:
         return self._embedder
 
+    def warmup_embedder(self) -> int:
+        if self.config.ray_enabled:
+            actor = get_code_embedding_actor(self.config)
+            if actor is not None:
+                return int(ray_get(actor.warmup.remote(), self.config))
+        return self.embedder.warmup()
+
     def search(
         self,
         query: str,
@@ -120,7 +139,22 @@ class CodeRetrieval:
         )
         final_limit = max(1, final_top_k or self.config.code_search_final_top_k)
 
-        query_vector = self.embedder.embed([query])[0]
+        try:
+            query_vector = self._embed_texts([query])[0]
+        except Exception as exc:
+            logger.warning(
+                "Code embedding model unavailable; using text-only code search: %s",
+                exc,
+            )
+            return self._search_text_only(
+                query,
+                selected_repository_ids,
+                file_limit,
+                max(function_limit, final_limit * 10),
+                final_limit,
+                degradation_reason=str(exc),
+            )
+
         file_hits = self._search_files(
             query_vector,
             file_limit,
@@ -145,10 +179,14 @@ class CodeRetrieval:
             selected_repository_ids,
             max(function_limit, final_limit * 10),
         )
+        text_vector_hits = self._score_function_candidates_by_vector(
+            query_vector,
+            [function_id for function_id, _score in text_function_hits],
+        )
         function_hits = _merge_function_hits(
             function_hits,
             repository_function_hits,
-            text_function_hits,
+            text_vector_hits,
         )
         hydrated = self._hydrate_functions(function_hits, file_scores)
         ranked = _rank_code_hits(query, hydrated)
@@ -164,6 +202,70 @@ class CodeRetrieval:
             (repository, counts.get(repository.id, 0))
             for repository in discover_code_repositories(self.config)
         ]
+
+    def _search_text_only(
+        self,
+        query: str,
+        repository_ids: list[str],
+        file_limit: int,
+        function_limit: int,
+        final_limit: int,
+        degradation_reason: str = "",
+    ) -> CodeSearchOutcome:
+        file_hits = self._search_files_by_text(query, repository_ids, file_limit)
+        function_hits = self._search_functions_by_text(
+            query,
+            repository_ids,
+            function_limit,
+        )
+        hydrated = self._hydrate_functions(
+            function_hits,
+            {str(hit.file_id): hit.score for hit in file_hits},
+        )
+        ranked = _rank_code_hits(query, hydrated)[:final_limit]
+        return CodeSearchOutcome(
+            query=query,
+            files=_merge_file_hits(file_hits, _file_hits_from_functions(ranked))[
+                :file_limit
+            ],
+            functions=ranked,
+            retrieval_mode="text_only",
+            code_embedding_degraded=True,
+            degradation_reason=degradation_reason,
+        )
+
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if self.config.ray_enabled:
+            last_error: Exception | None = None
+            for attempt in range(2):
+                actor = get_code_embedding_actor(self.config)
+                if actor is None:
+                    break
+                try:
+                    return list(ray_get(actor.embed.remote(texts), self.config))
+                except Exception as exc:
+                    last_error = exc
+                    reset_code_embedding_actor()
+                    if attempt == 0:
+                        logger.warning(
+                            "Ray CodeBERT actor embed failed; recreating actor "
+                            "and retrying once: %s",
+                            exc,
+                        )
+            if last_error is not None:
+                raise RuntimeError(
+                    "Ray CodeBERT actor embed failed after retry."
+                ) from last_error
+
+        if not _code_embedding_model_ready(
+            self._embedder,
+            self.config.code_embedding_model,
+        ):
+            raise RuntimeError(
+                f"Code embedding model {self.config.code_embedding_model} is not "
+                "loaded or cached locally."
+            )
+        return self.embedder.embed(texts)
 
     def _selected_repository_ids(self, repository_ids: list[str] | None) -> list[str]:
         selected = _clean_repository_ids(repository_ids)
@@ -331,6 +433,108 @@ class CodeRetrieval:
                 scored.append((row["id"], 0.75 + score))
 
         return sorted(scored, key=lambda item: item[1], reverse=True)[:limit]
+
+    def _score_function_candidates_by_vector(
+        self,
+        query_vector: list[float],
+        function_ids: list[UUID],
+    ) -> list[tuple[UUID, float]]:
+        if not function_ids:
+            return []
+
+        unique_ids: list[UUID] = []
+        seen: set[UUID] = set()
+        for function_id in function_ids:
+            if function_id in seen:
+                continue
+            unique_ids.append(function_id)
+            seen.add(function_id)
+
+        try:
+            points = self.client.retrieve(
+                collection_name=self.config.code_functions_collection,
+                ids=[str(function_id) for function_id in unique_ids],
+                with_vectors=True,
+                with_payload=False,
+            )
+        except UnexpectedResponse as exc:
+            if _is_missing_collection_error(exc):
+                raise CodeIndexUnavailable(
+                    "Code search index is not ready. Missing Qdrant collection "
+                    f"`{self.config.code_functions_collection}`. Open Code mode, "
+                    "select the repository, and run Index."
+                ) from exc
+            raise
+        except Exception:
+            logger.exception(
+                "Failed to retrieve code function vectors for lexical candidates."
+            )
+            return []
+
+        scores: dict[UUID, float] = {}
+        for point in points:
+            try:
+                function_id = UUID(str(point.id))
+            except (TypeError, ValueError):
+                continue
+            vector = _point_vector_values(getattr(point, "vector", None))
+            if not vector:
+                continue
+            scores[function_id] = _dot_product(query_vector, vector)
+
+        return [
+            (function_id, scores[function_id])
+            for function_id in unique_ids
+            if function_id in scores
+        ]
+
+    def _search_files_by_text(
+        self,
+        query: str,
+        repository_ids: list[str],
+        limit: int,
+    ) -> list[CodeFileHit]:
+        tokens = _query_tokens(query)
+        if not tokens:
+            return []
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id,
+                       repository_id,
+                       repository_name,
+                       source_root,
+                       path,
+                       language,
+                       full_content
+                FROM code_files
+                WHERE repository_id = ANY(%s)
+                """,
+                (repository_ids,),
+            ).fetchall()
+
+        hits: list[CodeFileHit] = []
+        for row in rows:
+            score = _file_text_match_score(
+                path=str(row["path"] or ""),
+                full_content=str(row["full_content"] or ""),
+                tokens=tokens,
+            )
+            if score <= 0:
+                continue
+            hits.append(
+                CodeFileHit(
+                    file_id=row["id"],
+                    repository_id=str(row["repository_id"] or ""),
+                    repository_name=str(row["repository_name"] or ""),
+                    source_root=str(row["source_root"] or ""),
+                    path=str(row["path"] or ""),
+                    language=str(row["language"] or ""),
+                    score=0.75 + score,
+                )
+            )
+        return sorted(hits, key=lambda hit: hit.score, reverse=True)[:limit]
 
     def _query_points(
         self,
@@ -508,6 +712,70 @@ def _merge_function_hits(
     )
 
 
+def _merge_file_hits(
+    *groups: list[CodeFileHit],
+) -> list[CodeFileHit]:
+    by_id: dict[UUID, CodeFileHit] = {}
+    for group in groups:
+        for hit in group:
+            existing = by_id.get(hit.file_id)
+            if existing is None or hit.score > existing.score:
+                by_id[hit.file_id] = hit
+    return sorted(by_id.values(), key=lambda hit: hit.score, reverse=True)
+
+
+def _file_hits_from_functions(functions: list[CodeSearchHit]) -> list[CodeFileHit]:
+    by_file: dict[UUID, CodeFileHit] = {}
+    for function in functions:
+        current = by_file.get(function.file_id)
+        score = function.file_score if function.file_score is not None else function.score
+        if current is not None and current.score >= score:
+            continue
+        by_file[function.file_id] = CodeFileHit(
+            file_id=function.file_id,
+            repository_id=function.repository_id,
+            repository_name=function.repository_name,
+            source_root=function.source_root,
+            path=function.path,
+            language=function.language,
+            score=score,
+        )
+    return sorted(by_file.values(), key=lambda hit: hit.score, reverse=True)
+
+
+def _point_vector_values(value: object) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        for key in (
+            "dense_vecs",
+            "dense",
+            "sentence_embedding",
+            "embedding",
+            "vector",
+        ):
+            vector = value.get(key)
+            if vector is not None:
+                return _point_vector_values(vector)
+        if len(value) == 1:
+            return _point_vector_values(next(iter(value.values())))
+        return []
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (str, bytes, bytearray)):
+        return []
+    try:
+        return [float(item) for item in value]  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return []
+
+
+def _dot_product(left: list[float], right: list[float]) -> float:
+    if not left or not right:
+        return 0.0
+    return float(sum(a * b for a, b in zip(left, right, strict=False)))
+
+
 def _rank_code_hits(query: str, hits: list[CodeSearchHit]) -> list[CodeSearchHit]:
     tokens = _query_tokens(query)
     ranked = [
@@ -598,6 +866,60 @@ def _text_match_score(
         if "/python-package/xgboost/" in haystacks["path"]:
             score += 0.03
     return max(0.0, score - _path_penalty(path))
+
+
+def _file_text_match_score(
+    *,
+    path: str,
+    full_content: str,
+    tokens: list[str],
+) -> float:
+    path_text = path.lower()
+    content = full_content.lower()
+    score = 0.0
+    for token in tokens:
+        if token in path_text:
+            score += 0.09
+        count = content.count(token)
+        if count:
+            score += min(0.12, 0.025 * count)
+    if score:
+        if "/src/" in path_text or "/include/" in path_text:
+            score += 0.04
+        if "/python-package/xgboost/" in path_text:
+            score += 0.03
+    return max(0.0, score - _path_penalty(path))
+
+
+def _code_embedding_model_ready(embedder: CodeEmbedder, model_name: str) -> bool:
+    if type(embedder) is not CodeEmbedder:
+        return True
+
+    if getattr(embedder, "_model", None) is not None and getattr(
+        embedder,
+        "_tokenizer",
+        None,
+    ) is not None:
+        return True
+
+    model_path = Path(model_name).expanduser()
+    if model_path.exists():
+        return True
+
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        from huggingface_hub.file_download import _CACHED_NO_EXIST
+    except Exception:
+        return True
+
+    def cached(filename: str) -> bool:
+        path = try_to_load_from_cache(model_name, filename)
+        return bool(path and path is not _CACHED_NO_EXIST)
+
+    has_config = cached("config.json")
+    has_weights = cached("model.safetensors") or cached("pytorch_model.bin")
+    has_tokenizer = cached("tokenizer.json") or cached("vocab.json")
+    return has_config and has_weights and has_tokenizer
 
 
 def _path_penalty(path: str) -> float:

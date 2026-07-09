@@ -192,6 +192,11 @@ class CodeEmbedder:
         self._lock = Lock()
         self._vector_size: int | None = None
 
+    def warmup(self) -> int:
+        """Load tokenizer/model into memory and return the embedding dimension."""
+        _ = self.tokenizer
+        return self.vector_size
+
     @property
     def tokenizer(self) -> object:
         if self._tokenizer is None:
