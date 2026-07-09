@@ -110,9 +110,18 @@ class Reranker:
                     )
                 except Exception:
                     logger.exception(
-                        "Reranker Ray actor failed; falling back to local model."
+                        "Reranker Ray actor failed; local_model_fallback=%s.",
+                        self.config.ray_local_fallback,
                     )
                     mark_ray_unavailable()
+                    if not self.config.ray_local_fallback:
+                        raise RuntimeError(
+                            "Reranker Ray actor failed and RAY_LOCAL_FALLBACK=0."
+                        )
+            elif not self.config.ray_local_fallback:
+                raise RuntimeError(
+                    "Reranker Ray actor is unavailable and RAY_LOCAL_FALLBACK=0."
+                )
 
         limit = max(1, top_k or self.config.retrieve_top_k)
         documents = [self._document_text(context) for context in contexts]

@@ -97,6 +97,11 @@ class SequencingVectorStore(VectorStore):
         super()._delete_file_points(file_path)
 
 
+class MissingRayActorVectorStore(VectorStore):
+    def _embedding_actor(self) -> object | None:
+        return None
+
+
 class FakeLLMClient:
     def chat(
         self,
@@ -393,6 +398,24 @@ def assert_embedding_encode_falls_back_to_cpu_on_cuda_failure() -> None:
         raise AssertionError("Embedding encode should retry exactly once.")
 
     print("Embedding CUDA encode fallback -> ok")
+
+
+def assert_ray_embedding_does_not_fallback_locally_when_disabled() -> None:
+    store = MissingRayActorVectorStore(
+        Settings(ray_enabled=True, ray_local_fallback=False),
+        use_ray=True,
+    )
+    try:
+        store.encode("query")
+    except RuntimeError as exc:
+        if "RAY_LOCAL_FALLBACK=0" not in str(exc):
+            raise
+    else:
+        raise AssertionError(
+            "VectorStore should not load a local model when Ray fallback is disabled."
+        )
+
+    print("Ray embedding local fallback disabled -> ok")
 
 
 def assert_jina_embedding_tasks_are_routed_by_use_case() -> None:
@@ -802,6 +825,7 @@ def main() -> None:
     assert_vector_store_lazy_loads_once_under_concurrency()
     assert_embedding_model_respects_cpu_override()
     assert_embedding_encode_falls_back_to_cpu_on_cuda_failure()
+    assert_ray_embedding_does_not_fallback_locally_when_disabled()
     assert_jina_embedding_tasks_are_routed_by_use_case()
     assert_collection_setup_avoids_redundant_indexes()
     assert_ingest_streams_files_and_skips_recreate_deletes()

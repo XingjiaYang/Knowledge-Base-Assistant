@@ -115,6 +115,11 @@ class FakeRuntimeCudaRerankerModel:
         return [{"index": 0, "relevance_score": 1.0}]
 
 
+class MissingRayActorReranker(Reranker):
+    def _reranker_actor(self) -> object | None:
+        return None
+
+
 def assert_reranker_orders_by_model_score() -> None:
     model = FakeRerankerModel()
     reranker = Reranker(Settings(), model=model)
@@ -269,12 +274,38 @@ def assert_reranker_falls_back_to_cpu_when_cuda_inference_fails() -> None:
     print("Reranker CUDA inference fallback -> ok")
 
 
+def assert_ray_reranker_does_not_fallback_locally_when_disabled() -> None:
+    reranker = MissingRayActorReranker(
+        Settings(ray_enabled=True, ray_local_fallback=False),
+    )
+    contexts = [
+        SearchResult(
+            text="candidate",
+            source="data/docs/guide.md",
+            chunk_id=1,
+            score=0.9,
+        )
+    ]
+    try:
+        reranker.rerank("query", contexts, top_k=1)
+    except RuntimeError as exc:
+        if "RAY_LOCAL_FALLBACK=0" not in str(exc):
+            raise
+    else:
+        raise AssertionError(
+            "Reranker should not load a local model when Ray fallback is disabled."
+        )
+
+    print("Ray reranker local fallback disabled -> ok")
+
+
 def main() -> None:
     assert_reranker_orders_by_model_score()
     assert_reranker_batches_large_recalls()
     assert_warmup_uses_rerank()
     assert_reranker_falls_back_to_cpu_when_cuda_move_fails()
     assert_reranker_falls_back_to_cpu_when_cuda_inference_fails()
+    assert_ray_reranker_does_not_fallback_locally_when_disabled()
 
 
 if __name__ == "__main__":

@@ -106,6 +106,7 @@ def assert_llm_settings() -> None:
         reranker_max_documents_per_call=32,
         ray_enabled=True,
         ray_address="ray://localhost:10001",
+        ray_local_fallback=False,
         ray_namespace="test-ns",
         ray_actor_num_cpus=2.0,
         ray_embedding_actor_num_gpus=0.25,
@@ -114,6 +115,9 @@ def assert_llm_settings() -> None:
         ray_embedding_actor_name="embedding-test",
         ray_code_embedding_actor_name="code-embedding-test",
         ray_reranker_actor_name="reranker-test",
+        ray_embedding_actor_resource="ray_worker_embedding",
+        ray_code_embedding_actor_resource="ray_worker_code",
+        ray_reranker_actor_resource="ray_worker_reranker",
         ray_task_timeout_seconds=12.5,
     )
 
@@ -197,7 +201,11 @@ def assert_llm_settings() -> None:
         raise AssertionError("Reranker dtype should be configurable.")
     if config.reranker_max_documents_per_call != 32:
         raise AssertionError("Reranker per-call document limit should be configurable.")
-    if not config.ray_enabled or config.ray_address != "ray://localhost:10001":
+    if (
+        not config.ray_enabled
+        or config.ray_address != "ray://localhost:10001"
+        or config.ray_local_fallback
+    ):
         raise AssertionError("Ray runtime should be configurable.")
     if (
         config.ray_namespace != "test-ns"
@@ -214,6 +222,12 @@ def assert_llm_settings() -> None:
         or config.ray_task_timeout_seconds != 12.5
     ):
         raise AssertionError("Ray actor resource settings should be configurable.")
+    if (
+        config.ray_embedding_actor_resource != "ray_worker_embedding"
+        or config.ray_code_embedding_actor_resource != "ray_worker_code"
+        or config.ray_reranker_actor_resource != "ray_worker_reranker"
+    ):
+        raise AssertionError("Ray actor node resource labels should be configurable.")
 
     print("LLM settings -> ok")
 
@@ -723,6 +737,9 @@ def assert_invalid_settings_rejected() -> None:
         {"ray_embedding_actor_name": ""},
         {"ray_code_embedding_actor_name": ""},
         {"ray_reranker_actor_name": ""},
+        {"ray_embedding_actor_resource": "bad-name"},
+        {"ray_code_embedding_actor_resource": "bad-name"},
+        {"ray_reranker_actor_resource": "bad-name"},
     ]
     for kwargs in invalid_configs:
         try:

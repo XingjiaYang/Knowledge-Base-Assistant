@@ -538,9 +538,19 @@ class VectorStore:
                 except Exception:
                     logger.exception(
                         "Embedding Ray actor failed during dimension probe; "
-                        "falling back to local model."
+                        "local_model_fallback=%s.",
+                        self.config.ray_local_fallback,
                     )
                     mark_ray_unavailable()
+                    if not self.config.ray_local_fallback:
+                        raise RuntimeError(
+                            "Embedding Ray actor failed during dimension probe and "
+                            "RAY_LOCAL_FALLBACK=0."
+                        )
+            elif not self.config.ray_local_fallback:
+                raise RuntimeError(
+                    "Embedding Ray actor is unavailable and RAY_LOCAL_FALLBACK=0."
+                )
 
         reported_size: int | None = None
         if hasattr(self.model, "get_embedding_dimension"):
@@ -1043,10 +1053,20 @@ class VectorStore:
                     )
                 except Exception:
                     logger.exception(
-                        "Embedding Ray actor failed during encode; falling back "
-                        "to local model."
+                        "Embedding Ray actor failed during encode; "
+                        "local_model_fallback=%s.",
+                        self.config.ray_local_fallback,
                     )
                     mark_ray_unavailable()
+                    if not self.config.ray_local_fallback:
+                        raise RuntimeError(
+                            "Embedding Ray actor failed during encode and "
+                            "RAY_LOCAL_FALLBACK=0."
+                        )
+            elif not self.config.ray_local_fallback:
+                raise RuntimeError(
+                    "Embedding Ray actor is unavailable and RAY_LOCAL_FALLBACK=0."
+                )
 
         raw_embeddings = self._encode(
             texts,

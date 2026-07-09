@@ -1,3 +1,25 @@
+x-main-build: &main-build
+  context: .
+  dockerfile: Dockerfile
+  args:
+    API_BASE_IMAGE: ${API_BASE_IMAGE:-pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime}
+    DOCS_INIT_BUILD_ID: ${DOCS_INIT_BUILD_ID:-auto}
+
+x-ray-worker-env: &ray-worker-env
+  CUDA: ${CUDA:-TRUE}
+  HF_TOKEN: ${HF_TOKEN:-}
+  HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+  HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+  HF_HOME: ${HF_HOME:-/root/.cache/huggingface}
+  HF_HUB_DISABLE_XET: ${HF_HUB_DISABLE_XET:-1}
+  GRPC_ENABLE_FORK_SUPPORT: ${GRPC_ENABLE_FORK_SUPPORT:-0}
+  HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
+  HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
+  NO_PROXY: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+  http_proxy: ${DOCKER_HTTP_PROXY:-}
+  https_proxy: ${DOCKER_HTTPS_PROXY:-}
+  no_proxy: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+
 services:
   postgres:
     image: ${POSTGRES_IMAGE:-postgres:17-alpine}
@@ -63,6 +85,102 @@ services:
         mc version enable "local/$${DOCS_S3_BUCKET}"
         mc anonymous set none "local/$${DOCS_S3_BUCKET}"
 
+  ray-head:
+    build: *main-build
+    restart: unless-stopped
+    shm_size: "10gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - |
+        ray start \
+          --head \
+          --port=6379 \
+          --ray-client-server-port=10001 \
+          --dashboard-host=0.0.0.0 \
+          --dashboard-port=8265 \
+          --num-cpus=0 \
+          --block
+    environment: *ray-worker-env
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+      - ./models:/models:ro
+    expose:
+      - "6379"
+      - "10001"
+      - "8265"
+
+  ray-worker-embedding-1:
+    build: *main-build
+    container_name: ray-worker-embedding-1
+    hostname: ray-worker-embedding-1
+    restart: unless-stopped
+    depends_on:
+      ray-head:
+        condition: service_started
+    gpus: all
+    shm_size: "10gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - |
+        until ray start \
+          --address=ray-head:6379 \
+          --num-cpus="$${RAY_WORKER_EMBEDDING_NUM_CPUS:-2}" \
+          --num-gpus="$${RAY_WORKER_EMBEDDING_NUM_GPUS:-1}" \
+          --resources='{"ray_worker_embedding": 1}' \
+          --block; do
+          echo "Waiting for ray-head..."
+          sleep 3
+        done
+    environment:
+      <<: *ray-worker-env
+      RAY_WORKER_EMBEDDING_NUM_CPUS: ${RAY_WORKER_EMBEDDING_NUM_CPUS:-2}
+      RAY_WORKER_EMBEDDING_NUM_GPUS: ${RAY_WORKER_EMBEDDING_NUM_GPUS:-1}
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+      - ./models:/models:ro
+
+  ray-worker-reranker-1:
+    build: *main-build
+    container_name: ray-worker-reranker-1
+    hostname: ray-worker-reranker-1
+    restart: unless-stopped
+    depends_on:
+      ray-head:
+        condition: service_started
+    gpus: all
+    shm_size: "10gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - |
+        until ray start \
+          --address=ray-head:6379 \
+          --num-cpus="$${RAY_WORKER_RERANKER_NUM_CPUS:-2}" \
+          --num-gpus="$${RAY_WORKER_RERANKER_NUM_GPUS:-1}" \
+          --resources='{"ray_worker_reranker": 1}' \
+          --block; do
+          echo "Waiting for ray-head..."
+          sleep 3
+        done
+    environment:
+      <<: *ray-worker-env
+      RAY_WORKER_RERANKER_NUM_CPUS: ${RAY_WORKER_RERANKER_NUM_CPUS:-2}
+      RAY_WORKER_RERANKER_NUM_GPUS: ${RAY_WORKER_RERANKER_NUM_GPUS:-1}
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+      - ./models:/models:ro
+
   vllm:
     profiles:
       - local-llm
@@ -78,10 +196,10 @@ services:
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      NO_PROXY: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       VLLM_USE_FLASHINFER_SAMPLER: ${VLLM_USE_FLASHINFER_SAMPLER:-0}
     volumes:
       - huggingface_cache:/root/.cache/huggingface
@@ -103,13 +221,10 @@ services:
       - --gpu-memory-utilization
       - ${VLLM_GPU_MEMORY_UTILIZATION:-0.92}
 
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        API_BASE_IMAGE: ${API_BASE_IMAGE:-pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime}
-        DOCS_INIT_BUILD_ID: ${DOCS_INIT_BUILD_ID:-auto}
+  main:
+    build: *main-build
+    container_name: main
+    hostname: main
     restart: unless-stopped
     depends_on:
       qdrant:
@@ -118,7 +233,12 @@ services:
         condition: service_started
       minio-init:
         condition: service_completed_successfully
-    gpus: all
+      ray-head:
+        condition: service_started
+      ray-worker-embedding-1:
+        condition: service_started
+      ray-worker-reranker-1:
+        condition: service_started
     shm_size: "10gb"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -152,7 +272,7 @@ services:
       CODE_FILES_COLLECTION: ${CODE_FILES_COLLECTION:-code_files}
       CODE_FUNCTIONS_COLLECTION: ${CODE_FUNCTIONS_COLLECTION:-code_functions}
       CODE_EMBEDDING_MODEL: ${CODE_EMBEDDING_MODEL:-microsoft/codebert-base}
-      CODE_EMBEDDING_PRELOAD: ${CODE_EMBEDDING_PRELOAD:-1}
+      CODE_EMBEDDING_PRELOAD: ${CODE_EMBEDDING_PRELOAD:-0}
       CODE_EMBEDDING_PRELOAD_RETRIES: ${CODE_EMBEDDING_PRELOAD_RETRIES:-3}
       CODE_EMBEDDING_PRELOAD_RETRY_SECONDS: ${CODE_EMBEDDING_PRELOAD_RETRY_SECONDS:-20}
       CODE_EMBEDDING_BATCH_SIZE: ${CODE_EMBEDDING_BATCH_SIZE:-8}
@@ -186,8 +306,10 @@ services:
       RERANKER_DTYPE: ${RERANKER_DTYPE:-auto}
       RERANKER_MAX_DOCUMENTS_PER_CALL: ${RERANKER_MAX_DOCUMENTS_PER_CALL:-64}
       RAY_ENABLED: ${RAY_ENABLED:-1}
-      RAY_ADDRESS: ${RAY_ADDRESS:-}
+      RAY_ADDRESS: ${RAY_ADDRESS:-ray://ray-head:10001}
+      RAY_LOCAL_FALLBACK: ${RAY_LOCAL_FALLBACK:-0}
       RAY_NAMESPACE: ${RAY_NAMESPACE:-kba}
+      GRPC_ENABLE_FORK_SUPPORT: ${GRPC_ENABLE_FORK_SUPPORT:-0}
       RAY_ACTOR_NUM_CPUS: ${RAY_ACTOR_NUM_CPUS:-1}
       RAY_EMBEDDING_ACTOR_NUM_GPUS: ${RAY_EMBEDDING_ACTOR_NUM_GPUS:-0.5}
       RAY_RERANKER_ACTOR_NUM_GPUS: ${RAY_RERANKER_ACTOR_NUM_GPUS:-0.5}
@@ -195,6 +317,9 @@ services:
       RAY_EMBEDDING_ACTOR_NAME: ${RAY_EMBEDDING_ACTOR_NAME:-kba_embedding}
       RAY_CODE_EMBEDDING_ACTOR_NAME: ${RAY_CODE_EMBEDDING_ACTOR_NAME:-kba_code_embedding}
       RAY_RERANKER_ACTOR_NAME: ${RAY_RERANKER_ACTOR_NAME:-kba_reranker}
+      RAY_EMBEDDING_ACTOR_RESOURCE: ${RAY_EMBEDDING_ACTOR_RESOURCE:-ray_worker_embedding}
+      RAY_CODE_EMBEDDING_ACTOR_RESOURCE: ${RAY_CODE_EMBEDDING_ACTOR_RESOURCE:-}
+      RAY_RERANKER_ACTOR_RESOURCE: ${RAY_RERANKER_ACTOR_RESOURCE:-ray_worker_reranker}
       RAY_TASK_TIMEOUT_SECONDS: ${RAY_TASK_TIMEOUT_SECONDS:-300}
       DEBUG: ${DEBUG:-0}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai_compatible}
@@ -251,7 +376,7 @@ services:
       INTENT_EMBEDDING_DIRECT_THRESHOLD: ${INTENT_EMBEDDING_DIRECT_THRESHOLD:-0.40}
       INTENT_EMBEDDING_MARGIN: ${INTENT_EMBEDDING_MARGIN:-0.06}
       INGEST_ON_STARTUP: ${INGEST_ON_STARTUP:-0}
-      INGEST_USE_RAY: ${INGEST_USE_RAY:-0}
+      INGEST_USE_RAY: ${INGEST_USE_RAY:-1}
       RECREATE_COLLECTION: ${RECREATE_COLLECTION:-0}
       WAIT_FOR_LLM: ${WAIT_FOR_LLM:-0}
       SERVICE_TIMEOUT_SECONDS: ${SERVICE_TIMEOUT_SECONDS:-1800}
@@ -262,10 +387,10 @@ services:
       HF_HUB_DISABLE_XET: ${HF_HUB_DISABLE_XET:-1}
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      NO_PROXY: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,api,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
     volumes:
       - ./data:/app/data:ro
       - huggingface_cache:/root/.cache/huggingface

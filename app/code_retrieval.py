@@ -118,6 +118,10 @@ class CodeRetrieval:
             actor = get_code_embedding_actor(self.config)
             if actor is not None:
                 return int(ray_get(actor.warmup.remote(), self.config))
+            if not self.config.ray_local_fallback:
+                raise RuntimeError(
+                    "Ray CodeBERT actor is unavailable and RAY_LOCAL_FALLBACK=0."
+                )
         return self.embedder.warmup()
 
     def search(
@@ -256,6 +260,10 @@ class CodeRetrieval:
                 raise RuntimeError(
                     "Ray CodeBERT actor embed failed after retry."
                 ) from last_error
+            if not self.config.ray_local_fallback:
+                raise RuntimeError(
+                    "Ray CodeBERT actor is unavailable and RAY_LOCAL_FALLBACK=0."
+                )
 
         if not _code_embedding_model_ready(
             self._embedder,

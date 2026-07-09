@@ -105,6 +105,16 @@ class QdrantFailingVectorStore(FakeVectorStore):
         ][: top_k or 2]
 
 
+class BM25FailingVectorStore(FakeVectorStore):
+    def search_bm25(
+        self,
+        query: str,
+        top_k: int | None = None,
+    ) -> list[SearchResult]:
+        self.bm25_top_ks.append(top_k)
+        raise RuntimeError("bm25 unavailable")
+
+
 class SlowParallelVectorStore:
     def __init__(self) -> None:
         self.bm25_started_at = 0.0
@@ -378,6 +388,34 @@ def assert_pipeline_retrieval_degradation_behavior() -> None:
         raise AssertionError("Working reranker should not be marked degraded.")
     if [context.chunk_id for context in qdrant_answer.contexts] != [10]:
         raise AssertionError("Qdrant fallback should use BM25-only contexts.")
+
+    bm25_config = Settings(reranker_enabled=False)
+    bm25_router = IntentRouter(bm25_config, embedder=None, llm_client=None)
+    bm25_store = BM25FailingVectorStore()
+    bm25_answer = RAGPipeline(
+        bm25_config,
+        vector_store=bm25_store,
+        llm_client=llm_client,
+        intent_router=bm25_router,
+        reranker=FakeReranker(),
+    ).answer(
+        "新员工如何申请开发设备？",
+        top_k=1,
+        bm25_top_k=3,
+        recall_top_k=4,
+    )
+    if not bm25_answer.retrieval_degraded:
+        raise AssertionError("BM25 failure should mark retrieval as degraded.")
+    if bm25_answer.qdrant_degraded:
+        raise AssertionError("BM25 failure should not mark Qdrant as degraded.")
+    if bm25_answer.reranker_degraded:
+        raise AssertionError("Disabled reranker should not be marked degraded.")
+    if [context.chunk_id for context in bm25_answer.contexts] != [0]:
+        raise AssertionError("BM25 fallback should use Qdrant/vector-only contexts.")
+    if bm25_store.search_top_ks != [4] or bm25_store.bm25_top_ks != [3]:
+        raise AssertionError("BM25 fallback should still run both recall branches.")
+    if "BM25 keyword recall failed" not in bm25_answer.degradation_reason:
+        raise AssertionError("BM25 fallback should expose a degradation reason.")
 
     vector_store = FakeVectorStore()
     failing_reranker = FailingReranker()

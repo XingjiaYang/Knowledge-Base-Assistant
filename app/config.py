@@ -234,6 +234,10 @@ class Settings:
     )
     ray_enabled: bool = _env_bool("RAY_ENABLED", True)
     ray_address: str = os.getenv("RAY_ADDRESS", "")
+    ray_local_fallback: bool = _env_bool(
+        "RAY_LOCAL_FALLBACK",
+        not bool(os.getenv("RAY_ADDRESS", "").strip()),
+    )
     ray_namespace: str = os.getenv("RAY_NAMESPACE", "kba")
     ray_actor_num_cpus: float = _env_float("RAY_ACTOR_NUM_CPUS", 1.0)
     ray_embedding_actor_num_gpus: float = _env_float(
@@ -259,6 +263,18 @@ class Settings:
     ray_reranker_actor_name: str = os.getenv(
         "RAY_RERANKER_ACTOR_NAME",
         "kba_reranker",
+    )
+    ray_embedding_actor_resource: str = os.getenv(
+        "RAY_EMBEDDING_ACTOR_RESOURCE",
+        "",
+    )
+    ray_code_embedding_actor_resource: str = os.getenv(
+        "RAY_CODE_EMBEDDING_ACTOR_RESOURCE",
+        "",
+    )
+    ray_reranker_actor_resource: str = os.getenv(
+        "RAY_RERANKER_ACTOR_RESOURCE",
+        "",
     )
     ray_task_timeout_seconds: float = _env_float("RAY_TASK_TIMEOUT_SECONDS", 300.0)
 
@@ -478,6 +494,18 @@ class Settings:
             raise ValueError("RAY_CODE_EMBEDDING_ACTOR_NAME must not be empty.")
         if not self.ray_reranker_actor_name.strip():
             raise ValueError("RAY_RERANKER_ACTOR_NAME must not be empty.")
+        for field_name, resource_name in (
+            ("RAY_EMBEDDING_ACTOR_RESOURCE", self.ray_embedding_actor_resource),
+            (
+                "RAY_CODE_EMBEDDING_ACTOR_RESOURCE",
+                self.ray_code_embedding_actor_resource,
+            ),
+            ("RAY_RERANKER_ACTOR_RESOURCE", self.ray_reranker_actor_resource),
+        ):
+            if resource_name and not resource_name.replace("_", "").isalnum():
+                raise ValueError(
+                    f"{field_name} must contain only letters, numbers, or underscores."
+                )
         if self.llm_timeout_seconds <= 0:
             raise ValueError("LLM_TIMEOUT_SECONDS must be greater than 0.")
         if self.llm_retry_attempts <= 0:
