@@ -59,6 +59,7 @@ class RAGAnswer:
     route: str
     route_reason: str
     retrieval_degraded: bool = False
+    embedding_degraded: bool = False
     qdrant_degraded: bool = False
     reranker_degraded: bool = False
     degradation_reason: str = ""
@@ -69,6 +70,7 @@ class RAGAnswer:
 class RetrievalOutcome:
     contexts: list[SearchResult]
     retrieval_degraded: bool = False
+    embedding_degraded: bool = False
     qdrant_degraded: bool = False
     reranker_degraded: bool = False
     degradation_reason: str = ""
@@ -78,6 +80,7 @@ class RetrievalOutcome:
 @dataclass(frozen=True)
 class RecallOutcome:
     contexts: list[SearchResult]
+    embedding_degraded: bool = False
     qdrant_degraded: bool = False
     recall_ms: float = 0.0
     bm25_ms: float = 0.0
@@ -95,14 +98,19 @@ class RAGPipeline:
         llm_client: LLMClient | None = None,
         intent_router: IntentRouter | None = None,
         reranker: Reranker | None = None,
+        health_monitor: object | None = None,
     ) -> None:
         self.config = config
         self.budget = PromptBudget.from_config(config)
         self.vector_store = vector_store or VectorStore(config)
         self.llm_client = llm_client or LLMClient(config)
+        self.health_monitor = health_monitor
+        intent_embedder = self._intent_embedder(self.vector_store)
+        if intent_embedder is not None and health_monitor is not None:
+            intent_embedder = _HealthAwareEmbedder(intent_embedder, health_monitor)
         self.intent_router = intent_router or IntentRouter(
             config,
-            embedder=self._intent_embedder(self.vector_store),
+            embedder=intent_embedder,
             llm_client=self.llm_client,
         )
         self.reranker = reranker or Reranker(config)
@@ -211,6 +219,7 @@ class RAGPipeline:
             route=intent.route,
             route_reason=intent.reason,
             retrieval_degraded=retrieval_outcome.retrieval_degraded,
+            embedding_degraded=retrieval_outcome.embedding_degraded,
             qdrant_degraded=retrieval_outcome.qdrant_degraded,
             reranker_degraded=retrieval_outcome.reranker_degraded,
             degradation_reason=retrieval_outcome.degradation_reason,
@@ -243,6 +252,7 @@ class RAGPipeline:
         )
         recalled_contexts = recall_outcome.contexts
         recall_degraded = bool(degradation_reasons)
+        embedding_degraded = recall_outcome.embedding_degraded
         qdrant_degraded = recall_outcome.qdrant_degraded
 
         logger.info(
@@ -254,8 +264,36 @@ class RAGPipeline:
             return RetrievalOutcome(
                 contexts=recalled_contexts[:final_top_k],
                 retrieval_degraded=recall_degraded,
+                embedding_degraded=embedding_degraded,
                 qdrant_degraded=qdrant_degraded,
                 reranker_degraded=False,
+                degradation_reason="; ".join(degradation_reasons),
+                timings=self._retrieval_timings(
+                    retrieval_start,
+                    recall_outcome,
+                    reranker_ms=0.0,
+                ),
+            )
+
+        if self._component_degraded("reranker"):
+            degradation_reasons.append(
+                "Reranker health probe is degraded; using unre-ranked recall results."
+            )
+            logger.warning(
+                "Retrieval degraded: retrieval_degraded=True "
+                "qdrant_degraded=%s reranker_degraded=True "
+                "fallback=health_probe_rrf_or_bm25_top_k final_top_k=%s "
+                "recalled_contexts=%s.",
+                qdrant_degraded,
+                final_top_k,
+                len(recalled_contexts),
+            )
+            return RetrievalOutcome(
+                contexts=recalled_contexts[:final_top_k],
+                retrieval_degraded=True,
+                embedding_degraded=embedding_degraded,
+                qdrant_degraded=qdrant_degraded,
+                reranker_degraded=True,
                 degradation_reason="; ".join(degradation_reasons),
                 timings=self._retrieval_timings(
                     retrieval_start,
@@ -289,6 +327,7 @@ class RAGPipeline:
             return RetrievalOutcome(
                 contexts=recalled_contexts[:final_top_k],
                 retrieval_degraded=True,
+                embedding_degraded=embedding_degraded,
                 qdrant_degraded=qdrant_degraded,
                 reranker_degraded=reranker_degraded,
                 degradation_reason="; ".join(degradation_reasons),
@@ -307,6 +346,7 @@ class RAGPipeline:
         return RetrievalOutcome(
             contexts=reranked_contexts,
             retrieval_degraded=recall_degraded,
+            embedding_degraded=embedding_degraded,
             qdrant_degraded=qdrant_degraded,
             reranker_degraded=False,
             degradation_reason="; ".join(degradation_reasons),
@@ -365,6 +405,53 @@ class RAGPipeline:
                     self._elapsed_ms(vector_start),
                     0.0,
                     0.0,
+                )
+
+            embedding_health_degraded = self._component_degraded("embedding")
+            qdrant_health_degraded = self._component_degraded("qdrant")
+            if embedding_health_degraded or qdrant_health_degraded:
+                if embedding_health_degraded:
+                    degradation_reasons.append(
+                        "Embedding health probe is degraded; using BM25-only retrieval."
+                    )
+                if qdrant_health_degraded:
+                    degradation_reasons.append(
+                        "Qdrant health probe is degraded; using BM25-only retrieval."
+                    )
+                bm25_start = time.perf_counter()
+                try:
+                    bm25_contexts = self.vector_store.search_bm25(
+                        search_query,
+                        top_k=bm25_limit,
+                    )
+                    bm25_ms = self._elapsed_ms(bm25_start)
+                except Exception as bm25_exc:
+                    logger.exception(
+                        "Retrieval failed while vector recall was disabled by "
+                        "component health and BM25 recall also failed."
+                    )
+                    raise RuntimeError(
+                        "Vector recall is disabled by component health and BM25 "
+                        "keyword recall failed."
+                    ) from bm25_exc
+                logger.warning(
+                    "Retrieval degraded: retrieval_degraded=True "
+                    "embedding_degraded=%s qdrant_degraded=%s "
+                    "reranker_degraded=False fallback=bm25_only bm25_contexts=%s.",
+                    embedding_health_degraded,
+                    qdrant_health_degraded,
+                    len(bm25_contexts),
+                )
+                return RecallOutcome(
+                    contexts=bm25_contexts[:rrf_limit],
+                    embedding_degraded=embedding_health_degraded,
+                    qdrant_degraded=qdrant_health_degraded,
+                    recall_ms=self._elapsed_ms(recall_start),
+                    bm25_ms=bm25_ms,
+                    vector_ms=0.0,
+                    embedding_ms=0.0,
+                    qdrant_ms=0.0,
+                    rrf_ms=0.0,
                 )
 
             vector_start = time.perf_counter()
@@ -530,6 +617,18 @@ class RAGPipeline:
     @staticmethod
     def _elapsed_ms(start: float) -> float:
         return (time.perf_counter() - start) * 1000
+
+    def _component_degraded(self, name: str) -> bool:
+        if self.health_monitor is None:
+            return False
+        is_degraded = getattr(self.health_monitor, "is_degraded", None)
+        if not callable(is_degraded):
+            return False
+        try:
+            return bool(is_degraded(name))
+        except Exception:
+            logger.exception("Failed to read component health state for %s.", name)
+            return False
 
     def _final_top_k(self, top_k: int | None = None) -> int:
         return max(1, top_k or self.config.retrieve_top_k)
@@ -836,3 +935,15 @@ class RAGPipeline:
         if hasattr(vector_store, "encode"):
             return vector_store
         return getattr(vector_store, "model", None)
+
+
+class _HealthAwareEmbedder:
+    def __init__(self, embedder: object, health_monitor: object) -> None:
+        self.embedder = embedder
+        self.health_monitor = health_monitor
+
+    def encode(self, *args: object, **kwargs: object) -> object:
+        is_degraded = getattr(self.health_monitor, "is_degraded", None)
+        if callable(is_degraded) and is_degraded("embedding"):
+            raise RuntimeError("Embedding health probe is degraded.")
+        return self.embedder.encode(*args, **kwargs)

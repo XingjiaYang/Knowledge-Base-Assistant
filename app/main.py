@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import csv
+from datetime import datetime, timezone
 from io import StringIO
 import logging
 from pathlib import Path
+import time
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -17,6 +19,7 @@ from pydantic import BaseModel, Field
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.call_graph import CallGraphStore
+from app.component_health import ComponentHealthSnapshot, ComponentHealthSupervisor
 from app.config import settings
 from app.code_indexer import CodeIndexer, CodeRepository, discover_code_repositories
 from app.code_retrieval import (
@@ -26,7 +29,14 @@ from app.code_retrieval import (
     CodeFileHit,
 )
 from app.llm_client import LLMClient
-from app.model_actors import warmup_model_actors
+from app.model_actors import (
+    get_embedding_actor,
+    get_reranker_actor,
+    ray_get,
+    reset_embedding_actor,
+    reset_reranker_actor,
+    warmup_model_actors,
+)
 from app.rag import RAGPipeline, RAGTimings
 from app.reranker import Reranker
 from app.security import bearer_token
@@ -42,6 +52,9 @@ from app.vector_store import SearchResult, VectorStore
 
 
 logger = logging.getLogger(__name__)
+
+_ACTOR_RECOVERY_WARMUP_MIN_INTERVAL_SECONDS = 60.0
+_actor_recovery_warmup_last_at: dict[str, float] = {}
 
 
 async def _warmup_model_actors_background() -> None:
@@ -91,6 +104,21 @@ async def lifespan(_app: FastAPI):
         settings,
         runtime_settings_provider=_app.state.session_store.get_llm_runtime_settings,
     )
+    _app.state.health_monitor = ComponentHealthSupervisor(settings)
+    _app.state.health_monitor.register(
+        "qdrant",
+        lambda: _probe_qdrant_component(_app.state.vector_store),
+    )
+    if settings.ray_enabled:
+        _app.state.health_monitor.register(
+            "embedding",
+            lambda: _probe_embedding_component(),
+        )
+        if settings.reranker_enabled:
+            _app.state.health_monitor.register(
+                "reranker",
+                lambda: _probe_reranker_component(),
+            )
     if settings.ray_enabled:
         _app.state.model_actor_warmup_task = asyncio.create_task(
             _warmup_model_actors_background()
@@ -114,7 +142,9 @@ async def lifespan(_app: FastAPI):
         vector_store=_app.state.vector_store,
         llm_client=_app.state.llm_client,
         reranker=_app.state.reranker,
+        health_monitor=_app.state.health_monitor,
     )
+    _app.state.health_monitor.start()
     _app.state.code_retrieval = CodeRetrieval(settings)
     if settings.code_embedding_preload and not settings.ray_enabled:
         _app.state.code_embedding_warmup_task = asyncio.create_task(
@@ -129,6 +159,9 @@ async def lifespan(_app: FastAPI):
             task = getattr(_app.state, task_name, None)
             if task is not None and not task.done():
                 task.cancel()
+        health_monitor = getattr(_app.state, "health_monitor", None)
+        if health_monitor is not None:
+            await health_monitor.stop()
         _app.state.llm_client.close()
         _app.state.vector_store.close()
         if _app.state.session_store is not None:
@@ -494,6 +527,7 @@ class RAGResponse(BaseModel):
     route: str
     route_reason: str
     retrieval_degraded: bool = False
+    embedding_degraded: bool = False
     qdrant_degraded: bool = False
     reranker_degraded: bool = False
     degradation_reason: str = ""
@@ -653,6 +687,7 @@ class StoredMessageResponse(BaseModel):
     route: str = ""
     route_reason: str = ""
     retrieval_degraded: bool = False
+    embedding_degraded: bool = False
     qdrant_degraded: bool = False
     reranker_degraded: bool = False
     degradation_reason: str = ""
@@ -669,6 +704,7 @@ class StoredMessageResponse(BaseModel):
             route=message.route,
             route_reason=message.route_reason,
             retrieval_degraded=message.retrieval_degraded,
+            embedding_degraded=message.embedding_degraded,
             qdrant_degraded=message.qdrant_degraded,
             reranker_degraded=message.reranker_degraded,
             degradation_reason=message.degradation_reason,
@@ -1146,6 +1182,14 @@ async def health_details(request: Request) -> dict[str, object]:
         "ray_reranker_actor_name": settings.ray_reranker_actor_name,
         "ray_embedding_actor_resource": settings.ray_embedding_actor_resource,
         "ray_reranker_actor_resource": settings.ray_reranker_actor_resource,
+        "health_probe_interval_seconds": settings.health_probe_interval_seconds,
+        "health_probe_degraded_interval_seconds": (
+            settings.health_probe_degraded_interval_seconds
+        ),
+        "health_probe_timeout_seconds": settings.health_probe_timeout_seconds,
+        "health_probe_failure_threshold": settings.health_probe_failure_threshold,
+        "health_probe_recovery_threshold": settings.health_probe_recovery_threshold,
+        "component_health": _health_snapshots(request),
         "intent_router": settings.intent_router_enabled,
         "auth_enabled": True,
     }
@@ -1453,6 +1497,7 @@ async def rag(
         result.route,
         result.route_reason,
         result.retrieval_degraded,
+        result.embedding_degraded,
         result.qdrant_degraded,
         result.reranker_degraded,
         result.degradation_reason,
@@ -1477,6 +1522,7 @@ async def rag(
         route=result.route,
         route_reason=result.route_reason,
         retrieval_degraded=result.retrieval_degraded,
+        embedding_degraded=result.embedding_degraded,
         qdrant_degraded=result.qdrant_degraded,
         reranker_degraded=result.reranker_degraded,
         degradation_reason=result.degradation_reason,
@@ -1491,6 +1537,107 @@ def _qdrant_health(vector_store: VectorStore) -> bool:
         logger.exception("Qdrant health check failed.")
         return False
     return True
+
+
+def _probe_qdrant_component(vector_store: VectorStore) -> None:
+    vector_store.client.get_collection(collection_name=settings.collection_name)
+
+
+def _probe_embedding_component() -> None:
+    actor = get_embedding_actor(settings)
+    if actor is None:
+        reset_embedding_actor(settings)
+        actor = get_embedding_actor(settings)
+    if actor is None:
+        raise RuntimeError("Ray document embedding actor is unavailable.")
+    try:
+        ray_get(
+            actor.health.remote(),
+            settings,
+            timeout_seconds=settings.health_probe_timeout_seconds,
+        )
+    except Exception as exc:
+        _schedule_actor_recovery_warmup(
+            actor,
+            actor_name=settings.ray_embedding_actor_name,
+            component_name="document embedding",
+            error=exc,
+        )
+        raise
+
+
+def _probe_reranker_component() -> None:
+    actor = get_reranker_actor(settings)
+    if actor is None:
+        reset_reranker_actor(settings)
+        actor = get_reranker_actor(settings)
+    if actor is None:
+        raise RuntimeError("Ray reranker actor is unavailable.")
+    try:
+        ray_get(
+            actor.health.remote(),
+            settings,
+            timeout_seconds=settings.health_probe_timeout_seconds,
+        )
+    except Exception as exc:
+        _schedule_actor_recovery_warmup(
+            actor,
+            actor_name=settings.ray_reranker_actor_name,
+            component_name="reranker",
+            error=exc,
+        )
+        raise
+
+
+def _schedule_actor_recovery_warmup(
+    actor: Any,
+    *,
+    actor_name: str,
+    component_name: str,
+    error: Exception,
+) -> None:
+    if "not warmed up" not in str(error).lower():
+        return
+
+    now = time.monotonic()
+    last_at = _actor_recovery_warmup_last_at.get(actor_name, 0.0)
+    if now - last_at < _ACTOR_RECOVERY_WARMUP_MIN_INTERVAL_SECONDS:
+        return
+    _actor_recovery_warmup_last_at[actor_name] = now
+    actor.warmup.remote()
+    logger.info(
+        "Scheduled Ray %s actor warmup after health probe found a cold actor.",
+        component_name,
+    )
+
+
+def _health_snapshots(request: Request) -> dict[str, dict[str, object]]:
+    health_monitor = getattr(request.app.state, "health_monitor", None)
+    if health_monitor is None:
+        return {}
+    return {
+        name: _health_snapshot_to_dict(snapshot)
+        for name, snapshot in health_monitor.snapshots().items()
+    }
+
+
+def _health_snapshot_to_dict(snapshot: ComponentHealthSnapshot) -> dict[str, object]:
+    return {
+        "status": snapshot.status,
+        "degraded": snapshot.degraded,
+        "consecutive_failures": snapshot.consecutive_failures,
+        "consecutive_successes": snapshot.consecutive_successes,
+        "last_error": snapshot.last_error,
+        "last_checked_at": _timestamp_to_iso(snapshot.last_checked_at),
+        "last_changed_at": _timestamp_to_iso(snapshot.last_changed_at),
+        "probe_interval_seconds": snapshot.probe_interval_seconds,
+    }
+
+
+def _timestamp_to_iso(timestamp: float) -> str:
+    if timestamp <= 0:
+        return ""
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
 async def _get_or_create_chat_session(

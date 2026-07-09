@@ -14,7 +14,7 @@ _ray_lock = Lock()
 _embedding_actor: Any | None = None
 _code_embedding_actor: Any | None = None
 _reranker_actor: Any | None = None
-_ray_unavailable = False
+_unavailable_actor_names: set[str] = set()
 
 
 class EmbeddingActor:
@@ -43,6 +43,17 @@ class EmbeddingActor:
     def warmup(self) -> int:
         return self.vector_size()
 
+    def health(self) -> dict[str, object]:
+        vector_size = getattr(self.store, "_vector_size", None)
+        ready = getattr(self.store, "_model", None) is not None and bool(vector_size)
+        if not ready:
+            raise RuntimeError("Document embedding actor is not warmed up.")
+        return {
+            "ready": True,
+            "model": self.store.config.embedding_model,
+            "vector_size": int(vector_size),
+        }
+
 
 class RerankerActor:
     def __init__(self, config: Settings = settings) -> None:
@@ -61,6 +72,14 @@ class RerankerActor:
     def warmup(self) -> None:
         self.reranker.warmup()
 
+    def health(self) -> dict[str, object]:
+        if getattr(self.reranker, "_model", None) is None:
+            raise RuntimeError("Reranker actor is not warmed up.")
+        return {
+            "ready": True,
+            "model": self.reranker.config.reranker_model,
+        }
+
 
 class CodeEmbeddingActor:
     def __init__(self, config: Settings = settings) -> None:
@@ -76,6 +95,17 @@ class CodeEmbeddingActor:
 
     def warmup(self) -> int:
         return self.embedder.warmup()
+
+    def health(self) -> dict[str, object]:
+        vector_size = getattr(self.embedder, "_vector_size", None)
+        ready = getattr(self.embedder, "_model", None) is not None and bool(vector_size)
+        if not ready:
+            raise RuntimeError("Code embedding actor is not warmed up.")
+        return {
+            "ready": True,
+            "model": self.embedder.config.code_embedding_model,
+            "vector_size": int(vector_size),
+        }
 
 
 def get_embedding_actor(config: Settings = settings) -> Any | None:
@@ -110,10 +140,25 @@ def get_code_embedding_actor(config: Settings = settings) -> Any | None:
         return _code_embedding_actor
 
 
-def reset_code_embedding_actor() -> None:
+def reset_code_embedding_actor(config: Settings = settings) -> None:
     global _code_embedding_actor
     with _ray_lock:
         _code_embedding_actor = None
+        _unavailable_actor_names.discard(config.ray_code_embedding_actor_name)
+
+
+def reset_embedding_actor(config: Settings = settings) -> None:
+    global _embedding_actor
+    with _ray_lock:
+        _embedding_actor = None
+        _unavailable_actor_names.discard(config.ray_embedding_actor_name)
+
+
+def reset_reranker_actor(config: Settings = settings) -> None:
+    global _reranker_actor
+    with _ray_lock:
+        _reranker_actor = None
+        _unavailable_actor_names.discard(config.ray_reranker_actor_name)
 
 
 def get_reranker_actor(config: Settings = settings) -> Any | None:
@@ -132,18 +177,34 @@ def get_reranker_actor(config: Settings = settings) -> Any | None:
         return _reranker_actor
 
 
-def ray_get(ref: Any, config: Settings = settings) -> Any:
+def ray_get(
+    ref: Any,
+    config: Settings = settings,
+    timeout_seconds: float | None = None,
+) -> Any:
     import ray
 
-    timeout = config.ray_task_timeout_seconds
+    timeout = (
+        config.ray_task_timeout_seconds
+        if timeout_seconds is None
+        else timeout_seconds
+    )
     if timeout <= 0:
         return ray.get(ref)
     return ray.get(ref, timeout=timeout)
 
 
-def mark_ray_unavailable() -> None:
-    global _ray_unavailable
-    _ray_unavailable = True
+def mark_ray_unavailable(actor_name: str | None = None, config: Settings = settings) -> None:
+    if actor_name is None:
+        actor_names = (
+            config.ray_embedding_actor_name,
+            config.ray_code_embedding_actor_name,
+            config.ray_reranker_actor_name,
+        )
+    else:
+        actor_names = (actor_name,)
+    with _ray_lock:
+        _unavailable_actor_names.update(actor_names)
 
 
 def warmup_model_actors(config: Settings = settings) -> None:
@@ -211,8 +272,7 @@ def _get_or_create_actor(
     num_gpus: float,
     node_resource: str = "",
 ) -> Any | None:
-    global _ray_unavailable
-    if _ray_unavailable:
+    if name in _unavailable_actor_names:
         return None
 
     try:
@@ -233,6 +293,8 @@ def _get_or_create_actor(
         remote_options: dict[str, Any] = {
             "num_cpus": config.ray_actor_num_cpus,
             "num_gpus": requested_gpus,
+            "max_restarts": -1,
+            "max_task_retries": 0,
         }
         if node_resource.strip():
             remote_options["resources"] = {node_resource.strip(): 0.001}
@@ -252,7 +314,7 @@ def _get_or_create_actor(
             namespace=config.ray_namespace,
         ).remote(config)
     except Exception:
-        _ray_unavailable = True
+        _unavailable_actor_names.add(name)
         logger.exception(
             "Ray actor %s is unavailable; local_model_fallback=%s.",
             name,

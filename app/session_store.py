@@ -72,6 +72,7 @@ class StoredChatMessage:
     route: str
     route_reason: str
     retrieval_degraded: bool
+    embedding_degraded: bool
     qdrant_degraded: bool
     reranker_degraded: bool
     degradation_reason: str
@@ -196,6 +197,7 @@ class SessionStore:
                         route TEXT NOT NULL DEFAULT '',
                         route_reason TEXT NOT NULL DEFAULT '',
                         retrieval_degraded BOOLEAN NOT NULL DEFAULT FALSE,
+                        embedding_degraded BOOLEAN NOT NULL DEFAULT FALSE,
                         qdrant_degraded BOOLEAN NOT NULL DEFAULT FALSE,
                         reranker_degraded BOOLEAN NOT NULL DEFAULT FALSE,
                         degradation_reason TEXT NOT NULL DEFAULT '',
@@ -207,6 +209,12 @@ class SessionStore:
                     """
                     ALTER TABLE chat_messages
                     ADD COLUMN IF NOT EXISTS retrieval_degraded BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS embedding_degraded BOOLEAN NOT NULL DEFAULT FALSE
                     """
                 )
                 cur.execute(
@@ -1000,6 +1008,7 @@ class SessionStore:
                        route,
                        route_reason,
                        retrieval_degraded,
+                       embedding_degraded,
                        qdrant_degraded,
                        reranker_degraded,
                        degradation_reason,
@@ -1061,6 +1070,7 @@ class SessionStore:
         route: str = "",
         route_reason: str = "",
         retrieval_degraded: bool = False,
+        embedding_degraded: bool = False,
         qdrant_degraded: bool = False,
         reranker_degraded: bool = False,
         degradation_reason: str = "",
@@ -1081,11 +1091,12 @@ class SessionStore:
                     route,
                     route_reason,
                     retrieval_degraded,
+                    embedding_degraded,
                     qdrant_degraded,
                     reranker_degraded,
                     degradation_reason
                 )
-                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id,
                           role,
                           content,
@@ -1094,6 +1105,7 @@ class SessionStore:
                           route,
                           route_reason,
                           retrieval_degraded,
+                          embedding_degraded,
                           qdrant_degraded,
                           reranker_degraded,
                           degradation_reason,
@@ -1108,6 +1120,7 @@ class SessionStore:
                     route,
                     route_reason,
                     retrieval_degraded,
+                    embedding_degraded,
                     qdrant_degraded,
                     reranker_degraded,
                     degradation_reason,
@@ -1325,6 +1338,7 @@ def chat_message_from_row(row: dict[str, Any]) -> StoredChatMessage:
         route=row["route"] or "",
         route_reason=row["route_reason"] or "",
         retrieval_degraded=bool(row["retrieval_degraded"]),
+        embedding_degraded=bool(row.get("embedding_degraded", False)),
         qdrant_degraded=bool(row["qdrant_degraded"]),
         reranker_degraded=bool(row["reranker_degraded"]),
         degradation_reason=row["degradation_reason"] or "",

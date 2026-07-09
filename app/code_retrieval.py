@@ -249,7 +249,7 @@ class CodeRetrieval:
                     return list(ray_get(actor.embed.remote(texts), self.config))
                 except Exception as exc:
                     last_error = exc
-                    reset_code_embedding_actor()
+                    reset_code_embedding_actor(self.config)
                     if attempt == 0:
                         logger.warning(
                             "Ray CodeBERT actor embed failed; recreating actor "

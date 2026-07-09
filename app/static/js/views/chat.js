@@ -100,6 +100,7 @@ async function ask(question) {
     route: "",
     routeReason: "",
     retrievalDegraded: false,
+    embeddingDegraded: false,
     qdrantDegraded: false,
     rerankerDegraded: false,
     degradationReason: "",
@@ -134,6 +135,7 @@ async function ask(question) {
     assistant.route = data.route || "";
     assistant.routeReason = data.route_reason || "";
     assistant.retrievalDegraded = Boolean(data.retrieval_degraded);
+    assistant.embeddingDegraded = Boolean(data.embedding_degraded);
     assistant.qdrantDegraded = Boolean(data.qdrant_degraded);
     assistant.rerankerDegraded = Boolean(data.reranker_degraded);
     assistant.degradationReason = data.degradation_reason || "";
@@ -604,6 +606,12 @@ function renderDegradationNotice(message) {
 
 function degradationText(item) {
   if (item.degradationReason) return item.degradationReason;
+  if (item.embeddingDegraded && item.qdrantDegraded) {
+    return "Embedding and Qdrant/vector recall degraded; using BM25-only references.";
+  }
+  if (item.embeddingDegraded) {
+    return "Embedding health degraded; using BM25-only references.";
+  }
   if (item.qdrantDegraded && item.rerankerDegraded) {
     return "Qdrant/vector recall and reranker degraded; using BM25-only unre-ranked references.";
   }

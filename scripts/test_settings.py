@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import LLMRuntimeSettings, Settings
+from app.component_health import ComponentHealthState
 from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget
 from app.session_store import ChatSessionRecord, CurrentUser
@@ -849,8 +850,44 @@ def assert_default_embedding_settings() -> None:
         raise AssertionError("Default embedding actor should request fractional GPU.")
     if config.ray_reranker_actor_num_gpus != 0.5:
         raise AssertionError("Default reranker actor should request fractional GPU.")
+    if config.health_probe_interval_seconds != 10.0:
+        raise AssertionError("Default healthy probe interval should be 10 seconds.")
+    if config.health_probe_degraded_interval_seconds != 3.0:
+        raise AssertionError("Default degraded probe interval should be 3 seconds.")
+    if config.health_probe_failure_threshold != 2:
+        raise AssertionError("Default failure threshold should require two probes.")
+    if config.health_probe_recovery_threshold != 2:
+        raise AssertionError("Default recovery threshold should require two probes.")
 
     print("Default embedding settings -> ok")
+
+
+def assert_component_health_thresholds() -> None:
+    state = ComponentHealthState(
+        "embedding",
+        failure_threshold=2,
+        recovery_threshold=2,
+    )
+    if state.snapshot(normal_interval=10, degraded_interval=3).degraded:
+        raise AssertionError("Component should start non-degraded.")
+    if state.record_failure(RuntimeError("first failure")):
+        raise AssertionError("First failure should not cross the degrade threshold.")
+    if state.degraded:
+        raise AssertionError("One failure should not mark degraded.")
+    if not state.record_failure(RuntimeError("second failure")):
+        raise AssertionError("Second consecutive failure should mark degraded.")
+    if not state.degraded:
+        raise AssertionError("Component should be degraded after two failures.")
+    if state.record_success():
+        raise AssertionError("First recovery success should not clear degradation.")
+    if state.degraded is False:
+        raise AssertionError("One success should not recover a degraded component.")
+    if not state.record_success():
+        raise AssertionError("Second consecutive success should clear degradation.")
+    if state.degraded:
+        raise AssertionError("Component should recover after two successes.")
+
+    print("Component health thresholds -> ok")
 
 
 def main() -> None:
@@ -874,6 +911,7 @@ def main() -> None:
     assert_prompt_budget_settings()
     assert_default_conversation_summary_budget()
     assert_default_embedding_settings()
+    assert_component_health_thresholds()
 
 
 if __name__ == "__main__":

@@ -97,6 +97,7 @@ function applySessionDetail(session) {
       route: m.route || "",
       routeReason: m.route_reason || "",
       retrievalDegraded: Boolean(m.retrieval_degraded),
+      embeddingDegraded: Boolean(m.embedding_degraded),
       qdrantDegraded: Boolean(m.qdrant_degraded),
       rerankerDegraded: Boolean(m.reranker_degraded),
       degradationReason: m.degradation_reason || "",

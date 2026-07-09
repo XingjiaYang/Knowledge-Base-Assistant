@@ -205,6 +205,14 @@ class FailingReranker(FakeReranker):
         raise RuntimeError("reranker unavailable")
 
 
+class FakeHealthMonitor:
+    def __init__(self, *degraded_components: str) -> None:
+        self.degraded_components = set(degraded_components)
+
+    def is_degraded(self, name: str) -> bool:
+        return name in self.degraded_components
+
+
 class FakeClassifierLLM:
     def __init__(self, response: str) -> None:
         self.response = response
@@ -437,6 +445,59 @@ def assert_pipeline_retrieval_degradation_behavior() -> None:
         raise AssertionError("Reranker should receive coarse recall before fallback.")
 
     print("Retrieval degradation behavior -> ok")
+
+
+def assert_pipeline_health_probe_degradation_behavior() -> None:
+    config = Settings(reranker_enabled=False)
+    llm_client = FakeLLMClient()
+    router = IntentRouter(config, embedder=None, llm_client=None)
+
+    embedding_answer = RAGPipeline(
+        config,
+        vector_store=QdrantFailingVectorStore(),
+        llm_client=llm_client,
+        intent_router=router,
+        reranker=FakeReranker(),
+        health_monitor=FakeHealthMonitor("embedding"),
+    ).answer("新员工如何申请开发设备？", top_k=1, bm25_top_k=4)
+    if not embedding_answer.retrieval_degraded:
+        raise AssertionError("Embedding health degradation should degrade retrieval.")
+    if not embedding_answer.embedding_degraded:
+        raise AssertionError("Embedding health degradation should be exposed.")
+    if embedding_answer.qdrant_degraded:
+        raise AssertionError("Embedding degradation should not mark Qdrant degraded.")
+    if [context.chunk_id for context in embedding_answer.contexts] != [10]:
+        raise AssertionError("Embedding degradation should use BM25-only contexts.")
+
+    qdrant_answer = RAGPipeline(
+        config,
+        vector_store=QdrantFailingVectorStore(),
+        llm_client=llm_client,
+        intent_router=router,
+        reranker=FakeReranker(),
+        health_monitor=FakeHealthMonitor("qdrant"),
+    ).answer("新员工如何申请开发设备？", top_k=1, bm25_top_k=4)
+    if not qdrant_answer.retrieval_degraded or not qdrant_answer.qdrant_degraded:
+        raise AssertionError("Qdrant health degradation should be exposed.")
+    if qdrant_answer.embedding_degraded:
+        raise AssertionError("Qdrant degradation should not mark embedding degraded.")
+
+    reranker_config = Settings(reranker_enabled=True)
+    reranker = FakeReranker()
+    reranker_answer = RAGPipeline(
+        reranker_config,
+        vector_store=SlowParallelVectorStore(),
+        llm_client=llm_client,
+        intent_router=IntentRouter(reranker_config, embedder=None, llm_client=None),
+        reranker=reranker,
+        health_monitor=FakeHealthMonitor("reranker"),
+    ).answer("force retrieval", rag_only=True, top_k=1, rrf_top_k=2)
+    if not reranker_answer.retrieval_degraded or not reranker_answer.reranker_degraded:
+        raise AssertionError("Reranker health degradation should be exposed.")
+    if reranker.calls:
+        raise AssertionError("Degraded reranker should not be called.")
+
+    print("Health probe degradation behavior -> ok")
 
 
 def assert_parallel_hybrid_recall_behavior() -> None:
@@ -813,6 +874,7 @@ def main() -> None:
     assert_llm_fallback_behavior()
     assert_pipeline_search_behavior()
     assert_pipeline_retrieval_degradation_behavior()
+    assert_pipeline_health_probe_degradation_behavior()
     assert_parallel_hybrid_recall_behavior()
 
 
