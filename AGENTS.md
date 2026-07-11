@@ -20,9 +20,8 @@ configurable LLM provider.
 - `scripts/`: operational, smoke-test, and evaluation scripts for local
   services, ingestion, retrieval, routing, prompt budgeting, settings, session
   helpers, and offline intent-router A/B checks.
-- `data/docs/`: replaceable Markdown source documents ingested into Qdrant.
-  The committed corpus is a synthetic Chinese restaurant/business case,
-  including the 巨大历史机遇/巨大历史鲫鱼 meme topic.
+- `data/docs/`: recursively scanned, replaceable Markdown source documents
+  ingested into Qdrant. The current corpus lives under `data/docs/RAGBench/`.
 - `data/eval/`: labeled intent-routing evaluation cases used by
   `scripts/intent_router_ab.py`, including bilingual and cross-lingual slices
   for comparing Jina against other encoders.
@@ -34,8 +33,15 @@ configurable LLM provider.
 ## Build, Test, and Development Commands
 
 - `cp .env.example .env`: create local deployment settings.
-- `docker compose up --build`: build and start PostgreSQL, Qdrant, document
-  ingest, and FastAPI using the configured LLM API.
+- `docker compose up --build`: build and start infrastructure plus the
+  two-phase document pipeline. A temporary embedding worker serves the
+  one-shot `docs-indexer`, exits after alias commit to release CUDA cache, then
+  the online embedding worker and two reranker workers start together before
+  FastAPI becomes ready. Run-scoped ready/failed markers reject stale handoffs.
+- `./scripts/update_docs.sh`: manually apply a running-corpus diff without
+  stopping online GPU actors. A dedicated CPU Ray actor embeds changed chunks,
+  Main builds a candidate BM25S index in parallel, and a retrieval-only gate
+  coordinates the Qdrant alias plus BM25S pointer swap.
 - `APP_PORT=9000 docker compose up --build`: run the frontend/API on a
   different host port.
 - `docker compose up -d --build --force-recreate`: recreate containers after
@@ -56,6 +62,8 @@ configurable LLM provider.
 - `python scripts/test_vector_store.py`: validate lazy loading, recursive
   ingest, payload indexes, score thresholds, BM25 keyword recall, RRF fusion,
   and incremental document replacement.
+- `python scripts/test_document_commit.py`: validate retrieval gate queue/drain
+  behavior and prove reranker/LLM execution remains outside the gate.
 - `python scripts/test_session_store.py`: validate login/session helper
   behavior without a live PostgreSQL service.
 - `python scripts/test_intent_router.py`: smoke-test routing for RAG vs
@@ -136,10 +144,22 @@ Docker daemon proxy settings only affect image pulls, not running containers.
 
 RAG retrieval uses Jina embeddings v5 text small by default:
 `EMBEDDING_MODEL=jinaai/jina-embeddings-v5-text-small`,
-`EMBEDDING_TRUST_REMOTE_CODE=1`, `CHUNK_SIZE=2000`,
-`CHUNK_OVERLAP=300`, query embeddings use `retrieval` with prompt `query`,
+`EMBEDDING_TRUST_REMOTE_CODE=1`, token-aware Markdown chunking reuses its Qwen3
+tokenizer with a 1,600-token body target/hard maximum and up to 100 tokens of
+sentence-aware overlap on each side, yielding a derived 1,800-token assembled
+hard maximum; query embeddings use `retrieval` with prompt `query`,
 document chunks use `retrieval` with prompt `document`, and intent-routing
 embeddings use `classification`.
+Offline S3 indexing batches 64 chunks across document boundaries on
+`ray-worker-embedding-bootstrap`. The worker exits after a validated Qdrant
+alias switch; online query embedding then starts in a fresh process with a
+maximum dynamic batch of 16 and a 10ms collection window.
+Manual incremental updates instead use the `docs-update` profile's CPU-only
+embedding actor while all online actors remain available. Main builds a full
+candidate BM25S index beside the active index. The final gate drains only query
+embedding/BM25/Qdrant/RRF recall, switches the Qdrant alias and active manifest,
+swaps the BM25S reference, and then releases queued recalls. Reranking and LLM
+generation run outside this gate.
 Hybrid recall runs before reranking: BM25 recalls `BM25_TOP_K` keyword
 candidates from Markdown chunks, Qdrant recalls `RECALL_TOP_K`
 cosine-similarity candidates, reciprocal rank fusion keeps `RRF_TOP_K`
@@ -150,7 +170,7 @@ prompt. The API preloads and warms the reranker during startup by default with
 `retrieval_degraded=True`/`reranker_degraded=True` but does not prevent startup.
 Keep Hugging Face cache, mirror, or proxy settings ready before rebuilding
 containers. The browser exposes these limits as `BM25 K`, `Cosine K`, `RRF K`,
-and `Final K`, defaulting to `100`, `100`, `100`, and `5`.
+and `Final K`, defaulting to `100`, `100`, `64`, and `5`.
 
 Retrieval degradation must be explicit. If Qdrant/vector recall fails, RAG falls
 back to BM25-only recall from local Markdown. If reranking fails, the pipeline

@@ -84,6 +84,14 @@ def assert_llm_settings() -> None:
         embedding_classification_task="classification",
         embedding_query_prompt_name="query",
         embedding_passage_prompt_name="document",
+        embedding_dynamic_batch_enabled=True,
+        embedding_dynamic_batch_max_size=16,
+        embedding_dynamic_batch_wait_ms=10.0,
+        embedding_offline_batch_size=64,
+        docs_commit_url="http://main:8080/internal/docs/index",
+        docs_commit_token="test-commit-token",
+        docs_commit_http_timeout_seconds=900.0,
+        docs_commit_drain_timeout_seconds=30.0,
         code_root_dir=Path("/repo/code"),
         code_source_dir=Path("/repo/code/repo-one"),
         code_files_collection="code-file-test",
@@ -163,6 +171,20 @@ def assert_llm_settings() -> None:
         raise AssertionError("Embedding query prompt name should be configurable.")
     if config.embedding_passage_prompt_name != "document":
         raise AssertionError("Embedding passage prompt name should be configurable.")
+    if (
+        not config.embedding_dynamic_batch_enabled
+        or config.embedding_dynamic_batch_max_size != 16
+        or config.embedding_dynamic_batch_wait_ms != 10.0
+        or config.embedding_offline_batch_size != 64
+    ):
+        raise AssertionError("Embedding dynamic batching should be configurable.")
+    if (
+        config.docs_commit_url != "http://main:8080/internal/docs/index"
+        or config.docs_commit_token != "test-commit-token"
+        or config.docs_commit_http_timeout_seconds != 900.0
+        or config.docs_commit_drain_timeout_seconds != 30.0
+    ):
+        raise AssertionError("Document commit coordination should be configurable.")
     if config.code_root_dir != Path("/repo/code"):
         raise AssertionError("Code root directory should be configurable.")
     if config.code_source_dir != Path("/repo/code/repo-one"):
@@ -464,6 +486,9 @@ class FakeSessionStore:
     def append_message(self, *args: object, **kwargs: object) -> None:
         return
 
+    def append_exchange(self, *args: object, **kwargs: object) -> ChatSessionRecord:
+        return self._session(self.user_id)
+
     def update_chat_session_after_answer(
         self,
         session_id: UUID,
@@ -697,8 +722,12 @@ def assert_csv_import_parser() -> None:
 
 def assert_invalid_settings_rejected() -> None:
     invalid_configs = [
-        {"chunk_size": 100, "chunk_overlap": 100},
-        {"chunk_size": 100, "chunk_overlap": 99},
+        {"chunk_tokenizer_model": ""},
+        {"chunk_body_max_tokens": 0},
+        {"chunk_body_target_tokens": 0},
+        {"chunk_body_target_tokens": 1601, "chunk_body_max_tokens": 1600},
+        {"chunk_overlap_target_tokens": -1},
+        {"chunk_overlap_target_tokens": 101, "chunk_overlap_max_tokens": 100},
         {"embedding_model": ""},
         {"llm_retry_attempts": 0},
         {
@@ -715,6 +744,15 @@ def assert_invalid_settings_rejected() -> None:
         {"bm25_top_k": 0},
         {"recall_top_k": 0},
         {"rrf_top_k": 0},
+        {"embedding_offline_batch_size": 0},
+        {"docs_commit_url": "http://main/internal", "docs_commit_token": ""},
+        {"docs_commit_http_timeout_seconds": 0},
+        {"docs_commit_drain_timeout_seconds": 0},
+        {"redis_session_enabled": True, "redis_url": ""},
+        {"redis_session_ttl_seconds": 0},
+        {"redis_auth_cache_ttl_seconds": 0},
+        {"redis_archive_batch_size": 0},
+        {"redis_archive_backlog_max": 0},
         {"code_files_collection": ""},
         {"code_functions_collection": ""},
         {"code_embedding_model": ""},
@@ -819,10 +857,21 @@ def assert_default_conversation_summary_budget() -> None:
 
 def assert_default_embedding_settings() -> None:
     config = Settings()
-    if config.chunk_size != 2000:
-        raise AssertionError("Default chunk size should use Jina-scale context.")
-    if config.chunk_overlap != 300:
-        raise AssertionError("Default chunk overlap should use Jina-scale context.")
+    if config.chunk_tokenizer_model != "jinaai/jina-embeddings-v5-text-small":
+        raise AssertionError("Default chunk tokenizer should reuse the Jina Qwen3 tokenizer.")
+    if config.chunk_body_target_tokens != 1600:
+        raise AssertionError("Default target chunk body should be 1600 tokens.")
+    if config.chunk_body_max_tokens != 1600:
+        raise AssertionError("Default maximum chunk body should be 1600 tokens.")
+    if (
+        config.chunk_overlap_target_tokens != 100
+        or config.chunk_overlap_max_tokens != 100
+    ):
+        raise AssertionError("Default bidirectional overlap should be 100 tokens.")
+    if config.chunk_total_max_tokens != 1800:
+        raise AssertionError("Derived assembled chunk maximum should be 1800 tokens.")
+    if config.embedding_offline_batch_size != 64:
+        raise AssertionError("Offline document embedding should default to batch 64.")
     if config.embedding_model != "jinaai/jina-embeddings-v5-text-small":
         raise AssertionError("Default embedding model should be Jina embeddings v5 text small.")
     if not config.embedding_trust_remote_code:
@@ -867,6 +916,16 @@ def assert_default_embedding_settings() -> None:
     print("Default embedding settings -> ok")
 
 
+def assert_default_retrieval_limits() -> None:
+    config = Settings()
+    if config.rrf_top_k != 64:
+        raise AssertionError("RRF_TOP_K should default to one 64-document rerank call.")
+    if config.reranker_max_documents_per_call != 64:
+        raise AssertionError("The reranker per-call document limit should remain 64.")
+
+    print("Default retrieval limits -> ok")
+
+
 def assert_component_health_thresholds() -> None:
     state = ComponentHealthState(
         "embedding",
@@ -893,6 +952,20 @@ def assert_component_health_thresholds() -> None:
         raise AssertionError("Component should recover after two successes.")
 
     print("Component health thresholds -> ok")
+
+
+def assert_redis_session_defaults() -> None:
+    config = Settings()
+    if config.redis_session_enabled:
+        raise AssertionError("Manual local mode should not require Redis by default.")
+    if config.redis_session_ttl_seconds != 604800:
+        raise AssertionError("Redis active sessions should default to a seven-day TTL.")
+    if config.redis_archive_batch_size != 200:
+        raise AssertionError("Redis archive batches should default to 200 events.")
+    if config.redis_archive_backlog_max != 100000:
+        raise AssertionError("Redis archive backlog protection should default to 100000.")
+
+    print("Redis session defaults -> ok")
 
 
 def assert_reranker_actor_replica_names() -> None:
@@ -936,6 +1009,8 @@ def main() -> None:
     assert_prompt_budget_settings()
     assert_default_conversation_summary_budget()
     assert_default_embedding_settings()
+    assert_default_retrieval_limits()
+    assert_redis_session_defaults()
     assert_component_health_thresholds()
     assert_reranker_actor_replica_names()
 

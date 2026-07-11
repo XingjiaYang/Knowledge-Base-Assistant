@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -25,12 +26,18 @@ from qdrant_client.models import (
 )
 
 from app.config import Settings, settings
-from app.vector_store import VectorStore, chunk_markdown
+from app.document_commit import DocumentIndexCommitter, PreparedIndexCommit
+from app.vector_store import (
+    CHUNKING_VERSION,
+    MarkdownChunk,
+    VectorStore,
+    chunk_markdown,
+)
 
 
 logger = logging.getLogger(__name__)
 
-_MANIFEST_SCHEMA_VERSION = 1
+_MANIFEST_SCHEMA_VERSION = 4
 _S3_METADATA_SHA256 = "content-sha256"
 
 
@@ -141,8 +148,14 @@ class S3DocumentStore:
     def load_active_manifest(self) -> dict[str, object] | None:
         return self._read_json_if_exists(self.active_manifest_key())
 
+    def load_version_manifest(self, index_version: str) -> dict[str, object] | None:
+        return self._read_json_if_exists(self.version_manifest_key(index_version))
+
     def write_active_manifest(self, manifest: dict[str, object]) -> None:
         self._put_json(self.active_manifest_key(), manifest)
+
+    def delete_active_manifest(self) -> None:
+        self.client.delete_object(Bucket=self.bucket, Key=self.active_manifest_key())
 
     def write_version_manifest(self, manifest: dict[str, object]) -> None:
         self._put_json(self.version_manifest_key(str(manifest["index_version"])), manifest)
@@ -389,11 +402,21 @@ class VersionedS3DocumentIndexer:
         self.document_store = document_store or S3DocumentStore(config)
         self.vector_store = vector_store or VectorStore(config)
 
-    def ingest(self, *, recreate: bool = False, dry_run: bool = False) -> S3IngestResult:
+    def ingest(
+        self,
+        *,
+        recreate: bool = False,
+        dry_run: bool = False,
+        committer: DocumentIndexCommitter | None = None,
+    ) -> S3IngestResult:
         self.document_store.ensure_versioning_enabled()
         current_records = self.document_store.list_current_markdown()
         active_manifest = self._load_active_manifest()
-        previous_collection = str(active_manifest.get("qdrant_collection", "")) if active_manifest else ""
+        previous_collection = (
+            str(active_manifest.get("qdrant_collection", ""))
+            if active_manifest
+            else ""
+        )
         previous_docs = self._manifest_docs(active_manifest)
         current_docs = {record.source_doc_id: record for record in current_records}
 
@@ -461,6 +484,7 @@ class VersionedS3DocumentIndexer:
                 "recreate": recreate,
             },
         )
+        manifest["status"] = "processing"
 
         if dry_run:
             return S3IngestResult(
@@ -477,6 +501,16 @@ class VersionedS3DocumentIndexer:
                 total_chunks=0,
                 skipped=False,
             )
+
+        self.document_store.write_version_manifest(manifest)
+        prepare_executor: ThreadPoolExecutor | None = None
+        bm25_future: Future[int] | None = None
+        if committer is not None:
+            prepare_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="bm25-candidate",
+            )
+            bm25_future = prepare_executor.submit(committer.prepare, index_version)
 
         self.document_store.prune_document_versions(
             self.config.docs_s3_processing_retain_versions
@@ -500,7 +534,13 @@ class VersionedS3DocumentIndexer:
             )
             embedded_chunks = self._index_records(
                 new_collection,
-                [*added_records, *modified_records],
+                self._records_selected_from_manifest(
+                    manifest,
+                    {
+                        record.source_doc_id
+                        for record in (*added_records, *modified_records)
+                    },
+                ),
                 index_version=index_version,
             )
             total_chunks = self._collection_count(new_collection)
@@ -511,20 +551,87 @@ class VersionedS3DocumentIndexer:
                     f"expected={expected_chunks} actual={total_chunks}."
                 )
 
+            manifest.update(
+                {
+                    "status": "candidate",
+                    "copied_chunks": copied_chunks,
+                    "embedded_chunks": embedded_chunks,
+                    "total_chunks": total_chunks,
+                }
+            )
             self.document_store.write_version_manifest(manifest)
-            rollback_collection = self._switch_alias(new_collection)
-            alias_switched = True
-            self.document_store.write_active_manifest(manifest)
+            if committer is None:
+                rollback_collection = self._switch_alias(new_collection)
+                alias_switched = True
+                active_payload = {**manifest, "status": "active"}
+                self.document_store.write_active_manifest(active_payload)
+                self.document_store.write_version_manifest(active_payload)
+            else:
+                if bm25_future is None:
+                    raise RuntimeError("BM25S candidate preparation was not started.")
+                manifest["bm25_chunks"] = int(bm25_future.result())
+                self.document_store.write_version_manifest(manifest)
+                rollback_collection = committer.commit(
+                    PreparedIndexCommit(
+                        index_version=index_version,
+                        candidate_collection=new_collection,
+                        previous_collection=active_collection,
+                        expected_total_chunks=total_chunks,
+                    )
+                )
+                alias_switched = True
         except Exception:
             logger.exception(
                 "S3 document ingest failed; rolling back to %s.",
                 rollback_collection or "no previous document alias",
             )
-            if alias_switched:
+            active_now = self._active_collection_name()
+            active_now_manifest = self.document_store.load_active_manifest() or {}
+            commit_visible = (
+                committer is not None
+                and active_now == new_collection
+                and active_now_manifest.get("qdrant_collection") == new_collection
+                and active_now_manifest.get("index_version") == index_version
+            )
+            if commit_visible:
+                logger.warning(
+                    "Treating document commit as successful after an ambiguous "
+                    "coordinator response: index_version=%s.",
+                    index_version,
+                )
+                alias_switched = True
+            elif committer is None and alias_switched:
                 self._rollback_alias(rollback_collection)
-            if new_collection_created:
+                try:
+                    if active_manifest:
+                        self.document_store.write_active_manifest(active_manifest)
+                    else:
+                        self.document_store.delete_active_manifest()
+                except Exception:
+                    logger.exception("Failed to restore the previous S3 manifest.")
+            else:
+                if committer is not None:
+                    if bm25_future is not None:
+                        try:
+                            bm25_future.result()
+                        except Exception:
+                            pass
+                    try:
+                        committer.discard(index_version)
+                    except Exception:
+                        logger.exception(
+                            "Failed to discard Main BM25S candidate %s.",
+                            index_version,
+                        )
+                failed_payload = {**manifest, "status": "failed"}
+                self.document_store.write_version_manifest(failed_payload)
+            if new_collection_created and not commit_visible:
                 self._delete_collection_if_exists(new_collection)
-            raise
+            if not commit_visible:
+                raise
+        finally:
+            if prepare_executor is not None:
+                prepare_executor.shutdown(wait=True, cancel_futures=True)
 
         try:
             self.document_store.prune_document_versions(
@@ -539,6 +646,7 @@ class VersionedS3DocumentIndexer:
 
         with self.vector_store._bm25_lock:  # noqa: SLF001 - same ownership boundary
             self.vector_store._bm25_index = None  # noqa: SLF001
+            self.vector_store._bm25_candidate = None  # noqa: SLF001
 
         return S3IngestResult(
             index_version=index_version,
@@ -554,6 +662,122 @@ class VersionedS3DocumentIndexer:
             total_chunks=total_chunks,
             skipped=False,
         )
+
+    def reconcile_active_manifest(self) -> dict[str, object] | None:
+        active_collection = self._active_collection_name()
+        if not active_collection:
+            return None
+        current = self.document_store.load_active_manifest()
+        if current and current.get("qdrant_collection") == active_collection:
+            return current
+        recovered = self.document_store.find_manifest_by_collection(active_collection)
+        if not recovered:
+            raise RuntimeError(
+                "No S3 manifest matches the active Qdrant collection: "
+                f"{active_collection}."
+            )
+        active_payload = {**recovered, "status": "active"}
+        self.document_store.write_active_manifest(active_payload)
+        self.document_store.write_version_manifest(active_payload)
+        return active_payload
+
+    def commit_prepared_version(
+        self,
+        prepared: PreparedIndexCommit,
+    ) -> dict[str, object]:
+        manifest = self.document_store.load_version_manifest(
+            prepared.index_version
+        )
+        if not manifest:
+            raise RuntimeError(
+                f"Prepared S3 manifest is missing: {prepared.index_version}."
+            )
+        if (
+            manifest.get("index_version") != prepared.index_version
+            or manifest.get("qdrant_collection") != prepared.candidate_collection
+        ):
+            raise RuntimeError("Prepared S3 manifest does not match the commit request.")
+        if str(manifest.get("status", "")) not in {"candidate", "active"}:
+            raise RuntimeError("Prepared S3 manifest is not ready for commit.")
+
+        actual_chunks = self._collection_count(prepared.candidate_collection)
+        if actual_chunks != prepared.expected_total_chunks:
+            raise RuntimeError(
+                "Candidate Qdrant chunk count changed before commit: "
+                f"expected={prepared.expected_total_chunks} actual={actual_chunks}."
+            )
+        active_collection = self._active_collection_name()
+        if active_collection not in {
+            prepared.previous_collection,
+            prepared.candidate_collection,
+        }:
+            raise RuntimeError(
+                "Active Qdrant alias changed during document preparation: "
+                f"expected={prepared.previous_collection} actual={active_collection}."
+            )
+
+        if (
+            active_collection == prepared.candidate_collection
+            and self.vector_store.active_bm25_index_version()
+            == prepared.index_version
+        ):
+            return {
+                "previous_collection": prepared.previous_collection,
+                "active_collection": prepared.candidate_collection,
+                "index_version": prepared.index_version,
+                "bm25_chunks": int(manifest.get("bm25_chunks", 0) or 0),
+                "idempotent": True,
+            }
+
+        previous_manifest = self.document_store.load_active_manifest()
+        if (
+            not previous_manifest
+            or previous_manifest.get("qdrant_collection")
+            != prepared.previous_collection
+        ):
+            previous_manifest = self.document_store.find_manifest_by_collection(
+                prepared.previous_collection
+            )
+
+        alias_changed = active_collection != prepared.candidate_collection
+        try:
+            if alias_changed:
+                self._switch_alias(prepared.candidate_collection)
+            active_payload = {**manifest, "status": "active"}
+            self.document_store.write_active_manifest(active_payload)
+            if self._active_collection_name() != prepared.candidate_collection:
+                raise RuntimeError("Qdrant alias verification failed after commit.")
+            committed_manifest = self.document_store.load_active_manifest() or {}
+            if (
+                committed_manifest.get("index_version") != prepared.index_version
+                or committed_manifest.get("qdrant_collection")
+                != prepared.candidate_collection
+            ):
+                raise RuntimeError("Active S3 manifest verification failed after commit.")
+            self.document_store.write_version_manifest(active_payload)
+            bm25_chunks = self.vector_store.activate_bm25_candidate(
+                prepared.index_version
+            )
+        except Exception:
+            logger.exception(
+                "Atomic document commit failed; restoring collection %s.",
+                prepared.previous_collection or "<none>",
+            )
+            if self._active_collection_name() == prepared.candidate_collection:
+                self._rollback_alias(prepared.previous_collection)
+            if previous_manifest:
+                self.document_store.write_active_manifest(previous_manifest)
+            else:
+                self.document_store.delete_active_manifest()
+            raise
+
+        return {
+            "previous_collection": prepared.previous_collection,
+            "active_collection": prepared.candidate_collection,
+            "index_version": prepared.index_version,
+            "bm25_chunks": bm25_chunks,
+            "idempotent": False,
+        }
 
     def _load_active_manifest(self) -> dict[str, object] | None:
         manifest = self.document_store.load_active_manifest()
@@ -591,14 +815,50 @@ class VersionedS3DocumentIndexer:
             if isinstance(doc, dict) and doc.get("source_doc_id")
         }
 
+    @staticmethod
+    def _records_selected_from_manifest(
+        manifest: dict[str, object],
+        source_doc_ids: set[str],
+    ) -> list[S3DocumentRecord]:
+        records: list[S3DocumentRecord] = []
+        for item in manifest.get("documents", []):
+            if not isinstance(item, dict):
+                continue
+            source_doc_id = str(item.get("source_doc_id", ""))
+            if source_doc_id not in source_doc_ids:
+                continue
+            records.append(
+                S3DocumentRecord(
+                    source_doc_id=source_doc_id,
+                    key=str(item.get("key", "")),
+                    source=str(item.get("source", "")),
+                    version_id=str(item.get("version_id", "")),
+                    etag=str(item.get("etag", "")),
+                    size=int(item.get("size", 0) or 0),
+                    last_modified=str(item.get("last_modified", "")),
+                    content_hash=str(item.get("content_hash", "")),
+                )
+            )
+        return records
+
     def _index_config_changed(self, manifest: dict[str, object] | None) -> bool:
         if not manifest:
             return False
         return (
             manifest.get("embedding_model") != self.config.embedding_model
-            or int(manifest.get("chunk_size", 0) or 0) != self.config.chunk_size
-            or int(manifest.get("chunk_overlap", -1) or -1)
-            != self.config.chunk_overlap
+            or manifest.get("chunking_version") != CHUNKING_VERSION
+            or manifest.get("chunk_tokenizer_model")
+            != self.config.chunk_tokenizer_model
+            or bool(manifest.get("chunk_tokenizer_trust_remote_code", False))
+            != self.config.chunk_tokenizer_trust_remote_code
+            or int(manifest.get("chunk_body_target_tokens", 0) or 0)
+            != self.config.chunk_body_target_tokens
+            or int(manifest.get("chunk_body_max_tokens", 0) or 0)
+            != self.config.chunk_body_max_tokens
+            or int(manifest.get("chunk_overlap_target_tokens", -1) or -1)
+            != self.config.chunk_overlap_target_tokens
+            or int(manifest.get("chunk_overlap_max_tokens", -1) or -1)
+            != self.config.chunk_overlap_max_tokens
             or manifest.get("embedding_passage_task")
             != self.config.embedding_passage_task
             or manifest.get("embedding_passage_prompt_name")
@@ -625,8 +885,17 @@ class VersionedS3DocumentIndexer:
             "time_ns": time.time_ns(),
             "records": [asdict(record) for record in current_records],
             "embedding_model": self.config.embedding_model,
-            "chunk_size": self.config.chunk_size,
-            "chunk_overlap": self.config.chunk_overlap,
+            "chunking_version": CHUNKING_VERSION,
+            "chunk_tokenizer_model": self.config.chunk_tokenizer_model,
+            "chunk_tokenizer_trust_remote_code": (
+                self.config.chunk_tokenizer_trust_remote_code
+            ),
+            "chunk_body_target_tokens": self.config.chunk_body_target_tokens,
+            "chunk_body_max_tokens": self.config.chunk_body_max_tokens,
+            "chunk_overlap_target_tokens": (
+                self.config.chunk_overlap_target_tokens
+            ),
+            "chunk_overlap_max_tokens": self.config.chunk_overlap_max_tokens,
         }
         digest = hashlib.sha256(
             json.dumps(payload, sort_keys=True).encode("utf-8")
@@ -658,8 +927,17 @@ class VersionedS3DocumentIndexer:
             "embedding_model": self.config.embedding_model,
             "embedding_passage_task": self.config.embedding_passage_task,
             "embedding_passage_prompt_name": self.config.embedding_passage_prompt_name,
-            "chunk_size": self.config.chunk_size,
-            "chunk_overlap": self.config.chunk_overlap,
+            "chunking_version": CHUNKING_VERSION,
+            "chunk_tokenizer_model": self.config.chunk_tokenizer_model,
+            "chunk_tokenizer_trust_remote_code": (
+                self.config.chunk_tokenizer_trust_remote_code
+            ),
+            "chunk_body_target_tokens": self.config.chunk_body_target_tokens,
+            "chunk_body_max_tokens": self.config.chunk_body_max_tokens,
+            "chunk_overlap_target_tokens": (
+                self.config.chunk_overlap_target_tokens
+            ),
+            "chunk_overlap_max_tokens": self.config.chunk_overlap_max_tokens,
             "documents": [asdict(record) for record in current_records],
             "diff": diff,
         }
@@ -762,69 +1040,111 @@ class VersionedS3DocumentIndexer:
         index_version: str,
     ) -> int:
         inserted = 0
+        pending: list[tuple[S3DocumentRecord, int, MarkdownChunk]] = []
         for record in records:
             text = self.document_store.read_markdown(record)
             chunks = chunk_markdown(
                 text,
-                chunk_size=self.config.chunk_size,
-                overlap=self.config.chunk_overlap,
+                tokenizer=self.vector_store.chunk_tokenizer,
+                body_target_tokens=self.config.chunk_body_target_tokens,
+                body_max_tokens=self.config.chunk_body_max_tokens,
+                overlap_target_tokens=self.config.chunk_overlap_target_tokens,
+                overlap_max_tokens=self.config.chunk_overlap_max_tokens,
             )
             if not chunks:
                 continue
+            for idx, chunk in enumerate(chunks):
+                pending.append((record, idx, chunk))
+                if len(pending) >= self.config.embedding_offline_batch_size:
+                    inserted += self._embed_and_upsert_chunks(
+                        collection_name,
+                        pending,
+                        index_version=index_version,
+                    )
+                    pending = []
 
-            embeddings = self.vector_store._encode_matrix(  # noqa: SLF001
-                [chunk.embedding_text for chunk in chunks],
-                normalize_embeddings=True,
-                task=self.config.embedding_passage_task,
-                prompt_name=self.config.embedding_passage_prompt_name,
+        if pending:
+            inserted += self._embed_and_upsert_chunks(
+                collection_name,
+                pending,
+                index_version=index_version,
             )
-            points: list[PointStruct] = []
+        return inserted
+
+    def _embed_and_upsert_chunks(
+        self,
+        collection_name: str,
+        pending: list[tuple[S3DocumentRecord, int, MarkdownChunk]],
+        *,
+        index_version: str,
+    ) -> int:
+        embeddings = self.vector_store._encode_matrix(  # noqa: SLF001
+            [chunk.embedding_text for _record, _idx, chunk in pending],
+            normalize_embeddings=True,
+            task=self.config.embedding_passage_task,
+            prompt_name=self.config.embedding_passage_prompt_name,
+        )
+        if len(embeddings) != len(pending):
+            raise RuntimeError("Offline embedding batch returned an unexpected row count.")
+
+        points: list[PointStruct] = []
+        for (record, idx, chunk), embedding in zip(
+            pending,
+            embeddings,
+            strict=True,
+        ):
             source_key = f"s3://{self.config.docs_s3_bucket}/{record.key}"
             version_id = record.version_id or record.etag or record.content_hash
-            for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-                point_id = str(
-                    uuid5(
-                        NAMESPACE_URL,
-                        f"{record.source_doc_id}:{version_id}:{idx}",
-                    )
+            point_id = str(
+                uuid5(
+                    NAMESPACE_URL,
+                    f"{record.source_doc_id}:{version_id}:{idx}",
                 )
-                points.append(
-                    PointStruct(
-                        id=point_id,
-                        vector=embedding,
-                        payload={
-                            "source": record.source,
-                            "source_key": source_key,
-                            "source_doc_id": record.source_doc_id,
-                            "version_id": version_id,
-                            "s3_bucket": self.config.docs_s3_bucket,
-                            "s3_key": record.key,
-                            "s3_version_id": record.version_id,
-                            "etag": record.etag,
-                            "content_hash": record.content_hash,
-                            "object_size": record.size,
-                            "source_last_modified": record.last_modified,
-                            "index_version": index_version,
-                            "chunk_id": idx,
-                            "text": chunk.text,
-                            "content_type": chunk.content_type,
-                            "h1": chunk.h1,
-                            "h2": chunk.h2,
-                            "h3": chunk.h3,
-                            "headings": list(chunk.headings),
-                            "start_line": chunk.start_line,
-                            "end_line": chunk.end_line,
-                        },
-                    )
-                )
-
-            self.vector_store.client.upsert(
-                collection_name=collection_name,
-                points=points,
-                wait=True,
             )
-            inserted += len(points)
-        return inserted
+            points.append(
+                PointStruct(
+                    id=point_id,
+                    vector=embedding,
+                    payload={
+                        "source": record.source,
+                        "source_key": source_key,
+                        "source_doc_id": record.source_doc_id,
+                        "version_id": version_id,
+                        "s3_bucket": self.config.docs_s3_bucket,
+                        "s3_key": record.key,
+                        "s3_version_id": record.version_id,
+                        "etag": record.etag,
+                        "content_hash": record.content_hash,
+                        "object_size": record.size,
+                        "source_last_modified": record.last_modified,
+                        "index_version": index_version,
+                        "chunk_id": idx,
+                        "text": chunk.text,
+                        "content_type": chunk.content_type,
+                        "h1": chunk.h1,
+                        "h2": chunk.h2,
+                        "h3": chunk.h3,
+                        "headings": list(chunk.headings),
+                        "start_line": chunk.start_line,
+                        "end_line": chunk.end_line,
+                        "body_token_count": chunk.body_token_count,
+                        "prefix_overlap_token_count": (
+                            chunk.prefix_overlap_token_count
+                        ),
+                        "suffix_overlap_token_count": (
+                            chunk.suffix_overlap_token_count
+                        ),
+                        "token_count": chunk.token_count,
+                    },
+                )
+            )
+
+        self.vector_store.client.upsert(
+            collection_name=collection_name,
+            points=points,
+            wait=True,
+        )
+        return len(points)
 
     def _switch_alias(self, new_collection: str) -> str:
         active_collection = self._active_collection_name()

@@ -8,8 +8,10 @@ networkx==3.6.1
 numpy==2.3.5
 peft==0.18.0
 psycopg[binary]==3.3.2
+PyYAML==6.0.3
 qdrant-client==1.18.0
 ray==2.55.1
+redis[hiredis]==8.0.1
 sentence-transformers==5.1.2
 torch==2.12.1
 tree-sitter-language-pack==0.13.0

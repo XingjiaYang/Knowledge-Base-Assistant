@@ -8,34 +8,31 @@ between retrieval-augmented answers grounded in the indexed corpus and direct
 chat for requests that do not need retrieval.
 
 Qdrant provides vector search, a local BM25 index provides keyword recall,
-PostgreSQL stores required user accounts and account-scoped chat sessions,
+Redis serves active chat sessions while PostgreSQL archives complete history,
 SentenceTransformers generates embeddings, and FastAPI serves both the API and
 browser UI. Generation is provider-configurable: the default setup targets an
 OpenAI-compatible cloud API, Anthropic is supported, and a local vLLM service
 remains available as an optional Docker Compose profile.
 
-The repository currently ships with a synthetic restaurant/business case corpus
-about 家是本, 朱剑秋, the Yongge livestream incident, menu pricing, customer
-reviews, social-media reactions, financial simulation, and the 巨大历史机遇/巨大历史鲫鱼
-slogan meme. The corpus is
-intentionally niche so retrieval grounding matters more than pretrained model
-memory. The intent router keeps its embedding layer domain-general, while the
-keyword layer and LLM fallback prompt include lightweight corpus-specific
-boundaries that should be updated when `data/docs/` is replaced.
+The repository currently ships with 102 long-form contract documents from the
+RAGBench `cuad` test split under `data/docs/RAGBench/`. The corresponding source
+records and 500 labeled queries live under `RAGBench_Eval/`. Retrieval benchmark
+requests should enable `RAG-only` so intent-routing accuracy is measured
+separately from document recall.
 
 ## Highlights
 
-- Docker Compose deployment for PostgreSQL, Qdrant, local MinIO S3 storage,
-  Ray model workers, and FastAPI.
+- Docker Compose deployment for Redis, PostgreSQL, PgBouncer, Qdrant, local
+  MinIO S3 storage, Ray model workers, and FastAPI.
 - Configurable cloud LLM providers with an optional local vLLM profile.
 - Jina embeddings v5 text small by default, with task/prompt routing for
   retrieval-query, retrieval-passage, and classification embeddings.
-- Replaceable Markdown corpus with isolated keyword hints for the bundled
-  domain.
+- Replaceable Markdown corpus with a `RAG-only` benchmark mode that separates
+  retrieval evaluation from application-specific intent hints.
 - Chat-style web UI at `/` with adjustable BM25, cosine, RRF, and final context
   counts.
-- Required account login with PostgreSQL-backed chat sessions per user and an
-  admin UI for user/data management.
+- Required account login with Redis-hot, PostgreSQL-archived sessions per user
+  and an admin UI for user/data management.
 - Admin CSV import for batch user creation with strict `email,passwd` format
   validation.
 - Intent routing avoids vector search for clear direct-chat questions.
@@ -56,7 +53,8 @@ boundaries that should be updated when `data/docs/` is replaced.
 Browser UI
    |
 FastAPI /auth, /sessions, /rag
-   |-- PostgreSQL users, login tokens, chat sessions, messages, summaries
+   |-- Redis active sessions + pending archive stream
+   |-- PostgreSQL users, settings, and complete session archive
    |
 IntentRouter
    |-- keyword rules and previous-route strong follow-up state
@@ -80,6 +78,11 @@ Main modules:
 - `app/session_store.py`: PostgreSQL-backed users, login tokens, chat sessions,
   messages, runtime LLM settings, route metadata, and compacted conversation
   summaries.
+- `app/redis_session_store.py`: active-session cache, auth-token cache, pending
+  overlays, atomic archive-stream writes, consistent cold loading, and strict
+  HTTP 503 responses when Redis session state is unavailable.
+- `app/session_archive.py`: independent Redis Stream consumer that archives
+  exchanges to PostgreSQL idempotently before acknowledging and clearing them.
 - `app/intent_router.py`: keyword/state, Jina-classification embedding, and
   tagged LLM fallback routing.
 - `app/rag.py`: hybrid recall, RRF fusion, reranking, prompt construction, and
@@ -149,7 +152,8 @@ local development. If the PostgreSQL volume already contains an `admin` user,
 startup keeps that user's existing password. PostgreSQL runs inside Docker
 Compose; you do not need to install PostgreSQL on the host.
 
-Start PostgreSQL, Qdrant, MinIO-backed S3 storage, and the API:
+Start Redis, the session archiver, PostgreSQL, PgBouncer, Qdrant, MinIO-backed
+S3 storage, and the API:
 
 ```bash
 docker compose up --build
@@ -191,7 +195,7 @@ Stop services:
 docker compose down
 ```
 
-Reset persisted PostgreSQL, Qdrant, MinIO, and Hugging Face cache volumes:
+Reset persisted Redis, PostgreSQL, Qdrant, MinIO, and Hugging Face cache volumes:
 
 ```bash
 docker compose down -v
@@ -199,27 +203,45 @@ docker compose down -v
 
 ## Startup Behavior
 
-`compose.yaml` starts nine long-running services and one one-shot initializer
-by default:
+`compose.yaml` starts twelve long-running services plus three ordered startup
+services by default:
 
 - `postgres`: runs PostgreSQL inside Docker and stores users, login tokens, and
   chat sessions in the `postgres_data` Docker volume.
+- `pgbouncer`: provides transaction-mode connection pooling between `main` and
+  PostgreSQL, accepting short-lived application connections while reusing a
+  bounded set of PostgreSQL server connections.
+- `redis`: serves active chat sessions from a 32 GB `volatile-lru` cache and
+  persists non-evictable pending/archive data with AOF `everysec`.
+- `session-archiver`: independently consumes Redis archive events, commits
+  idempotent batches through PgBouncer, then clears Pending and Stream entries.
 - `qdrant`: stores vectors in the `qdrant_storage` Docker volume.
 - `minio`: provides local S3-compatible object storage in the `minio_data`
   Docker volume.
 - `minio-init`: creates the configured document bucket and enables S3 object
-  versioning before the API starts.
+  versioning.
 - `ray-head`: owns the Ray cluster control plane and Ray client endpoint.
-- `ray-worker-embedding-1`: runs the named document embedding actor and is
-  tagged with Ray resource `ray_worker_embedding`.
+- `ray-worker-embedding-bootstrap`: temporary GPU worker used only for offline
+  document embedding. It exits after a successful index build, destroying its
+  CUDA context and retained allocator cache.
+- `docs-indexer`: one-shot CPU chunker and index coordinator. It syncs Markdown
+  into MinIO, creates 64-chunk cross-document embedding batches through Ray,
+  validates the candidate Qdrant collection, and atomically switches the alias.
+- `ray-worker-embedding-ingest-cpu` and `docs-updater`: on-demand services under
+  the `docs-update` profile. They build an incremental candidate with a unique
+  CPU-only Ray embedding actor while the online GPU actors continue serving.
+- `ray-worker-embedding-1`: runs the named document embedding actor, performs
+  bounded online query micro-batching (`16` requests / `10ms`), and starts only
+  after the bootstrap embedding worker has exited.
 - `ray-worker-reranker-1` and `ray-worker-reranker-2`: run two reranker actor
-  replicas, pinned to Ray resources `ray_worker_reranker_1` and
-  `ray_worker_reranker_2`.
+  replicas. They start in parallel with the online embedding worker after
+  offline indexing releases the GPU.
 - `autoheal`: watches Docker healthchecks and restarts services that are safe
-  to heal as a single container, such as `qdrant` and `main`.
-- `main`: waits for Qdrant, PostgreSQL, and MinIO initialization, optionally
-  runs document initialization, connects to Ray, and starts FastAPI on
-  container port `8080`.
+  to heal as a single container, such as `redis`, `session-archiver`,
+  `pgbouncer`, `qdrant`, and `main`.
+- `main`: starts alongside the infrastructure but holds Uvicorn behind the
+  current startup-run marker. It connects to Ray and serves FastAPI only after
+  the document index is committed and the online model workers are released.
 
 Docker service architecture:
 
@@ -230,88 +252,149 @@ flowchart TD
     subgraph Compose["Docker Compose network"]
         Main
         PG["postgres<br/>PostgreSQL<br/>users / sessions / messages / settings"]
+        PgBouncer["pgbouncer<br/>transaction connection pool<br/>reuses PostgreSQL server connections"]
+        Redis["redis<br/>32 GB volatile-lru hot sessions<br/>AOF everysec + non-evictable Pending/Stream"]
+        Archiver["session-archiver<br/>Redis consumer group<br/>idempotent PG batch archive"]
         Qdrant["qdrant<br/>Qdrant<br/>vector collections + aliases"]
         MinIO["minio<br/>S3-compatible object store<br/>versioned docs"]
         MinIOInit["minio-init<br/>one-shot bucket init<br/>enable versioning"]
         RayHead["ray-head<br/>Ray control plane<br/>ray://ray-head:10001"]
-        EmbedWorker["ray-worker-embedding-1<br/>Ray worker<br/>resource: ray_worker_embedding<br/>hosts kba_embedding actor"]
+        BootstrapEmbed["ray-worker-embedding-bootstrap<br/>temporary offline GPU worker<br/>embedding batch: 64"]
+        DocsIndexer["docs-indexer<br/>one-shot Qwen3 chunker<br/>S3 sync + candidate index + alias switch"]
+        CpuIngest["ray-worker-embedding-ingest-cpu<br/>docs-update profile<br/>CPU-only Ray worker"]
+        DocsUpdater["docs-updater<br/>docs-update profile<br/>manifest diff + candidate coordinator"]
+        EmbedWorker["ray-worker-embedding-1<br/>Ray worker: ray_worker_embedding<br/>kba_embedding actor<br/>query batch: max 16 / wait 10 ms"]
         RerankWorker1["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker_1<br/>hosts kba_reranker_1 actor"]
         RerankWorker2["ray-worker-reranker-2<br/>Ray worker<br/>resource: ray_worker_reranker_2<br/>hosts kba_reranker_2 actor"]
-        HealthSupervisor["main health supervisor<br/>embedding / qdrant / reranker<br/>independent lightweight probes"]
+        BM25Manager["main BM25S manager<br/>active + candidate indexes<br/>atomic reference swap"]
+        HealthSupervisor["main health supervisor<br/>redis / embedding / qdrant / reranker<br/>independent lightweight probes"]
         Autoheal["autoheal<br/>Docker healthcheck watcher<br/>restarts unhealthy containers"]
         VLLM["vllm<br/>optional local-llm profile<br/>OpenAI-compatible LLM server"]
     end
 
-    Main --> PG
+    Main --> Redis
+    Main --> PgBouncer
+    Redis --> Archiver
+    Archiver --> PgBouncer
+    PgBouncer --> PG
     Main --> Qdrant
     Main --> MinIO
     Main --> RayHead
+    Main --> BM25Manager
     MinIOInit --> MinIO
+    MinIOInit --> DocsIndexer
+    RayHead --> BootstrapEmbed
+    DocsIndexer --> MinIO
+    DocsIndexer --> BootstrapEmbed
+    DocsIndexer --> Qdrant
+    DocsIndexer --> StartupState["startup_state<br/>docs-ready / docs-failed / offline-stopped UUID"]
+    StartupState --> Main
+    StartupState --> BootstrapEmbed
+    BootstrapEmbed -- "exit: release CUDA cache" --> EmbedWorker
+    BootstrapEmbed -- "exit: release GPU" --> RerankWorker1
+    BootstrapEmbed -- "exit: release GPU" --> RerankWorker2
     RayHead --> EmbedWorker
     RayHead --> RerankWorker1
     RayHead --> RerankWorker2
+    RayHead -. "docs-update profile" .-> CpuIngest
+    DocsUpdater -. "docs-update profile" .-> CpuIngest
+    DocsUpdater -. "sync + version manifests" .-> MinIO
+    DocsUpdater -. "candidate vectors" .-> Qdrant
+    DocsUpdater -. "prepare / commit" .-> Main
+    DocsUpdater -. "run-scoped ready / failed" .-> StartupState
     Main --> HealthSupervisor
     HealthSupervisor -. "collection / alias metadata" .-> Qdrant
+    HealthSupervisor -. "PING" .-> Redis
     HealthSupervisor -. "embedding actor readiness" .-> EmbedWorker
     HealthSupervisor -. "parallel reranker readiness<br/>any replica healthy" .-> RerankWorker1
     HealthSupervisor -. "parallel reranker readiness<br/>any replica healthy" .-> RerankWorker2
     Autoheal -. healthcheck .-> Main
+    Autoheal -. healthcheck .-> Redis
+    Autoheal -. healthcheck .-> Archiver
+    Autoheal -. healthcheck .-> PgBouncer
     Autoheal -. healthcheck .-> Qdrant
     Main -. optional .-> VLLM
     Main --> CloudLLM["Cloud LLM API<br/>OpenAI-compatible / Anthropic"]
 
     subgraph Volumes["Docker volumes and bind mounts"]
         PGVol["postgres_data"]
+        RedisVol["redis_data<br/>AOF"]
         QVol["qdrant_storage"]
         S3Vol["minio_data"]
         HFVol["huggingface_cache"]
+        StartupVol["startup_state<br/>per-run handoff"]
         DataBind["./data:/app/data:ro"]
         ModelsBind["./models:/models:ro"]
     end
 
     PG --> PGVol
+    Redis --> RedisVol
     Qdrant --> QVol
     MinIO --> S3Vol
     Main --> DataBind
     Main --> HFVol
+    Main --> StartupVol
     Main --> ModelsBind
     EmbedWorker --> HFVol
     EmbedWorker --> ModelsBind
+    DocsIndexer --> DataBind
+    DocsIndexer --> HFVol
+    DocsIndexer --> StartupVol
+    BootstrapEmbed --> HFVol
+    BootstrapEmbed --> StartupVol
     RerankWorker1 --> HFVol
     RerankWorker1 --> ModelsBind
     RerankWorker2 --> HFVol
     RerankWorker2 --> ModelsBind
+    CpuIngest --> HFVol
+    CpuIngest --> ModelsBind
+    CpuIngest --> StartupVol
+    DocsUpdater --> DataBind
+    DocsUpdater --> HFVol
+    DocsUpdater --> StartupVol
 ```
 
-Startup and image-bound document initialization:
+Two-phase startup and image/config-bound document initialization:
 
 ```mermaid
 flowchart TD
     A["docker compose up --build"] --> B["Build main image"]
-    B --> C["Bake DOCS_INIT_BUILD_ID into /app/.image_build_id"]
-    A --> D["Start postgres"]
-    A --> E["Start qdrant"]
-    A --> F["Start minio"]
-    A --> R["Start Ray head and model workers"]
-    F --> G["minio-init creates bucket and enables versioning"]
-    D --> H["main entrypoint waits for PostgreSQL"]
-    E --> H
-    G --> H
-    R --> H
-    H --> I{"DOCS_SOURCE=s3 and DOCS_INIT_ON_IMAGE_BUILD=1?"}
-    I -- "no" --> J["Skip automatic document initialization"]
-    I -- "yes" --> K{"Build id already marked in S3 or local marker?"}
-    K -- "yes" --> J
-    K -- "no" --> L["Sync DOCS_DIR Markdown files into S3"]
-    L --> M["Build versioned Qdrant document index"]
-    M --> N["Write build-init marker"]
-    J --> O["Start FastAPI"]
-    N --> O
+    B --> C["COPY data/docs and bake /app/.image_build_id"]
+    A --> Infra["Start main, PostgreSQL/Redis, qdrant, minio and ray-head concurrently"]
+    Infra --> Bucket["minio-init creates versioned bucket"]
+    Infra --> Offline["Start ray-worker-embedding-bootstrap<br/>write startup run UUID"]
+    Offline --> MainWait["main starts and waits for matching offline-stopped UUID"]
+    Bucket --> Indexer["Start one-shot docs-indexer"]
+    Offline --> Indexer
+    Indexer --> Marker{"Image build id + index config fingerprint unchanged?"}
+    Marker -- "yes" --> Ready["Write matching ready UUID"]
+    Marker -- "no" --> Sync["Sync current Markdown set to MinIO<br/>including deleted-file detection"]
+    Indexer -. "error" .-> Failed["Write matching docs-failed UUID<br/>abort main startup without waiting for timeout"]
+    Sync --> Chunk["CPU Qwen3 tokenizer chunking<br/>body 1600 + overlap 100/100"]
+    Chunk --> Batch["Offline embedding batches across documents<br/>batch size 64"]
+    Batch --> Candidate["Write and validate candidate Qdrant collection"]
+    Candidate --> Alias["Atomically switch collection alias<br/>write S3 manifests"]
+    Alias --> Ready
+    Ready --> Stop["Bootstrap embedding worker exits<br/>CUDA context/cache destroyed"]
+    Stop --> Online["Start online embedding worker<br/>query dynamic batch 16 / 10ms"]
+    Stop --> RR1["Start reranker replica 1"]
+    Stop --> RR2["Start reranker replica 2"]
+    Stop --> MainWarm["main passes startup gate<br/>warm online actors"]
+    Online --> MainWarm
+    RR1 --> MainWarm
+    RR2 --> MainWarm
+    MainWarm --> API["Uvicorn/FastAPI ready"]
 ```
 
 Plain `docker compose restart` does not rescan local Markdown. A new image build
-id, or an explicit `DOCS_INIT_BUILD_ID` change, is what makes the S3
-initialization path run again during startup.
+id or changed index-config fingerprint makes `docs-indexer` sync and run the
+manifest diff; it rebuilds only when the corpus or index configuration changed.
+The image copies `data/docs`, so changing the corpus invalidates the build layer
+and produces a new build id. A same-image Compose restart checks only the S3
+marker and does not sync or diff local Markdown. Because BM25S is process-local
+memory, restarting `main` reconstructs only the active BM25S index from the
+already committed S3 manifest; it does not embed documents, create a collection,
+or move the Qdrant alias.
 
 The `vllm` service is optional and only starts under the `local-llm` profile:
 
@@ -328,15 +411,22 @@ docker compose --profile local-llm up --build
 Important startup flags:
 
 ```bash
-INGEST_ON_STARTUP=0      # manual document ingest is the default
-INGEST_USE_RAY=1         # document ingest embeddings run on Ray workers
+INGEST_ON_STARTUP=0      # main never performs Compose startup ingest
+INGEST_USE_RAY=1         # manual ingest embeddings still use Ray
 RECREATE_COLLECTION=0    # local mode: rebuild collection; S3 mode: rebuild version
-DOCS_INIT_ON_IMAGE_BUILD=1 # S3 mode: initialize docs once per image build id
-DOCS_INIT_DELETE_REMOVED=1 # S3 build init removes remote docs missing locally
+DOCS_INIT_DELETE_REMOVED=1 # docs-indexer removes remote docs missing locally
+EMBEDDING_OFFLINE_BATCH_SIZE=64 # cross-document build/update batches
+EMBEDDING_DYNAMIC_BATCH_MAX_SIZE=16 # online cross-request query batch
+EMBEDDING_DYNAMIC_BATCH_WAIT_MS=10  # online batch collection window
 WAIT_FOR_LLM=0           # set to 1 when a local LLM service must be ready first
 APP_PORT=8080            # host port mapped to FastAPI/UI
 QDRANT_IMAGE=qdrant/qdrant:v1.18.1
 POSTGRES_IMAGE=postgres:17-alpine
+PGBOUNCER_IMAGE=edoburu/pgbouncer:v1.25.2-p0
+REDIS_IMAGE=redis:8.2.7-alpine3.22
+REDIS_MAXMEMORY=32gb
+REDIS_CONTAINER_MEMORY_LIMIT=48g
+REDIS_CONTAINER_MEMORY_RESERVATION=36g
 MINIO_IMAGE=minio/minio:latest
 AUTOHEAL_IMAGE=willfarrell/autoheal:1.2.0
 AUTOHEAL_INTERVAL=10
@@ -354,6 +444,16 @@ HEALTH_PROBE_DEGRADED_INTERVAL_SECONDS=3
 HEALTH_PROBE_TIMEOUT_SECONDS=2
 HEALTH_PROBE_FAILURE_THRESHOLD=2
 HEALTH_PROBE_RECOVERY_THRESHOLD=2
+PGBOUNCER_POOL_MODE=transaction
+PGBOUNCER_MAX_CLIENT_CONN=200
+PGBOUNCER_DEFAULT_POOL_SIZE=20
+PGBOUNCER_MIN_POOL_SIZE=2
+PGBOUNCER_RESERVE_POOL_SIZE=5
+PGBOUNCER_MAX_PREPARED_STATEMENTS=100
+REDIS_SESSION_ENABLED=1
+REDIS_SESSION_TTL_SECONDS=604800
+REDIS_ARCHIVE_BATCH_SIZE=200
+REDIS_ARCHIVE_BACKLOG_MAX=100000
 ```
 
 For fast restarts after the image has already been built:
@@ -411,15 +511,16 @@ docker compose up -d --build
 ```
 
 Startup does not scan local Markdown on ordinary restarts. In local mode, run
-`python scripts/ingest_docs.py` manually. In S3 mode, the container initializes
-documents only once per Docker image build id: `docker compose up --build`
-creates the image marker, the first container start syncs `DOCS_DIR` to S3 and
-builds the versioned index, and later `docker compose restart` runs skip
-without scanning. If you need to force S3 initialization without changing source
-files, set `DOCS_INIT_BUILD_ID` to a new value before `docker compose up
---build`. Code indexes are built on demand: open the browser UI, switch to
-`Code`, select the repository under `data/code`, and click `Index`. Selecting
-`All code folders` indexes every discovered repository under `CODE_ROOT_DIR`.
+`python scripts/ingest_docs.py` manually. In S3 mode, `docs-indexer` initializes
+documents once per Docker image build id and index-configuration fingerprint:
+`docker compose up --build` creates the image marker, syncs `DOCS_DIR` when the
+marker or fingerprint changes, and builds a versioned index. Later
+`docker compose restart` runs skip local sync and diff. To force initialization
+without changing source files, set `DOCS_INIT_BUILD_ID` to a new value before
+`docker compose up --build`. Code indexes are built on demand: open the browser
+UI, switch to `Code`, select the repository under `data/code`, and click
+`Index`. Selecting `All code folders` indexes every discovered repository under
+`CODE_ROOT_DIR`.
 
 The same operation is available through the API after retrieving an auth token
 as shown below:
@@ -545,7 +646,6 @@ DOCS_S3_REQUIRE_VERSIONING=1
 DOCS_S3_RETAIN_VERSIONS=5
 DOCS_S3_PROCESSING_RETAIN_VERSIONS=6
 DOCS_S3_MANIFEST_PREFIX=_kba/manifests/docs
-DOCS_INIT_ON_IMAGE_BUILD=1
 DOCS_INIT_DELETE_REMOVED=1
 QDRANT_COLLECTION=tech_docs
 QDRANT_RETAIN_VERSIONS=2
@@ -558,13 +658,21 @@ EMBEDDING_CLASSIFICATION_TASK=classification
 EMBEDDING_QUERY_PROMPT_NAME=query
 EMBEDDING_PASSAGE_PROMPT_NAME=document
 EMBEDDING_CLASSIFICATION_PROMPT_NAME=
+EMBEDDING_DYNAMIC_BATCH_ENABLED=1
+EMBEDDING_DYNAMIC_BATCH_MAX_SIZE=16
+EMBEDDING_DYNAMIC_BATCH_WAIT_MS=10
+EMBEDDING_OFFLINE_BATCH_SIZE=64
 BM25_TOP_K=100
 RECALL_TOP_K=100
-RRF_TOP_K=100
+RRF_TOP_K=64
 RETRIEVE_TOP_K=5
 RETRIEVE_SCORE_THRESHOLD=0
-CHUNK_SIZE=2000
-CHUNK_OVERLAP=300
+CHUNK_TOKENIZER_MODEL=jinaai/jina-embeddings-v5-text-small
+CHUNK_TOKENIZER_TRUST_REMOTE_CODE=1
+CHUNK_BODY_TARGET_TOKENS=1600
+CHUNK_BODY_MAX_TOKENS=1600
+CHUNK_OVERLAP_TARGET_TOKENS=100
+CHUNK_OVERLAP_MAX_TOKENS=100
 RERANKER_ENABLED=1
 RERANKER_MODEL=jinaai/jina-reranker-v3
 RERANKER_PRELOAD=1
@@ -616,6 +724,22 @@ summary views rather than the full API-scale conversation summary. These intent
 budgets are character-based safeguards; if the encoder still raises, the router
 falls through to the LLM classifier instead of failing the request.
 
+Online single-query embedding calls are dynamically coalesced inside the Ray
+Embedding Actor. The default batcher waits at most 10 ms and submits up to 16
+compatible queries together; a full batch executes immediately without waiting
+for the deadline. Requests are grouped by task, prompt, and
+normalization mode, so classification and retrieval inputs are never mixed.
+The one-shot `docs-indexer` bypasses this queue and accumulates chunks across
+document boundaries into `EMBEDDING_OFFLINE_BATCH_SIZE=64` requests on the
+bootstrap actor. After alias commit, the bootstrap worker exits; the online
+actor therefore starts with a fresh CUDA allocator instead of inheriting the
+offline peak. The model's 32K context limit applies to each sequence, not to the sum
+of all sequences in a GPU batch. The actor's lightweight `health()` response
+and the retrieval benchmark expose the configured size, wait time, queue depth,
+batch count, request count, and observed average batch size.
+`SEARCH_QUERY_MAX_CHARS=3000` remains the retrieval-query character guard and
+is independent of the model's token limit.
+
 Intent routing is state-aware without feeding all history to every layer. The
 first keyword layer routes general technical/database topics outside the local
 corpus to direct chat, and uses the previous assistant route metadata only for
@@ -648,7 +772,7 @@ Qdrant, fuses both ranked lists with reciprocal rank fusion, keeps
 `RRF_TOP_K` fused candidates, reranks those candidates with the multilingual
 `jinaai/jina-reranker-v3` cross-encoder, then keeps `RETRIEVE_TOP_K` chunks for
 the LLM prompt and response references. The browser UI exposes these values as
-`BM25 K`, `Cosine K`, `RRF K`, and `Final K`; defaults are `100`, `100`, `100`,
+`BM25 K`, `Cosine K`, `RRF K`, and `Final K`; defaults are `100`, `100`, `64`,
 and `5`. Set `RETRIEVE_SCORE_THRESHOLD` above `0` to drop low-scoring vector
 results before fusion. `/health/details` returns the active defaults so the UI
 can initialize all four controls after login. With `CUDA=TRUE` (the default),
@@ -658,30 +782,48 @@ two Jina reranker actor replicas as detached named actors. The `main` container 
 models locally. Set `CUDA=FALSE` to force the Ray workers and actor resource
 requests to CPU. The default API image uses the PyTorch CUDA runtime image, so
 no host CUDA toolkit install is required.
+
+The document-version gate covers only query embedding, BM25/Qdrant recall, and
+RRF. A commit queues new recall operations and waits for recall operations
+already inside that gate to leave; it does not wait for requests that have
+already advanced to reranking or LLM generation. The gate is released before
+the reranker is called, so both reranker replicas and direct/RAG LLM generation
+continue independently of the index pointer swap.
+
 `jina-reranker-v3` is a listwise reranker, so candidates are reranked in
 batches of `RERANKER_MAX_DOCUMENTS_PER_CALL` when recall returns more than the
-model should process in one call.
+model should process in one call. The default `RRF_TOP_K=64` matches the
+`RERANKER_MAX_DOCUMENTS_PER_CALL=64` limit, so the default retrieval path uses
+one reranker call. Each assembled chunk is capped at 1,800 Qwen3 tokens, so 64
+candidates contribute at most 115,200 document tokens inside the reranker's
+131,072-token context and leave room for the query, source/headings, and model
+template. Explicit request overrides above 64 are still split safely.
 
 Query-time document RAG pipeline:
 
 ```mermaid
 flowchart TD
-    A["Browser / POST /rag"] --> B["Load session, compact memory, and settings from PostgreSQL"]
-    P["Background component health<br/>embedding / qdrant / reranker<br/>10s healthy probes, 3s degraded probes<br/>reranker replicas probed independently"]
+    A["Browser / POST /rag"] --> RS{"Redis session store reachable?"}
+    RS -- "no" --> R503["HTTP 503 + Retry-After: 3<br/>no stale PostgreSQL fallback"]
+    RS -- "yes" --> B["Load active session from Redis<br/>cold load PG archive + Pending overlay"]
+    P["Background component health<br/>redis / embedding / qdrant / reranker<br/>10s healthy probes, 3s degraded probes<br/>reranker replicas probed independently"]
     B --> C{"RAG-only enabled?"}
     C -- "yes" --> F["Force RAG route"]
     C -- "no" --> D["Intent router"]
     D --> E{"Needs local documents?"}
     E -- "no" --> Z["Direct chat with LLM"]
     E -- "yes" --> F
-    F --> G["Embed query through Ray embedding actor"]
-    F --> H["BM25S keyword recall<br/>S3 active manifest + Markdown first<br/>Qdrant payload scroll fallback"]
+    F --> GateIn["Enter retrieval-version gate"]
+    GateIn --> G["Ray Embedding Actor<br/>dynamic batch: max 16 / wait 10 ms"]
+    GateIn --> H["BM25S keyword recall<br/>S3 active manifest + Markdown first<br/>Qdrant payload scroll fallback"]
     G --> I["Qdrant vector recall through tech_docs alias"]
     P -. "embedding or qdrant degraded skips vector recall" .-> G
     P -. "qdrant degraded skips vector recall" .-> I
     H --> J["RRF fusion"]
     I --> J
-    J --> R{"Reranker component healthy?<br/>at least one replica ready"}
+    J --> GateOut["Release retrieval-version gate"]
+    Commit["Incremental index commit<br/>queues new recalls and drains active recall only"] -. "alias + manifest + BM25 pointer swap" .-> GateIn
+    GateOut --> R{"Reranker component healthy?<br/>at least one replica ready"}
     P -. "latest health snapshot" .-> R
     R -- "yes" --> K["Rerank through Ray replicas<br/>round-robin kba_reranker_1/_2"]
     K --> S{"Selected replica succeeds?"}
@@ -692,13 +834,40 @@ flowchart TD
     U --> L
     L --> M["Build prompt with references and conversation memory"]
     M --> N["LLM answer"]
-    N --> O["Store message, route metadata, and retrieved context snapshot in PostgreSQL"]
+    N --> O["Atomic Redis write<br/>Hot messages + Pending payload + Stream reference"]
+    O -. "Redis write failure" .-> R503
+    O --> V["Return response without waiting for PG archive"]
+    O --> W["session-archiver batch"]
+    W --> X["PG commit through PgBouncer"]
+    X --> Y["HDEL Pending + XACK/XDEL Stream"]
 ```
 
 PostgreSQL does not store the canonical document chunks. It stores users,
-sessions, runtime settings, messages, and retrieved-context snapshots for past
-answers. The current chunk text lives in Qdrant payloads and is rebuildable
-from the S3 source documents.
+runtime settings, and the complete archived session/message history, including
+retrieved-context snapshots. Redis is the active session read/write path.
+Session cache keys have a sliding TTL and are eligible for `volatile-lru`;
+Pending hashes and the archive Stream have no TTL, so they cannot be evicted.
+The full exchange is stored only in the hot Messages List and Pending Hash;
+the Stream stores only `event_id` and `session_id`. The archiver batch-loads
+the referenced Pending payloads instead of duplicating them in Stream entries.
+The archiver commits PG first and only then acknowledges and removes Redis
+archive data. A cache miss rebuilds from PG plus any still-pending exchange.
+PG cold loading is allowed only while Redis is reachable, so Pending can be
+merged before data is returned. If Redis is unavailable or the archive backlog
+reaches the configured limit, session reads and writes return HTTP `503` with
+`Retry-After: 3`; they never return a potentially stale PG-only history and do
+not synchronously fall back to PG. Account authentication can still use PG
+because account records, unlike active conversation state, are PG-canonical.
+The first undetected failure may consume one Redis socket timeout; after that,
+an in-process circuit returns 503 immediately. Only the background health
+supervisor probes for recovery, so user requests do not periodically block on
+Redis recovery checks.
+The current document chunk text remains in Qdrant payloads and is rebuildable
+from S3 source documents.
+`appendfsync everysec` intentionally accepts an approximately one-second AOF
+durability window. The Redis container reserves 48 GB around a 32 GB
+`maxmemory`; the Linux host should set `vm.overcommit_memory=1` so AOF rewrite
+forks are not rejected.
 
 Retrieval degrades explicitly instead of failing silently. A background monitor
 checks `embedding`, `qdrant`, and `reranker` independently: healthy components
@@ -741,6 +910,16 @@ Ray actor failures are handled by Ray actor restart and the application health
 monitor/fallback path, avoiding a standalone head restart that would leave old
 workers and actor handles attached to the previous cluster.
 
+These mechanisms intentionally provide process-level recovery, not automatic
+index disaster recovery. A normal Qdrant restart reuses `qdrant_storage` and
+does not rechunk or re-embed documents. Missing or corrupt Qdrant collections
+remain BM25-only until an operator explicitly runs a CPU-offline rebuild from
+S3; the low-probability storage-corruption path stays manual to avoid a complex
+automatic recovery state machine. BM25S is an in-process `main` index: a
+query-time BM25S exception falls back to Qdrant-only, but there is no independent
+BM25S health probe or automatic background rebuild yet. Restarting `main` or
+committing a document update reconstructs or replaces the BM25S index.
+
 The default Compose configuration exposes NVIDIA GPU devices to
 `ray-worker-embedding-1`, `ray-worker-reranker-1`, and
 `ray-worker-reranker-2`, while the `main` container remains a Ray client and
@@ -767,7 +946,8 @@ If Docker exposes GPU devices but PyTorch cannot use them, or the GPU
 architecture is too old for the installed CUDA/PyTorch build, the application
 falls back to CPU after it starts.
 
-Account login and PostgreSQL-backed sessions are always enabled. By default,
+Account login and server-side sessions are always enabled. Redis is the active
+session read/write path and PostgreSQL is the durable archive. By default,
 startup creates an administrator account if it does not already exist:
 
 ```text
@@ -793,10 +973,11 @@ AUTH_BOOTSTRAP_USERS=analyst:change-me
 ```
 
 Bootstrap users are inserted only when they do not already exist. Passwords are
-stored as PBKDF2-SHA256 hashes, login bearer tokens are stored as SHA-256
-hashes, and each user's chat sessions, messages, retrieved references, route
-metadata, and compacted summary are stored in PostgreSQL. The browser opens to
-the sign-in form and only shows the RAG workspace after a valid login.
+stored as PBKDF2-SHA256 hashes and login bearer tokens are stored as SHA-256
+hashes in PostgreSQL. Active sessions and pending archive events are written to
+Redis first; the archiver persists messages, retrieved references, route
+metadata, and compacted summaries to PostgreSQL. The browser opens to the
+sign-in form and only shows the RAG workspace after a valid login.
 Administrators see an Admin panel for creating users, importing users from CSV,
 deleting users, resetting passwords, toggling admin access, and clearing a
 user's chat data. Superuser-only controls for global LLM settings are shown in
@@ -808,21 +989,21 @@ are rejected. `/rag` accepts a `session_id` and manages history server-side.
 
 The Markdown files under `data/docs/` provide the runtime domain content.
 Ingestion scans that tree recursively, so nested topic folders are supported.
-The committed files cover a generated restaurant/business case corpus about
-家是本, 朱剑秋, and the 巨大历史机遇/巨大历史鲫鱼 meme. Because these topics are
-unlikely to be memorized well by general models, they are a better fit for RAG
-evaluation than common SQL or database-system facts. The bundled docs
-intentionally do not include general DB/SQL reference material; database
-questions stay in the direct-chat/evaluation-negative path instead of being
-made into RAG content.
+The committed corpus contains 102 long-form contract documents from the
+RAGBench `cuad` test split. `RAGBench_Eval/corpus.jsonl` contains the source
+records and `RAGBench_Eval/queries.jsonl` contains 500 labeled queries. Use the
+request-level `RAG-only` switch for retrieval evaluation. The checked-in
+`DOMAIN_RAG_PHRASES`, `DOMAIN_RAG_PATTERNS`, and intent-router evaluation cases
+still demonstrate the previous sample domain, so update them before evaluating
+automatic intent routing against CUAD.
 
 To use another subject:
 
 1. Replace or edit the Markdown files under `data/docs/`.
 2. For local mode, rebuild the Qdrant collection with
-   `python scripts/ingest_docs.py --recreate`. For S3 mode, sync the files with
-   `python scripts/sync_docs_to_s3.py --delete-removed`, then run
-   `python scripts/ingest_docs.py --source s3`.
+   `python scripts/ingest_docs.py --recreate`. For the Compose S3 deployment,
+   run `./scripts/update_docs.sh`; it uses the isolated offline embedding
+   lifecycle instead of loading an ingest batch into the online actor.
 3. Update the corpus keyword hints in `app/intent_router.py`
    (`DOMAIN_RAG_PHRASES` and `DOMAIN_RAG_PATTERNS`), the LLM fallback corpus
    description, and `data/eval/intent_router_cases.jsonl` if first-pass,
@@ -849,7 +1030,7 @@ For host-side Mihomo, enable Allow LAN / bind to `0.0.0.0`, then set:
 ```bash
 DOCKER_HTTP_PROXY=http://host.docker.internal:7890
 DOCKER_HTTPS_PROXY=http://host.docker.internal:7890
-DOCKER_NO_PROXY=postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+DOCKER_NO_PROXY=postgres,pgbouncer,redis,session-archiver,qdrant,minio,vllm,main,docs-indexer,docs-updater,ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-ingest-cpu,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 GRPC_ENABLE_FORK_SUPPORT=0
 ```
 
@@ -921,7 +1102,7 @@ curl http://localhost:8080/rag \
     \"question\": \"When should I choose DuckDB over ClickHouse?\",
     \"bm25_top_k\": 100,
     \"recall_top_k\": 100,
-    \"rrf_top_k\": 100,
+    \"rrf_top_k\": 64,
     \"top_k\": 5
   }"
 ```
@@ -996,12 +1177,15 @@ Smoke-test Markdown chunking:
 
 ```bash
 python scripts/test_chunking.py
+# Inside the main image/shared HF cache, validate the corpus with Qwen3 tokens.
+python scripts/test_chunking.py --real-tokenizer
 ```
 
 Smoke-test incremental document replacement:
 
 ```bash
 python scripts/test_vector_store.py
+python scripts/test_document_commit.py
 ```
 
 Smoke-test intent routing:
@@ -1025,6 +1209,12 @@ Smoke-test cross-encoder reranker ordering with a fake model:
 python scripts/test_reranker.py
 ```
 
+Smoke-test cross-request embedding batching with a fake encoder:
+
+```bash
+python scripts/test_embedding_batcher.py
+```
+
 Smoke-test prompt budgeting and history trimming:
 
 ```bash
@@ -1036,6 +1226,146 @@ Smoke-test configuration wiring:
 ```bash
 python scripts/test_settings.py
 ```
+
+### Session pipeline load benchmark
+
+With the Compose stack already running, benchmark the session storage path at a
+fixed 10 QPS:
+
+```bash
+docker compose run --rm --no-deps \
+  -v /tmp:/bench-output \
+  --entrypoint python main \
+  scripts/bench_session_pipeline.py \
+  --rate 10 --duration 60 --warmup-seconds 10 \
+  --session-count 32 --workers 32 \
+  --output /bench-output/kba_session_benchmark_10qps.json
+```
+
+This benchmark calls `RedisSessionStore` directly and covers only
+Redis -> Stream -> session-archiver -> PostgreSQL. It deliberately excludes
+HTTP, LLM generation, intent routing, and retrieval. The report includes
+completed QPS; service, scheduling, and end-to-end P50/P95/P99 latency; Stream
+peak/average/final backlog; archive throughput and drain time; and exact
+message/event consistency checks. Benchmark sessions are removed after each
+run.
+
+The local 10 QPS validation run on 2026-07-10 completed 600/600 measured writes
+with no errors: 10.016 completion QPS, service latency P50 2.875 ms / P95
+3.440 ms / P99 3.941 ms, scheduled end-to-end latency P50 3.038 ms / P95
+3.629 ms / P99 4.140 ms, Stream peak backlog 1 and final backlog 0, and 10.000
+archived events/s. This is a fixed-load correctness baseline, not a maximum
+capacity result.
+
+Use closed-loop mode to measure short-burst acceptance throughput:
+
+```bash
+docker compose run --rm --no-deps \
+  -v /tmp:/bench-output \
+  --entrypoint python main \
+  scripts/bench_session_pipeline.py \
+  --mode closed-loop --concurrency 1 --duration 5 \
+  --warmup-seconds 0 --session-count 128 --workers 1 \
+  --max-requests 5000 --max-backlog 5000 \
+  --output /bench-output/kba_session_peak.json
+```
+
+The same local deployment, with Redis AOF enabled, produced two distinct
+capacity numbers. A bounded five-second burst accepted 5,000/5,000 events at
+1,016.4 QPS with service P99 2.44 ms, but backlog grew at 325.6 events/s and
+needed 2.49 seconds to drain. It is therefore a burst peak, not sustainable
+throughput. A 60-second 450 QPS run completed 27,000/27,000 events at 449.18
+QPS; archive throughput was 448.99 events/s, Stream backlog ended at zero with
+a 79-event peak and a 0.034 events/s fitted slope, and all 54,000 PG messages
+were unique and present. Service latency was P50 2.40 ms / P95 143.28 ms / P99
+149.72 ms, while scheduled end-to-end P99 was 391.19 ms. The tail latency
+includes automatic AOF rewrite overhead. A 600 QPS offered-load run saturated
+at about 451 QPS and accumulated client scheduling delay, so it is not reported
+as sustainable capacity.
+
+### Retrieval pipeline load benchmark
+
+The retrieval benchmark exercises the production retrieval coordinator
+directly:
+
+```text
+BM25S ───────────────┐
+                    ├─ RRF ─ two Ray Reranker replicas
+Ray Embedding ─ Qdrant ┘
+```
+
+It excludes HTTP, Session persistence, intent routing, and LLM generation. Run
+a closed-loop saturation test and a fixed-rate sustainability test with:
+
+```bash
+docker compose run --rm --no-deps \
+  -v /tmp:/bench-output \
+  --entrypoint python main \
+  scripts/bench_retrieval_pipeline.py \
+  --mode closed-loop --concurrency 16 --workers 16 \
+  --duration 30 --warmup-requests 4 --max-requests 600 \
+  --output /bench-output/kba_retrieval_dynamic16_peak_c16.json
+
+docker compose run --rm --no-deps \
+  -v /tmp:/bench-output \
+  --entrypoint python main \
+  scripts/bench_retrieval_pipeline.py \
+  --mode fixed-rate --rate 9 --workers 16 \
+  --duration 60 --warmup-requests 4 --max-requests 700 \
+  --output /bench-output/kba_retrieval_dynamic16_sustained_9qps_60s.json
+```
+
+The 2026-07-10 local RTX 5090 baseline, before query micro-batching, used one
+Jina v5 text Embedding Actor, two Jina Reranker v3 Actors, BM25/vector top K
+100, RRF K 64, and final K 5. The eight-concurrent closed-loop run completed
+213/213 requests without degradation at 10.27 QPS; retrieval latency was P50
+769.0 ms / P95 806.6 ms / P99 928.7 ms. The 60-second 9 QPS run completed
+540/540 requests at 8.962 QPS with P50 250.2 ms / P99 418.2 ms and only 0.024
+ms/s client queue growth. A 12 QPS offered-load control saturated at 9.66 QPS,
+with 211.5 ms/s queue growth and 1.82-second retrieval P99.
+
+With the previous dynamic batch of eight and 5 ms wait, the concurrency-eight
+run completed 212/212 at 10.22 QPS. Embedding P50 fell from 592.5 ms to 175.4
+ms, but burstier downstream arrivals moved queueing to the two rerankers:
+reranker P50 rose from 161.1 ms to 546.4 ms and retrieval P99 rose to 1.229 s.
+The actor formed 161 batches for 214 measured query embeddings, an average of
+1.33 queries per batch, and observed a largest batch of seven. At the stable
+9 QPS rate, arrivals were too sparse for material coalescing: average batch
+size was 1.002, throughput was 8.982 QPS, retrieval P50/P99 were 265.4/426.8
+ms, and queue growth remained flat at 0.013 ms/s.
+
+The overloaded 12 QPS comparison shows the intended protection effect:
+completed throughput improved from 9.66 to 10.31 QPS, client queue growth fell
+from 211.5 to 126.0 ms/s, end-to-end P99 fell from 7.32 to 5.70 seconds, and
+embedding P50 fell from 1.47 seconds to 181.5 ms. It remains an unsustainable
+offered load, and reranker P99 rose to 2.59 seconds. Dynamic batching therefore
+improves embedding efficiency under contention but does not by itself increase
+balanced end-to-end capacity; reranker admission control or more downstream
+capacity is the next scaling constraint. BM25S and Qdrant remain small parts of
+total latency. Ray Client also warns after more than 10 MB of cumulative
+fine-grained task payloads because every rerank request transfers up to 64
+candidate chunks; compact actor payloads or object references remain a future
+optimization.
+
+The current batch-16/10 ms configuration was then rerun with the same retrieval
+settings. All four runs completed with zero errors and zero degradation:
+
+| Load | Completed QPS | End-to-end P50 / P95 / P99 | Queue slope | Avg. embed batch | Classification |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Closed loop, concurrency 16 | 10.301 | 1.540 / 2.562 / 2.637 s | N/A | 1.498 | Short-burst peak |
+| Fixed 9 QPS, 60 s | 8.968 | 325.9 / 424.8 / 535.3 ms | 0.048 ms/s | 1.017 | Conservative sustainable load |
+| Fixed 10 QPS, 60 s | 9.963 | 398.8 / 566.1 / 639.3 ms | 0.021 ms/s | 1.210 | Observed capacity boundary |
+| Fixed 12 QPS, 30 s | 10.390 | 2.231 / 5.481 / 5.780 s | 83.419 ms/s | 1.504 | Overloaded, not sustainable |
+
+The closed-loop run observed a largest embedding batch of 15. At fixed 9 QPS,
+uniform arrivals are about 111 ms apart, so a 10 ms window correctly produces
+almost no batching. Fixed 10 QPS completed without client backlog growth during
+the 60-second observation, but service latency still had a positive 2.044 ms/s
+slope; it is a boundary measurement rather than a long-duration guarantee. At
+12 offered QPS the pipeline saturated near 10.39 QPS and reranker P99 reached
+3.67 seconds, confirming that the two reranker replicas, not embedding memory,
+are the current overload constraint. The reproducible JSON reports are written
+under `/tmp/kba_retrieval_dynamic16_*.json` on the benchmark host.
 
 Run FastAPI:
 
@@ -1054,12 +1384,10 @@ python -m compileall app scripts
 In local mode, Markdown files in `data/docs/` are the RAG source of truth. In
 S3 mode, the configured S3 bucket/prefix is the source of truth and
 `QDRANT_COLLECTION` is treated as a stable Qdrant alias that points at the
-active versioned collection. The bundled sample files cover a generated Chinese
-restaurant/business case: company overview, FAQ, menu and pricing, customer
-reviews, Bilibili comments, social-media archives, financial simulation, a
-timeline, a profile of 朱剑秋, the Yongge livestream incident, the 巨大历史机遇/巨大历史鲫鱼
-meme document, and a song document. Retrieval uses BM25 keyword recall plus
-Qdrant vector recall, RRF fusion, and optional reranking.
+active versioned collection. The current corpus is stored recursively under
+`data/docs/RAGBench/` and contains 102 Markdown evaluation documents. Retrieval
+uses BM25 keyword recall plus Qdrant vector recall, RRF fusion, and optional
+reranking.
 
 The keyword intent layer contains domain hints for this bundled corpus in
 `app/intent_router.py`. Those hints only decide whether to use RAG; they do not
@@ -1067,12 +1395,27 @@ rank documents. Replace them when swapping in a different corpus, and update
 `data/eval/intent_router_cases.jsonl` so encoder and threshold changes are
 checked against representative routing examples.
 
-Chunking is Markdown-aware and metadata-driven: Markdown blocks are parsed,
-headings are stored as `h1`/`h2`/`h3` payload metadata, and text, code, and
-tables are chunked separately. Heading context is included in embedding input
-but kept separate from stored chunk text to avoid duplicating titles in every
-chunk. Oversized text chunks use an effective chunk budget that leaves room for
-overlap, while fenced code chunks preserve complete fences.
+Chunking is Markdown-aware, metadata-driven, and token-aware. It reuses the
+Qwen3 tokenizer assets shipped with `jinaai/jina-embeddings-v5-text-small` but
+does not load embedding model weights in `main`. Adjacent paragraphs are packed
+inside one heading section toward a 1,600-token body target with a hard
+1,600-token body maximum; a heading change always ends the current chunk, so
+short sections remain short. Oversized prose is split at sentence boundaries,
+then clause and word boundaries, with tokenizer boundaries as the final hard
+limit instead of arbitrary character slicing. Each text chunk can include up
+to 100 tokens from both the preceding and following body without crossing a
+heading. The separator is included in each overlap budget, making the assembled
+hard maximum derive directly as `1600 + 100 + 100 = 1800` tokens. Text, code,
+and tables remain separate; only explicit fenced blocks are treated as code, so
+visually indented long-form prose is still packed as text. Fenced code preserves
+complete fences, and heading context is stored as metadata and added to
+embedding input
+without duplicating titles in stored text. YAML frontmatter is parsed and
+removed from stored text; its `title` becomes document-level heading metadata
+while original body line numbers remain intact. Qdrant payloads store body,
+preceding/following overlap, and assembled token counts. S3 manifests fingerprint
+the chunking algorithm, tokenizer, and all token budgets, so a later manual ingest
+builds a new version instead of copying vectors produced by an older chunker.
 
 Local filesystem ingest remains available for small corpora:
 
@@ -1101,44 +1444,76 @@ DOCS_S3_ENDPOINT_URL=        # leave blank for AWS S3, or set your compatible en
 QDRANT_COLLECTION=tech_docs
 ```
 
-Enable bucket versioning before ingest. Then sync local Markdown into S3 and
-build a new index version manually:
+Enable bucket versioning before ingest. For a running Compose deployment, use
+the coordinated update command:
 
 ```bash
-python scripts/sync_docs_to_s3.py --docs-dir data/docs --delete-removed
-python scripts/ingest_docs.py --source s3
+./scripts/update_docs.sh
 ```
+
+Set a non-default `DOCS_COMMIT_TOKEN` before exposing `main`; the internal
+prepare/commit endpoints require this shared token. CPU update capacity and
+timeouts are controlled by `DOCS_CPU_INGEST_THREADS`,
+`DOCS_CPU_INGEST_ACTOR_NUM_CPUS`, `EMBEDDING_CPU_INGEST_BATCH_SIZE`, and
+`DOCS_CPU_INGEST_TIMEOUT_SECONDS`.
+
+The script starts only the `docs-update` profile's CPU ingest worker and
+one-shot updater. It does not stop or recreate the online embedding worker or
+either reranker replica. The temporary Ray node advertises zero GPUs and a
+dedicated `ray_worker_embedding_ingest` resource, so the uniquely named
+`kba_embedding_ingest_cpu` actor cannot be placed on an online GPU worker. The
+actor is permanently removed from Ray before that temporary node exits, which
+also prevents detached-actor rescheduling after an update.
+
+S3 sync, manifest diffing, chunking, CPU embedding, candidate Qdrant writes,
+and a full candidate BM25S build all happen while the previous index remains
+available. Main keeps two BM25S references during preparation: searches use
+`active`, while a background thread builds `candidate` from the complete new
+manifest. This temporarily doubles BM25S memory, but no query observes a
+partially rebuilt lexical index. If the diff is empty, no embedding model is
+loaded and no index pointers change.
 
 Incremental S3 document update:
 
 ```mermaid
 flowchart TD
-    A["Edit Markdown under data/docs"] --> B["sync_docs_to_s3.py --delete-removed"]
-    B --> C["Upload added or changed .md objects with content-sha256 metadata"]
-    B --> D["Write delete markers for removed Markdown objects"]
-    C --> E["S3 current object list"]
-    D --> E
-    E --> F["ingest_docs.py --source s3"]
-    F --> G["Load active manifest"]
-    F --> H["Scan full current S3 .md list"]
-    G --> I["Diff by source_doc_id, VersionId, ETag, size, and content hash"]
-    H --> I
-    I --> J["Added or modified docs"]
-    I --> K["Unchanged docs"]
-    I --> L["Deleted docs"]
-    J --> M["Read exact S3 VersionId, chunk Markdown, embed, and upsert"]
-    K --> N["Copy existing Qdrant points and vectors from previous collection"]
-    L --> O["Do not copy deleted document chunks"]
-    M --> P["New candidate Qdrant collection"]
-    N --> P
-    O --> P
-    P --> Q{"Validate chunk count"}
-    Q -- "fail" --> R["Delete candidate and keep alias on previous active collection"]
-    Q -- "pass" --> S["Write version manifest"]
-    S --> T["Switch Qdrant alias to candidate"]
-    T --> U["Write active manifest"]
-    U --> V["Stable retention: S3 keeps 5 versions per key; Qdrant keeps active plus rollback"]
+    A["Edit Markdown under data/docs"] --> B["scripts/update_docs.sh"]
+    B --> C["Start docs-updater + temporary CPU Ray worker<br/>online GPU actors remain serving"]
+    C --> D["Sync added/changed/deleted files to versioned MinIO"]
+    D --> E["Write processing candidate manifest<br/>with exact S3 VersionIds"]
+    E --> F["Load previous manifest + scan complete candidate manifest"]
+    F --> G["Diff source_doc_id, VersionId, ETag, size, content hash, and index config"]
+    G --> H["Added / modified docs"]
+    G --> I["Unchanged docs"]
+    G --> J["Deleted docs"]
+    E --> BM["Main builds complete BM25S candidate in background<br/>active BM25S keeps serving"]
+    H --> K["Qwen3 chunk changed docs<br/>CPU actor embeds only new chunks"]
+    I --> L["Copy existing Qdrant points + vectors"]
+    J --> M["Omit all deleted-document chunks"]
+    K --> N["Candidate Qdrant collection"]
+    L --> N
+    M --> N
+    N --> Q{"Qdrant count valid and<br/>BM25 candidate ready?"}
+    BM --> Q
+    Q -- "no" --> Fail["Discard Qdrant/BM25 candidates<br/>active alias and BM25 unchanged"]
+    Q -- "yes" --> Gate["Close retrieval-only gate<br/>queue new recalls; drain active recalls"]
+    Gate --> Alias["Switch Qdrant alias to candidate"]
+    Alias --> Manifest["Commit and verify active S3 manifest"]
+    Manifest --> Swap["Swap BM25 active/candidate references"]
+    Swap --> Release["Open gate<br/>queued recalls use one new version"]
+    Release --> Cleanup["Kill detached CPU actor with no_restart<br/>stop temporary Ray node"]
+    Cleanup --> Keep["Stable retention: S3 latest 5 versions<br/>Qdrant active + rollback"]
+    Gate -. "does not wait for" .-> Outside["Reranker and LLM continue outside gate"]
+    D -. "pipeline error" .-> Fail
 ```
+
+Only the short final commit window closes the retrieval gate. It drains and
+queues the recall section only: query embedding, BM25S, Qdrant, and RRF.
+Reranking and LLM generation do not read the mutable indexes, so requests that
+already left recall keep running and are not included in the drain count. The
+commit window switches the Qdrant alias, commits the active S3 manifest, and
+exchanges the BM25S pointer; queued recalls are then released against the new
+version.
 
 The S3 indexer always scans the current S3 object list to detect additions,
 modifications, and deletions. It does not only scan changed objects. The
@@ -1147,9 +1522,12 @@ payload includes `source_doc_id` and `version_id`. A new physical Qdrant
 collection is created for each index version. Unchanged document chunks are
 copied from the previous collection with their vectors, added/modified
 documents are chunked and embedded, and deleted documents are not copied. After
-the new collection validates successfully, the `QDRANT_COLLECTION` alias is
-switched to the new collection. Old physical collections and S3 object versions
-remain available for rollback.
+the Qdrant and BM25S candidates both validate, the coordinated commit switches
+the `QDRANT_COLLECTION` alias and the in-memory BM25S active reference under the
+same retrieval gate. Old physical collections and S3 object versions remain
+available for rollback. A failure before commit discards only candidates; a
+commit failure attempts to restore the previous alias/manifest before reopening
+the gate.
 
 Retention is enabled by default. Stable S3 document object versions keep the
 latest 5 versions per Markdown key, including the latest usable version.
@@ -1172,6 +1550,7 @@ python scripts/test_vector_store.py
 python scripts/test_intent_router.py
 python scripts/test_prompt_budget.py
 python scripts/test_settings.py
+docker compose exec -T main python scripts/test_redis_session.py
 docker compose config
 ```
 

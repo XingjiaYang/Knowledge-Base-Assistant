@@ -12,6 +12,7 @@ from app.session_store import (  # noqa: E402
     hash_password,
     hash_token,
     normalize_username,
+    next_session_seq,
     parse_bootstrap_users,
     verify_password,
 )
@@ -72,12 +73,27 @@ def assert_session_title_cleanup() -> None:
     print("Session title cleanup -> ok")
 
 
+def assert_session_sequence_generation() -> None:
+    first = next_session_seq(0)
+    second = next_session_seq(first)
+    pg_only = next_session_seq(0, floor_offset=500)
+    if second <= first:
+        raise AssertionError("Session sequence values must be strictly increasing.")
+    if pg_only < first + 500:
+        raise AssertionError("PG-only mode should use the reserved sequence range.")
+    if first >= 9_007_199_254_740_991:
+        raise AssertionError("Session sequence values must remain JS-safe integers.")
+
+    print("Session sequence generation -> ok")
+
+
 def main() -> None:
     assert_username_normalization()
     assert_bootstrap_user_parsing()
     assert_password_hashing()
     assert_token_hashing()
     assert_session_title_cleanup()
+    assert_session_sequence_generation()
 
 
 if __name__ == "__main__":

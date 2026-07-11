@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
 import logging
 from threading import Lock
 import time
@@ -18,25 +20,150 @@ _reranker_round_robin_index = 0
 _unavailable_actor_names: set[str] = set()
 
 
+@dataclass
+class _EmbeddingBatchRequest:
+    text: str
+    future: asyncio.Future[list[list[float]]]
+
+
 class EmbeddingActor:
     def __init__(self, config: Settings = settings) -> None:
         from app.vector_store import VectorStore
 
         self.store = VectorStore(config, use_ray=False)
+        self.config = config
+        self._batch_queues: dict[
+            tuple[bool, str | None, str | None],
+            asyncio.Queue[_EmbeddingBatchRequest],
+        ] = {}
+        self._batch_tasks: dict[
+            tuple[bool, str | None, str | None],
+            asyncio.Task[None],
+        ] = {}
+        self._batch_events: dict[
+            tuple[bool, str | None, str | None],
+            asyncio.Event,
+        ] = {}
+        self._inference_lock: asyncio.Lock | None = None
+        self._batch_count = 0
+        self._batched_request_count = 0
+        self._batch_size_total = 0
+        self._last_batch_size = 0
+        self._max_observed_batch_size = 0
 
-    def encode_matrix(
+    async def encode_matrix(
         self,
         texts: str | list[str],
         normalize_embeddings: bool,
         task: str | None,
         prompt_name: str | None = None,
     ) -> list[list[float]]:
-        return self.store._encode_matrix(  # noqa: SLF001 - actor owns model process
+        if not self.config.embedding_dynamic_batch_enabled or not isinstance(
             texts,
-            normalize_embeddings=normalize_embeddings,
-            task=task,
-            prompt_name=prompt_name,
-        )
+            str,
+        ):
+            return await self._encode_direct(
+                texts,
+                normalize_embeddings,
+                task,
+                prompt_name,
+            )
+
+        key = (normalize_embeddings, task, prompt_name)
+        queue = self._batch_queues.get(key)
+        if queue is None:
+            queue = asyncio.Queue()
+            event = asyncio.Event()
+            self._batch_queues[key] = queue
+            self._batch_events[key] = event
+            self._batch_tasks[key] = asyncio.create_task(
+                self._run_batch_queue(key, queue, event)
+            )
+        else:
+            event = self._batch_events[key]
+
+        future = asyncio.get_running_loop().create_future()
+        queue.put_nowait(_EmbeddingBatchRequest(text=texts, future=future))
+        event.set()
+        return await future
+
+    async def _run_batch_queue(
+        self,
+        key: tuple[bool, str | None, str | None],
+        queue: asyncio.Queue[_EmbeddingBatchRequest],
+        event: asyncio.Event,
+    ) -> None:
+        normalize_embeddings, task, prompt_name = key
+        max_size = self.config.embedding_dynamic_batch_max_size
+        wait_seconds = self.config.embedding_dynamic_batch_wait_ms / 1000
+        while True:
+            first = await queue.get()
+            batch = [first]
+            deadline = asyncio.get_running_loop().time() + wait_seconds
+            while len(batch) < max_size:
+                event.clear()
+                while len(batch) < max_size:
+                    try:
+                        batch.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                if len(batch) >= max_size or wait_seconds <= 0:
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=remaining)
+                except TimeoutError:
+                    break
+
+            try:
+                rows = await self._encode_direct(
+                    [request.text for request in batch],
+                    normalize_embeddings,
+                    task,
+                    prompt_name,
+                )
+                if len(rows) != len(batch):
+                    raise RuntimeError(
+                        "Embedding dynamic batch returned an unexpected row count."
+                    )
+                self._batch_count += 1
+                self._batched_request_count += len(batch)
+                self._batch_size_total += len(batch)
+                self._last_batch_size = len(batch)
+                self._max_observed_batch_size = max(
+                    self._max_observed_batch_size,
+                    len(batch),
+                )
+                for request, row in zip(batch, rows, strict=True):
+                    if not request.future.done():
+                        request.future.set_result([row])
+            except Exception as exc:
+                for request in batch:
+                    if not request.future.done():
+                        request.future.set_exception(exc)
+            finally:
+                for _request in batch:
+                    queue.task_done()
+
+    async def _encode_direct(
+        self,
+        texts: str | list[str],
+        normalize_embeddings: bool,
+        task: str | None,
+        prompt_name: str | None,
+    ) -> list[list[float]]:
+        if self._inference_lock is None:
+            self._inference_lock = asyncio.Lock()
+        async with self._inference_lock:
+            return await asyncio.to_thread(
+                self.store._encode_matrix,  # noqa: SLF001 - actor owns model process
+                texts,
+                normalize_embeddings=normalize_embeddings,
+                task=task,
+                prompt_name=prompt_name,
+            )
 
     def vector_size(self) -> int:
         return self.store.vector_size
@@ -53,6 +180,24 @@ class EmbeddingActor:
             "ready": True,
             "model": self.store.config.embedding_model,
             "vector_size": int(vector_size),
+            "device": str(getattr(self.store, "_model_device", "unknown")),
+            "dynamic_batching": {
+                "enabled": self.config.embedding_dynamic_batch_enabled,
+                "max_size": self.config.embedding_dynamic_batch_max_size,
+                "wait_ms": self.config.embedding_dynamic_batch_wait_ms,
+                "batch_count": self._batch_count,
+                "request_count": self._batched_request_count,
+                "average_batch_size": (
+                    self._batch_size_total / self._batch_count
+                    if self._batch_count
+                    else 0.0
+                ),
+                "last_batch_size": self._last_batch_size,
+                "max_observed_batch_size": self._max_observed_batch_size,
+                "queue_depth": sum(
+                    queue.qsize() for queue in self._batch_queues.values()
+                ),
+            },
         }
 
 
@@ -79,6 +224,7 @@ class RerankerActor:
         return {
             "ready": True,
             "model": self.reranker.config.reranker_model,
+            "device": str(getattr(self.reranker, "_model_device", "unknown")),
         }
 
 
@@ -121,6 +267,10 @@ def get_embedding_actor(config: Settings = settings) -> Any | None:
                 config.ray_embedding_actor_name,
                 num_gpus=config.ray_embedding_actor_num_gpus,
                 node_resource=config.ray_embedding_actor_resource,
+                max_concurrency=max(
+                    32,
+                    config.embedding_dynamic_batch_max_size * 4,
+                ),
             )
         return _embedding_actor
 
@@ -153,6 +303,35 @@ def reset_embedding_actor(config: Settings = settings) -> None:
     with _ray_lock:
         _embedding_actor = None
         _unavailable_actor_names.discard(config.ray_embedding_actor_name)
+
+
+def destroy_embedding_actor(config: Settings = settings) -> bool:
+    """Permanently remove the configured detached embedding actor from Ray."""
+    global _embedding_actor
+    if not config.ray_enabled:
+        return False
+
+    with _ray_lock:
+        actor = _embedding_actor
+        _embedding_actor = None
+        _unavailable_actor_names.discard(config.ray_embedding_actor_name)
+
+    ray = _ensure_ray(config)
+    if actor is None:
+        try:
+            actor = ray.get_actor(
+                config.ray_embedding_actor_name,
+                namespace=config.ray_namespace,
+            )
+        except ValueError:
+            return False
+
+    ray.kill(actor, no_restart=True)
+    logger.info(
+        "Destroyed detached Ray embedding actor %s.",
+        config.ray_embedding_actor_name,
+    )
+    return True
 
 
 def reset_reranker_actor(
@@ -346,6 +525,7 @@ def _get_or_create_actor(
     name: str,
     num_gpus: float,
     node_resource: str = "",
+    max_concurrency: int | None = None,
 ) -> Any | None:
     if name in _unavailable_actor_names:
         return None
@@ -373,6 +553,8 @@ def _get_or_create_actor(
         }
         if node_resource.strip():
             remote_options["resources"] = {node_resource.strip(): 0.001}
+        if max_concurrency is not None:
+            remote_options["max_concurrency"] = max(1, max_concurrency)
 
         remote_cls = ray.remote(**remote_options)(actor_cls)
         logger.info(

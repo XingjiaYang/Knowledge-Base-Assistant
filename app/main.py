@@ -5,6 +5,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import asynccontextmanager
 import csv
 from datetime import datetime, timezone
+import hmac
 from io import StringIO
 import logging
 from pathlib import Path
@@ -14,7 +15,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -30,6 +31,7 @@ from app.code_retrieval import (
     CodeFileHit,
 )
 from app.llm_client import LLMClient
+from app.document_commit import PreparedIndexCommit, RetrievalRequestGate
 from app.model_actors import (
     get_embedding_actor,
     get_reranker_actors,
@@ -42,6 +44,7 @@ from app.model_actors import (
 )
 from app.rag import RAGPipeline, RAGTimings
 from app.reranker import Reranker
+from app.redis_session_store import RedisSessionStore, SessionStoreUnavailableError
 from app.security import bearer_token
 from app.session_store import (
     ChatSessionRecord,
@@ -51,6 +54,7 @@ from app.session_store import (
     LLMSettingsRecord,
     UserRecord,
 )
+from app.s3_documents import S3DocumentStore, VersionedS3DocumentIndexer
 from app.vector_store import SearchResult, VectorStore
 
 
@@ -101,8 +105,32 @@ async def _warmup_code_embedding_background(code_retrieval: CodeRetrieval) -> No
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     _app.state.vector_store = VectorStore(settings)
-    _app.state.session_store = SessionStore(settings)
-    await asyncio.to_thread(_app.state.session_store.init_db)
+    _app.state.retrieval_gate = RetrievalRequestGate()
+    _app.state.document_commit_executor = ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="document-commit",
+    )
+    _app.state.document_indexer = VersionedS3DocumentIndexer(
+        settings,
+        document_store=S3DocumentStore(settings),
+        vector_store=_app.state.vector_store,
+    )
+    pg_session_store = SessionStore(settings)
+    await asyncio.to_thread(pg_session_store.init_db)
+    _app.state.session_store = pg_session_store
+    if settings.redis_session_enabled:
+        redis_session_store = RedisSessionStore(
+            settings,
+            pg_store=pg_session_store,
+        )
+        _app.state.session_store = redis_session_store
+        try:
+            await asyncio.to_thread(redis_session_store.init_cache)
+        except Exception:
+            logger.exception(
+                "Redis session startup failed; session endpoints will return HTTP 503 "
+                "until Redis recovers."
+            )
     _app.state.llm_client = LLMClient(
         settings,
         runtime_settings_provider=_app.state.session_store.get_llm_runtime_settings,
@@ -112,6 +140,11 @@ async def lifespan(_app: FastAPI):
         "qdrant",
         lambda: _probe_qdrant_component(_app.state.vector_store),
     )
+    if isinstance(_app.state.session_store, RedisSessionStore):
+        _app.state.health_monitor.register(
+            "redis_session",
+            lambda: _app.state.session_store.ping(),
+        )
     if settings.ray_enabled:
         _app.state.health_monitor.register(
             "embedding",
@@ -140,12 +173,24 @@ async def lifespan(_app: FastAPI):
                 "qdrant_degraded=False reranker_degraded=True "
                 "fallback=rrf_or_bm25_top_k."
             )
+    if settings.docs_source == "s3":
+        active_manifest = await asyncio.to_thread(
+            _app.state.document_indexer.reconcile_active_manifest
+        )
+        if active_manifest:
+            await asyncio.to_thread(
+                _app.state.vector_store.rebuild_bm25_index,
+                expected_index_version=str(
+                    active_manifest.get("index_version", "")
+                ),
+            )
     _app.state.rag_pipeline = RAGPipeline(
         settings,
         vector_store=_app.state.vector_store,
         llm_client=_app.state.llm_client,
         reranker=_app.state.reranker,
         health_monitor=_app.state.health_monitor,
+        retrieval_gate=_app.state.retrieval_gate,
     )
     _app.state.health_monitor.start()
     _app.state.code_retrieval = CodeRetrieval(settings)
@@ -165,6 +210,10 @@ async def lifespan(_app: FastAPI):
         health_monitor = getattr(_app.state, "health_monitor", None)
         if health_monitor is not None:
             await health_monitor.stop()
+        _app.state.document_commit_executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
         _app.state.llm_client.close()
         _app.state.vector_store.close()
         if _app.state.session_store is not None:
@@ -176,6 +225,18 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(SessionStoreUnavailableError)
+async def session_store_unavailable(
+    _request: Request,
+    exc: SessionStoreUnavailableError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": str(exc)},
+        headers={"Retry-After": "3"},
+    )
 
 INDEX_HTML_PATH = Path(__file__).with_name("static") / "index.html"
 INDEX_HTML_FALLBACK = """
@@ -254,6 +315,17 @@ class RAGRequest(BaseModel):
         default=None,
         max_length=settings.api_summary_max_chars,
     )
+
+
+class DocumentBM25PrepareRequest(BaseModel):
+    index_version: str = Field(..., min_length=1, max_length=128)
+
+
+class DocumentIndexCommitRequest(BaseModel):
+    index_version: str = Field(..., min_length=1, max_length=128)
+    candidate_collection: str = Field(..., min_length=1, max_length=255)
+    previous_collection: str = Field(default="", max_length=255)
+    expected_total_chunks: int = Field(..., ge=0)
 
 
 class CodeSearchRequest(BaseModel):
@@ -1107,6 +1179,108 @@ async def delete_session(
     return {"status": "ok"}
 
 
+@app.post("/internal/docs/index/prepare", include_in_schema=False)
+async def prepare_document_bm25_candidate(
+    request: Request,
+    prepare_request: DocumentBM25PrepareRequest,
+    x_kba_docs_commit_token: str | None = Header(default=None),
+) -> dict[str, object]:
+    _require_document_commit_token(x_kba_docs_commit_token)
+    loop = asyncio.get_running_loop()
+    try:
+        chunk_count = await loop.run_in_executor(
+            request.app.state.document_commit_executor,
+            request.app.state.vector_store.prepare_bm25_candidate,
+            prepare_request.index_version,
+        )
+    except Exception as exc:
+        logger.exception(
+            "BM25S candidate preparation failed for %s.",
+            prepare_request.index_version,
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "status": "ready",
+        "index_version": prepare_request.index_version,
+        "bm25_chunks": chunk_count,
+    }
+
+
+@app.post("/internal/docs/index/discard", include_in_schema=False)
+async def discard_document_bm25_candidate(
+    request: Request,
+    discard_request: DocumentBM25PrepareRequest,
+    x_kba_docs_commit_token: str | None = Header(default=None),
+) -> dict[str, object]:
+    _require_document_commit_token(x_kba_docs_commit_token)
+    request.app.state.vector_store.discard_bm25_candidate(
+        discard_request.index_version
+    )
+    return {"status": "discarded", "index_version": discard_request.index_version}
+
+
+@app.post("/internal/docs/index/commit", include_in_schema=False)
+async def commit_document_index(
+    request: Request,
+    commit_request: DocumentIndexCommitRequest,
+    x_kba_docs_commit_token: str | None = Header(default=None),
+) -> dict[str, object]:
+    _require_document_commit_token(x_kba_docs_commit_token)
+    prepared = PreparedIndexCommit(
+        index_version=commit_request.index_version,
+        candidate_collection=commit_request.candidate_collection,
+        previous_collection=commit_request.previous_collection,
+        expected_total_chunks=commit_request.expected_total_chunks,
+    )
+    commit_metrics: dict[str, object] = {}
+
+    def commit_under_gate() -> dict[str, object]:
+        gate: RetrievalRequestGate = request.app.state.retrieval_gate
+        with gate.exclusive(
+            drain_timeout_seconds=settings.docs_commit_drain_timeout_seconds
+        ):
+            commit_metrics.update(gate.snapshot().as_dict())
+            return request.app.state.document_indexer.commit_prepared_version(
+                prepared
+            )
+
+    started = time.perf_counter()
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            request.app.state.document_commit_executor,
+            commit_under_gate,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Atomic document index commit failed for %s.",
+            commit_request.index_version,
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    commit_window_ms = (time.perf_counter() - started) * 1000
+    result["commit_window_ms"] = commit_window_ms
+    logger.info(
+        "Atomic document index commit completed: index_version=%s "
+        "commit_window_ms=%.2f queued_retrievals=%s gate_generation=%s.",
+        commit_request.index_version,
+        commit_window_ms,
+        commit_metrics.get("queued_requests", 0),
+        commit_metrics.get("generation", 0),
+    )
+    return result
+
+
+def _require_document_commit_token(provided: str | None) -> None:
+    expected = settings.docs_commit_token
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Document commit endpoint is not configured.",
+        )
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=403, detail="Invalid document commit token.")
+
+
 @app.get("/health/details", dependencies=[Depends(require_password_ready_user)])
 async def health_details(request: Request) -> dict[str, object]:
     llm_settings = await asyncio.to_thread(
@@ -1132,6 +1306,17 @@ async def health_details(request: Request) -> dict[str, object]:
         "docs_s3_retain_versions": settings.docs_s3_retain_versions,
         "docs_s3_processing_retain_versions": settings.docs_s3_processing_retain_versions,
         "docs_s3_manifest_prefix": settings.docs_s3_manifest_prefix,
+        "docs_commit_configured": bool(settings.docs_commit_token),
+        "docs_commit_drain_timeout_seconds": (
+            settings.docs_commit_drain_timeout_seconds
+        ),
+        "retrieval_commit_gate": request.app.state.retrieval_gate.snapshot().as_dict(),
+        "bm25_active_index_version": (
+            request.app.state.vector_store.active_bm25_index_version()
+        ),
+        "bm25_candidate_index_version": (
+            request.app.state.vector_store.prepared_bm25_candidate_version()
+        ),
         "qdrant_retain_versions": settings.qdrant_retain_versions,
         "qdrant_processing_retain_versions": settings.qdrant_processing_retain_versions,
         "code_root_dir": str(settings.code_root_dir),
@@ -1348,25 +1533,20 @@ async def code_search(
             outcome.functions,
         ),
     )
-    await asyncio.to_thread(
-        session_store.append_message,
+    session = await asyncio.to_thread(
+        session_store.append_exchange,
         session.id,
-        "user",
         search_request.query,
-    )
-    await asyncio.to_thread(
-        session_store.append_message,
-        session.id,
-        "assistant",
         answer,
         contexts,
         True,
         "code_search",
         "Code search over selected repositories.",
-    )
-    session = await asyncio.to_thread(
-        session_store.update_chat_session_after_answer,
-        session.id,
+        False,
+        False,
+        False,
+        False,
+        "",
         session.conversation_summary,
         0,
         search_request.query,
@@ -1486,16 +1666,10 @@ async def rag(
             detail=_error_detail("Internal server error.", exc),
         ) from exc
 
-    await asyncio.to_thread(
-        session_store.append_message,
+    session = await asyncio.to_thread(
+        session_store.append_exchange,
         session.id,
-        "user",
         rag_request.question,
-    )
-    await asyncio.to_thread(
-        session_store.append_message,
-        session.id,
-        "assistant",
         result.answer,
         result.contexts,
         result.used_rag,
@@ -1506,10 +1680,6 @@ async def rag(
         result.qdrant_degraded,
         result.reranker_degraded,
         result.degradation_reason,
-    )
-    session = await asyncio.to_thread(
-        session_store.update_chat_session_after_answer,
-        session.id,
         result.conversation_summary,
         result.compacted_history_messages,
         rag_request.question,

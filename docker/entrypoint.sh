@@ -15,6 +15,10 @@ DOCS_INIT_ON_IMAGE_BUILD="${DOCS_INIT_ON_IMAGE_BUILD:-1}"
 DOCS_INIT_DELETE_REMOVED="${DOCS_INIT_DELETE_REMOVED:-1}"
 DOCS_IMAGE_BUILD_ID_FILE="${DOCS_IMAGE_BUILD_ID_FILE:-/app/.image_build_id}"
 DOCS_INIT_LOCAL_MARKER="${DOCS_INIT_LOCAL_MARKER:-/app/.docs_init_build_id}"
+WAIT_FOR_DOCS_BOOTSTRAP="${WAIT_FOR_DOCS_BOOTSTRAP:-0}"
+DOCS_STARTUP_RUN_ID_FILE="${DOCS_STARTUP_RUN_ID_FILE:-/startup-state/run-id}"
+DOCS_STARTUP_READY_FILE="${DOCS_STARTUP_READY_FILE:-/startup-state/docs-ready}"
+DOCS_STARTUP_FAILED_FILE="${DOCS_STARTUP_FAILED_FILE:-/startup-state/docs-failed}"
 WAIT_FOR_LLM="${WAIT_FOR_LLM:-0}"
 SERVICE_TIMEOUT_SECONDS="${SERVICE_TIMEOUT_SECONDS:-1800}"
 POSTGRES_HOST="${POSTGRES_HOST:-postgres}"
@@ -118,7 +122,13 @@ LLM_READY_URL="${LLM_READY_URL:-${LLM_BASE_URL%/}${LLM_READY_PATH}}"
 wait_http "Qdrant" "$QDRANT_READY_URL" "$SERVICE_TIMEOUT_SECONDS"
 wait_tcp "PostgreSQL" "$POSTGRES_HOST" "$POSTGRES_PORT" "$SERVICE_TIMEOUT_SECONDS"
 
-if [[ "${DOCS_SOURCE,,}" == "s3" ]] && is_true "$DOCS_INIT_ON_IMAGE_BUILD"; then
+if [[ "${DOCS_SOURCE,,}" == "s3" ]] && is_true "$WAIT_FOR_DOCS_BOOTSTRAP"; then
+  python scripts/startup_pipeline_state.py wait \
+    --run-id-file "$DOCS_STARTUP_RUN_ID_FILE" \
+    --ready-file "$DOCS_STARTUP_READY_FILE" \
+    --failed-file "$DOCS_STARTUP_FAILED_FILE" \
+    --timeout-seconds "$SERVICE_TIMEOUT_SECONDS"
+elif [[ "${DOCS_SOURCE,,}" == "s3" ]] && is_true "$DOCS_INIT_ON_IMAGE_BUILD"; then
   image_build_id="unknown"
   if [[ -s "$DOCS_IMAGE_BUILD_ID_FILE" ]]; then
     image_build_id="$(tr -d '\n\r' < "$DOCS_IMAGE_BUILD_ID_FILE")"
