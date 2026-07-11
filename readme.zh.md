@@ -4,25 +4,20 @@ Knowledge Base Assistant 是一个通用知识库问答应用，用于查询可�
 Markdown 文档库。系统会通过意图路由判断问题是否需要检索：需要文档依据时走
 RAG，不需要检索的请求走直接对话。
 
-Qdrant 负责向量检索，本地 BM25 索引负责关键词召回，PostgreSQL 负责必需的用户
-账号、登录 token、用户会话、消息和压缩后的对话记忆，SentenceTransformers 负责
+Qdrant 负责向量检索，本地 BM25 索引负责关键词召回，Redis 负责活跃Session热路径，
+PostgreSQL 负责用户账号、设置和完整对话归档，SentenceTransformers 负责
 本地 embedding，FastAPI 同时提供 API 和浏览器界面。生成模型通过环境变量配置，
 默认使用 OpenAI-compatible API，也支持 Anthropic；本地 vLLM 作为可选 Docker
 Compose profile 保留。
 
-仓库当前自带一组由 Kimi 生成的餐饮创业案例 Markdown 语料，围绕家是本、
-朱剑秋、勇哥连线、菜单定价、顾客评价、社交媒体反应、财务模拟以及
-“巨大历史机遇/巨大历史鲫鱼”梗展开。这类
-小众合成语料比常见 SQL 或数据库知识更适合检验 RAG grounding，因为通用模型
-不太可能从预训练中直接记住这些细节。当前 `data/docs/` 不包含通用 DB/SQL
-参考资料；数据库问题作为 direct-chat / eval negative 保留，不作为 RAG 语料。
-意图路由的 embedding 层保持通用；关键词层和 LLM fallback prompt 包含当前语料的
-边界与专名提示，替换 `data/docs/` 后应同步更新。
+仓库当前在`data/docs/RAGBench/`中提供RAGBench `cuad`测试集的102份长合同文档；
+对应的原始记录和500条标注query位于`RAGBench_Eval/`。做文档召回评测时应打开
+`RAG-only`，把意图路由准确率与检索召回率分开测量。
 
 ## 功能概览
 
-- Docker Compose 一键启动 PostgreSQL、Qdrant、本机 MinIO S3 对象存储、Ray
-  model worker 和 FastAPI。
+- Docker Compose 一键启动 Redis、PostgreSQL、PgBouncer、Qdrant、本机 MinIO S3
+  对象存储、Ray model worker 和 FastAPI。
 - 必须登录账号后才能使用 RAG 系统，没有匿名访问模式。
 - 默认管理员账号为 `admin / 123456`，可通过环境变量改默认密码。
 - 管理员可以在前端创建用户、删除用户、重置密码、切换管理员权限、清空用户会话。
@@ -30,7 +25,7 @@ Compose profile 保留。
 - 支持 OpenAI-compatible、Anthropic 和可选本地 vLLM。
 - 默认使用 `jinaai/jina-embeddings-v5-text-small`，并为查询、文档和意图分类分别使用
   `retrieval` task + `query`/`document` prompt，以及 `classification` task。
-- Markdown 语料可替换，当前语料的关键词提示集中在意图路由 keyword 层。
+- Markdown语料可替换；`RAG-only`评测模式可将检索效果与应用专用意图提示分开测量。
 - 前端支持多会话、BM25 K、Cosine K、RRF K、Final K 调整、引用展示和路由结果展示。
 - 对话历史保存在后端，只在估算 prompt 接近当前 LLM 上下文窗口时才压缩成
   summary。
@@ -46,7 +41,8 @@ Compose profile 保留。
 Browser UI
    |
 FastAPI /auth, /sessions, /rag
-   |-- PostgreSQL users, login tokens, chat sessions, messages, summaries
+   |-- Redis active sessions + pending archive stream
+   |-- PostgreSQL users, settings, and complete session archive
    |
 IntentRouter
    |-- keyword rules and previous-route strong follow-up state
@@ -67,6 +63,10 @@ Answer + retrieved references + compacted conversation memory
 - `app/static/index.html`：浏览器聊天界面和管理员界面。
 - `app/session_store.py`：PostgreSQL 用户、登录 token、会话、消息、运行时
   LLM 设置、路由元数据和 summary。
+- `app/redis_session_store.py`：活跃Session、auth token缓存、Pending overlay、
+  Archive Stream原子写入、一致性冷加载，以及Redis不可用时严格返回HTTP 503。
+- `app/session_archive.py`：独立Redis Stream consumer；PG幂等提交成功后再清理
+  Pending并确认Stream事件。
 - `app/intent_router.py`：关键词/状态机、Jina classification embedding 和
   tagged LLM fallback 意图路由。
 - `app/rag.py`：混合召回、RRF 融合、重排、prompt 构造、基于上下文预算的历史压缩。
@@ -109,7 +109,8 @@ administrator 同时是唯一 superuser；只有这个 superuser 能在前端 Ad
 中的 LLM 默认值，不需要 rebuild 容器；`.env` 仍作为首次启动和未配置时的
 fallback。API key 不会回显给浏览器，保存时 key 输入框留空表示保留当前 key。
 
-启动 PostgreSQL、Qdrant、本机 MinIO S3 存储和 API：
+启动 Redis、Session Archiver、PostgreSQL、PgBouncer、Qdrant、本机 MinIO S3
+存储和 API：
 
 ```bash
 docker compose up --build
@@ -147,20 +148,36 @@ docker compose up -d --build --force-recreate
 docker compose down
 ```
 
-清空 PostgreSQL、Qdrant、MinIO 和 Hugging Face cache volume：
+清空 Redis、PostgreSQL、Qdrant、MinIO 和 Hugging Face cache volume：
 
 ```bash
 docker compose down -v
 ```
 
-默认 `compose.yaml` 会启动 PostgreSQL、Qdrant、MinIO、Ray head、三个 Ray
-model worker 和 `main` API 服务。`ray-worker-embedding-1` 带 Ray resource
-`ray_worker_embedding`，用于文档 embedding actor；`ray-worker-reranker-1` 和
+默认 `compose.yaml` 会启动 Redis、Session Archiver、PostgreSQL、PgBouncer、Qdrant、
+MinIO、Ray head、在线三个Ray model worker和`main` API服务，并增加三个有序的
+startup服务：`minio-init`、`ray-worker-embedding-bootstrap`和`docs-indexer`。
+bootstrap worker只服务离线文档embedding；`docs-indexer`负责同步MinIO、Qwen3
+tokenizer切分、跨文档64条批量embedding、候选collection验证和alias原子切换。
+成功后bootstrap worker退出并销毁CUDA context，再同时启动在线embedding worker和
+两个reranker replica。`main`提前启动但在本轮UUID ready marker前不启动Uvicorn，
+因此不会暴露半完成索引。
+
+`docs-update` profile另外提供按需启动的`ray-worker-embedding-ingest-cpu`和
+`docs-updater`。它们只负责运行中手动增量更新，使用独立的CPU embedding actor，
+不会停止或复用在线GPU embedding/reranker actor。
+
+`main`由显式安装的Uvicorn ASGI server启动，
+所有应用数据库连接先进入 transaction-mode PgBouncer，再复用少量 PostgreSQL
+server connection。在线`ray-worker-embedding-1`带Ray resource
+`ray_worker_embedding`，在actor内执行最多16条、等待10ms的跨请求query
+micro-batching；`ray-worker-reranker-1` 和
 `ray-worker-reranker-2` 分别带 `ray_worker_reranker_1` 和
 `ray_worker_reranker_2`，用于两个 reranker actor replica。`main` 容器只连接
 `ray://ray-head:10001`，默认 `RAY_LOCAL_FALLBACK=0`，不会把 embedding/reranker
 模型加载回 API 进程。Compose 还会启动 `autoheal`，它根据 Docker healthcheck
-重启适合单容器自愈的服务，例如 `qdrant` 和 `main`；Ray head/worker 不交给
+重启适合单容器自愈的服务，例如`redis`、`session-archiver`、`pgbouncer`、
+`qdrant`和`main`；Ray head/worker不交给
 autoheal 单独重启，避免把已有 Ray cluster 连接关系打散。
 
 Docker 服务架构：
@@ -172,87 +189,146 @@ flowchart TD
     subgraph Compose["Docker Compose 网络"]
         Main
         PG["postgres<br/>PostgreSQL<br/>用户 / 会话 / 消息 / 设置"]
+        PgBouncer["pgbouncer<br/>transaction connection pool<br/>复用 PostgreSQL server connections"]
+        Redis["redis<br/>32 GB volatile-lru热Session<br/>AOF everysec + 不可淘汰Pending/Stream"]
+        Archiver["session-archiver<br/>Redis consumer group<br/>PG幂等批量归档"]
         Qdrant["qdrant<br/>Qdrant<br/>向量 collection + alias"]
         MinIO["minio<br/>S3 兼容对象存储<br/>版本化文档"]
         MinIOInit["minio-init<br/>一次性 bucket 初始化<br/>开启 versioning"]
         RayHead["ray-head<br/>Ray 控制面<br/>ray://ray-head:10001"]
-        EmbedWorker["ray-worker-embedding-1<br/>Ray worker<br/>resource: ray_worker_embedding<br/>承载 kba_embedding actor"]
+        BootstrapEmbed["ray-worker-embedding-bootstrap<br/>临时离线GPU worker<br/>embedding batch: 64"]
+        DocsIndexer["docs-indexer<br/>一次性Qwen3 chunker<br/>S3同步 + 候选索引 + alias切换"]
+        CpuIngest["ray-worker-embedding-ingest-cpu<br/>docs-update profile<br/>CPU-only Ray worker"]
+        DocsUpdater["docs-updater<br/>docs-update profile<br/>manifest diff + 候选协调"]
+        EmbedWorker["ray-worker-embedding-1<br/>Ray worker: ray_worker_embedding<br/>kba_embedding actor<br/>query batch: 最大16 / 等待10 ms"]
         RerankWorker1["ray-worker-reranker-1<br/>Ray worker<br/>resource: ray_worker_reranker_1<br/>承载 kba_reranker_1 actor"]
         RerankWorker2["ray-worker-reranker-2<br/>Ray worker<br/>resource: ray_worker_reranker_2<br/>承载 kba_reranker_2 actor"]
-        HealthSupervisor["main health supervisor<br/>embedding / qdrant / reranker<br/>独立轻量探测"]
+        BM25Manager["main BM25S manager<br/>active + candidate双缓冲<br/>原子引用交换"]
+        HealthSupervisor["main health supervisor<br/>redis / embedding / qdrant / reranker<br/>独立轻量探测"]
         Autoheal["autoheal<br/>监控 Docker healthcheck<br/>重启 unhealthy 容器"]
         VLLM["vllm<br/>可选 local-llm profile<br/>OpenAI-compatible LLM 服务"]
     end
 
-    Main --> PG
+    Main --> Redis
+    Main --> PgBouncer
+    Redis --> Archiver
+    Archiver --> PgBouncer
+    PgBouncer --> PG
     Main --> Qdrant
     Main --> MinIO
     Main --> RayHead
+    Main --> BM25Manager
     MinIOInit --> MinIO
+    MinIOInit --> DocsIndexer
+    RayHead --> BootstrapEmbed
+    DocsIndexer --> MinIO
+    DocsIndexer --> BootstrapEmbed
+    DocsIndexer --> Qdrant
+    DocsIndexer --> StartupState["startup_state<br/>docs-ready / docs-failed / offline-stopped UUID"]
+    StartupState --> Main
+    StartupState --> BootstrapEmbed
+    BootstrapEmbed -- "退出并释放CUDA cache" --> EmbedWorker
+    BootstrapEmbed -- "退出并释放GPU" --> RerankWorker1
+    BootstrapEmbed -- "退出并释放GPU" --> RerankWorker2
     RayHead --> EmbedWorker
     RayHead --> RerankWorker1
     RayHead --> RerankWorker2
+    RayHead -. "docs-update profile" .-> CpuIngest
+    DocsUpdater -. "docs-update profile" .-> CpuIngest
+    DocsUpdater -. "同步 + 版本manifest" .-> MinIO
+    DocsUpdater -. "候选向量" .-> Qdrant
+    DocsUpdater -. "prepare / commit" .-> Main
+    DocsUpdater -. "本轮ready / failed" .-> StartupState
     Main --> HealthSupervisor
     HealthSupervisor -. "collection / alias 元信息" .-> Qdrant
+    HealthSupervisor -. "PING" .-> Redis
     HealthSupervisor -. "embedding actor readiness" .-> EmbedWorker
     HealthSupervisor -. "并行 reranker readiness<br/>任一 replica 健康即可" .-> RerankWorker1
     HealthSupervisor -. "并行 reranker readiness<br/>任一 replica 健康即可" .-> RerankWorker2
     Autoheal -. healthcheck .-> Main
+    Autoheal -. healthcheck .-> Redis
+    Autoheal -. healthcheck .-> Archiver
+    Autoheal -. healthcheck .-> PgBouncer
     Autoheal -. healthcheck .-> Qdrant
     Main -. 可选 .-> VLLM
     Main --> CloudLLM["云端 LLM API<br/>OpenAI-compatible / Anthropic"]
 
     subgraph Volumes["Docker volume 和 bind mount"]
         PGVol["postgres_data"]
+        RedisVol["redis_data<br/>AOF"]
         QVol["qdrant_storage"]
         S3Vol["minio_data"]
         HFVol["huggingface_cache"]
+        StartupVol["startup_state<br/>本轮启动握手"]
         DataBind["./data:/app/data:ro"]
         ModelsBind["./models:/models:ro"]
     end
 
     PG --> PGVol
+    Redis --> RedisVol
     Qdrant --> QVol
     MinIO --> S3Vol
     Main --> DataBind
     Main --> HFVol
+    Main --> StartupVol
     Main --> ModelsBind
     EmbedWorker --> HFVol
     EmbedWorker --> ModelsBind
+    DocsIndexer --> DataBind
+    DocsIndexer --> HFVol
+    DocsIndexer --> StartupVol
+    BootstrapEmbed --> HFVol
+    BootstrapEmbed --> StartupVol
     RerankWorker1 --> HFVol
     RerankWorker1 --> ModelsBind
     RerankWorker2 --> HFVol
     RerankWorker2 --> ModelsBind
+    CpuIngest --> HFVol
+    CpuIngest --> ModelsBind
+    CpuIngest --> StartupVol
+    DocsUpdater --> DataBind
+    DocsUpdater --> HFVol
+    DocsUpdater --> StartupVol
 ```
 
-默认 Compose 启动和镜像绑定的文档初始化流程：
+默认Compose两阶段启动和镜像/配置绑定的文档初始化流程：
 
 ```mermaid
 flowchart TD
     A["docker compose up --build"] --> B["构建 main 镜像"]
-    B --> C["把 DOCS_INIT_BUILD_ID 写入 /app/.image_build_id"]
-    A --> D["启动 postgres"]
-    A --> E["启动 qdrant"]
-    A --> F["启动 minio"]
-    A --> R["启动 Ray head 和模型 worker"]
-    F --> G["minio-init 创建 bucket 并开启 versioning"]
-    D --> H["main entrypoint 等待 PostgreSQL"]
-    E --> H
-    G --> H
-    R --> H
-    H --> I{"DOCS_SOURCE=s3 且 DOCS_INIT_ON_IMAGE_BUILD=1?"}
-    I -- "否" --> J["跳过自动文档初始化"]
-    I -- "是" --> K{"S3 或本地 marker 已记录这个 build id?"}
-    K -- "是" --> J
-    K -- "否" --> L["把 DOCS_DIR Markdown 同步到 S3"]
-    L --> M["构建版本化 Qdrant 文档索引"]
-    M --> N["写入 build-init marker"]
-    J --> O["启动 FastAPI"]
-    N --> O
+    B --> C["COPY data/docs并写入/app/.image_build_id"]
+    A --> Infra["并行启动main、PostgreSQL/Redis、qdrant、minio和ray-head"]
+    Infra --> Bucket["minio-init创建版本化bucket"]
+    Infra --> Offline["启动ray-worker-embedding-bootstrap<br/>写入本轮run UUID"]
+    Offline --> MainWait["main已启动，等待匹配的offline-stopped UUID"]
+    Bucket --> Indexer["启动一次性docs-indexer"]
+    Offline --> Indexer
+    Indexer --> Marker{"image build id和索引配置指纹都未变化?"}
+    Marker -- "是" --> Ready["写入匹配的ready UUID"]
+    Marker -- "否" --> Sync["同步当前Markdown集合到MinIO<br/>包含删除检测"]
+    Indexer -. "错误" .-> Failed["写入匹配的docs-failed UUID<br/>main立即终止启动等待"]
+    Sync --> Chunk["CPU Qwen3 tokenizer切分<br/>body 1600 + overlap 100/100"]
+    Chunk --> Batch["跨文档离线embedding<br/>batch size 64"]
+    Batch --> Candidate["写入并验证Qdrant候选collection"]
+    Candidate --> Alias["原子切换collection alias<br/>写S3 manifest"]
+    Alias --> Ready
+    Ready --> Stop["bootstrap embedding worker退出<br/>销毁CUDA context/cache"]
+    Stop --> Online["启动在线embedding worker<br/>动态batch 16 / 10ms"]
+    Stop --> RR1["启动reranker replica 1"]
+    Stop --> RR2["启动reranker replica 2"]
+    Stop --> MainWarm["main通过启动门并warmup在线actor"]
+    Online --> MainWarm
+    RR1 --> MainWarm
+    RR2 --> MainWarm
+    MainWarm --> API["Uvicorn/FastAPI ready"]
 ```
 
-普通 `docker compose restart` 不会重新扫描本地 Markdown。只有新的 `main` 镜像 build
-id，或显式修改 `DOCS_INIT_BUILD_ID`，才会让启动阶段再次执行 S3 文档初始化。
+普通`docker compose restart`不会重新扫描本地Markdown。新的image build id或索引
+配置指纹变化会让`docs-indexer`执行同步和manifest diff；只有语料或索引配置变化时
+才重建。镜像会COPY `data/docs`，因此语料变化会使构建层失效并产生新build id；
+同镜像重启不会同步或diff本地Markdown。BM25S只存在于进程内存，因此单独重启
+`main`会从已经提交的S3 active manifest重建active BM25S，但不会重新embedding、
+创建collection或移动Qdrant alias。
 
 ## 登录和用户管理
 
@@ -305,6 +381,21 @@ LLM_CONTEXT_PROMPT_OVERHEAD_TOKENS=2048
 POSTGRES_USER=kba
 POSTGRES_PASSWORD=kba_password
 POSTGRES_DB=kba
+PGBOUNCER_IMAGE=edoburu/pgbouncer:v1.25.2-p0
+REDIS_IMAGE=redis:8.2.7-alpine3.22
+REDIS_MAXMEMORY=32gb
+REDIS_CONTAINER_MEMORY_LIMIT=48g
+REDIS_CONTAINER_MEMORY_RESERVATION=36g
+PGBOUNCER_POOL_MODE=transaction
+PGBOUNCER_MAX_CLIENT_CONN=200
+PGBOUNCER_DEFAULT_POOL_SIZE=20
+PGBOUNCER_MIN_POOL_SIZE=2
+PGBOUNCER_RESERVE_POOL_SIZE=5
+PGBOUNCER_MAX_PREPARED_STATEMENTS=100
+REDIS_SESSION_ENABLED=1
+REDIS_SESSION_TTL_SECONDS=604800
+REDIS_ARCHIVE_BATCH_SIZE=200
+REDIS_ARCHIVE_BACKLOG_MAX=100000
 AUTOHEAL_IMAGE=willfarrell/autoheal:1.2.0
 AUTOHEAL_INTERVAL=10
 AUTOHEAL_START_PERIOD=30
@@ -327,7 +418,6 @@ DOCS_S3_REQUIRE_VERSIONING=1
 DOCS_S3_RETAIN_VERSIONS=5
 DOCS_S3_PROCESSING_RETAIN_VERSIONS=6
 DOCS_S3_MANIFEST_PREFIX=_kba/manifests/docs
-DOCS_INIT_ON_IMAGE_BUILD=1
 DOCS_INIT_DELETE_REMOVED=1
 QDRANT_RETAIN_VERSIONS=2
 QDRANT_PROCESSING_RETAIN_VERSIONS=3
@@ -339,12 +429,20 @@ EMBEDDING_CLASSIFICATION_TASK=classification
 EMBEDDING_QUERY_PROMPT_NAME=query
 EMBEDDING_PASSAGE_PROMPT_NAME=document
 EMBEDDING_CLASSIFICATION_PROMPT_NAME=
+EMBEDDING_DYNAMIC_BATCH_ENABLED=1
+EMBEDDING_DYNAMIC_BATCH_MAX_SIZE=16
+EMBEDDING_DYNAMIC_BATCH_WAIT_MS=10
+EMBEDDING_OFFLINE_BATCH_SIZE=64
 BM25_TOP_K=100
 RECALL_TOP_K=100
-RRF_TOP_K=100
+RRF_TOP_K=64
 RETRIEVE_TOP_K=5
-CHUNK_SIZE=2000
-CHUNK_OVERLAP=300
+CHUNK_TOKENIZER_MODEL=jinaai/jina-embeddings-v5-text-small
+CHUNK_TOKENIZER_TRUST_REMOTE_CODE=1
+CHUNK_BODY_TARGET_TOKENS=1600
+CHUNK_BODY_MAX_TOKENS=1600
+CHUNK_OVERLAP_TARGET_TOKENS=100
+CHUNK_OVERLAP_MAX_TOKENS=100
 RERANKER_ENABLED=1
 RERANKER_MODEL=jinaai/jina-reranker-v3
 RERANKER_PRELOAD=1
@@ -383,7 +481,7 @@ HEALTH_PROBE_RECOVERY_THRESHOLD=2
 然后用 RRF（reciprocal rank fusion）融合两路排序并保留 `RRF_TOP_K` 个候选，
 再使用多语言 `jinaai/jina-reranker-v3` cross-encoder 重排，最后只保留
 `RETRIEVE_TOP_K` 个 chunk 进入 LLM prompt 和引用列表。前端对应控件为 `BM25 K`、
-`Cosine K`、`RRF K` 和 `Final K`，默认分别为 `100`、`100`、`100` 和 `5`。
+`Cosine K`、`RRF K` 和 `Final K`，默认分别为 `100`、`100`、`64` 和 `5`。
 `/health/details` 会返回当前生效的默认值，前端登录后用这些值初始化四个控件。
 默认 embedding 模型是 `jinaai/jina-embeddings-v5-text-small`。文档 chunk 和
 检索 query 都使用 `retrieval` task，并分别使用 `document` 和 `query` prompt；
@@ -391,6 +489,17 @@ HEALTH_PROBE_RECOVERY_THRESHOLD=2
 history 和 summary 视图，不会直接把 256K 级别的主 summary 整段喂给 encoder。
 这些 intent 预算目前是字符级保护；如果 encoder 仍然报错，router 会跳过第二层并
 进入 LLM classifier，而不是让请求失败。
+
+在线单query embedding调用会在Ray Embedding Actor内动态合批。默认最多等待10 ms，
+把最多16个兼容query组成一个GPU batch；batch填满后立即执行，不继续等待deadline。
+不同task、prompt和normalization mode使用独立队列，因此classification和retrieval
+输入不会混批。一次性`docs-indexer`绕过在线队列，将不同文档的chunk累计成
+`EMBEDDING_OFFLINE_BATCH_SIZE=64`的请求并交给bootstrap actor。alias提交后bootstrap
+worker退出，在线actor使用全新的CUDA allocator，不继承离线峰值缓存。模型的32K
+context上限约束的是batch内每条sequence，
+不是整个GPU batch的token总和。Actor的轻量`health()`响应和检索压测报告会暴露
+配置batch size、等待时间、队列深度、batch数、请求数和实际平均batch size。
+`SEARCH_QUERY_MAX_CHARS=3000`仍是检索query的字符级保护，与模型token上限相互独立。
 
 意图路由是状态感知的，但不会把所有历史塞给每一层。第一层会把当前语料外的通用
 技术/数据库问题判 direct；也只在上一轮 assistant 确实使用过检索 contexts，且
@@ -418,29 +527,44 @@ embedding actor 和 2 个 Jina reranker actor replica 作为 detached named acto
 API 进程本地加载这些模型。设置 `CUDA=FALSE` 可强制 Ray worker 和 actor 资源请求
 都走 CPU。默认镜像使用 PyTorch CUDA runtime 镜像，不需要在宿主机安装 CUDA
 toolkit。
+
+文档版本闸门只覆盖query embedding、BM25/Qdrant召回和RRF。提交新版本时，新进入的
+召回会排队，已经处于闸门内的召回会先排空；已经进入reranker或LLM生成的请求不在
+等待计数中。RRF完成后会先释放闸门，再调用reranker，因此两个reranker replica和
+direct/RAG的LLM生成都不会被索引指针交换阻塞。
+
 `jina-reranker-v3` 是 listwise reranker；召回数量超过
-`RERANKER_MAX_DOCUMENTS_PER_CALL` 时会分批重排，再按分数全局排序。
+`RERANKER_MAX_DOCUMENTS_PER_CALL` 时会分批重排，再按分数全局排序。默认
+`RRF_TOP_K=64`与`RERANKER_MAX_DOCUMENTS_PER_CALL=64`对齐，因此默认检索只调用
+一次reranker。每个组装后chunk硬上限为1800个Qwen3 token，因此64个候选最多贡献
+115,200个文档token，低于reranker的131,072 token上下文，并为query、来源/标题和
+模型模板保留空间；请求显式传入大于64的值时仍会安全分批。
 
 Query 时的文档 RAG pipeline：
 
 ```mermaid
 flowchart TD
-    A["浏览器 / POST /rag"] --> B["从 PostgreSQL 读取会话、压缩记忆和运行配置"]
-    P["后台组件健康状态<br/>embedding / qdrant / reranker<br/>正常 10s 探测，降级 3s 探测<br/>reranker replicas 独立探测"]
+    A["浏览器 / POST /rag"] --> RS{"Redis Session存储可访问?"}
+    RS -- "否" --> R503["HTTP 503 + Retry-After: 3<br/>禁止返回过期PG历史"]
+    RS -- "是" --> B["从Redis读取活跃Session<br/>miss时合并PG归档+Pending"]
+    P["后台组件健康状态<br/>redis / embedding / qdrant / reranker<br/>正常10s探测，降级3s探测<br/>reranker replicas独立探测"]
     B --> C{"开启 RAG-only?"}
     C -- "是" --> F["强制 RAG route"]
     C -- "否" --> D["意图路由"]
     D --> E{"是否需要本地文档?"}
     E -- "否" --> Z["直接调用 LLM 对话"]
     E -- "是" --> F
-    F --> G["通过 Ray embedding actor embed 查询"]
-    F --> H["BM25S 关键词召回<br/>优先 S3 active manifest + Markdown<br/>Qdrant payload scroll 兜底"]
+    F --> GateIn["进入文档版本召回闸门"]
+    GateIn --> G["Ray Embedding Actor<br/>动态合批：最大16 / 等待10 ms"]
+    GateIn --> H["BM25S 关键词召回<br/>优先 S3 active manifest + Markdown<br/>Qdrant payload scroll 兜底"]
     G --> I["Qdrant 通过 tech_docs alias 做向量召回"]
     P -. "embedding 或 qdrant degraded 时跳过向量召回" .-> G
     P -. "qdrant degraded 时跳过向量召回" .-> I
     H --> J["RRF 融合"]
     I --> J
-    J --> R{"reranker 组件健康?<br/>至少一个 replica ready"}
+    J --> GateOut["释放文档版本召回闸门"]
+    Commit["增量索引提交<br/>只排队新召回并排空进行中的召回"] -. "alias + manifest + BM25指针交换" .-> GateIn
+    GateOut --> R{"reranker 组件健康?<br/>至少一个 replica ready"}
     P -. "最近一次健康快照" .-> R
     R -- "是" --> K["通过 Ray replicas 精排<br/>轮转 kba_reranker_1/_2"]
     K --> S{"选中的 replica 调用成功?"}
@@ -451,12 +575,32 @@ flowchart TD
     U --> L
     L --> M["拼接引用、会话记忆和 prompt"]
     M --> N["LLM 生成回答"]
-    N --> O["把消息、route metadata 和 retrieved contexts 快照写入 PostgreSQL"]
+    N --> O["Redis原子写入<br/>Hot messages + Pending payload + Stream引用"]
+    O -. "Redis写入失败" .-> R503
+    O --> V["不等待PG归档，直接返回"]
+    O --> W["session-archiver批量消费"]
+    W --> X["通过PgBouncer提交PG"]
+    X --> Y["HDEL Pending + XACK/XDEL Stream"]
 ```
 
-PostgreSQL 不保存文档 chunk 的 canonical 副本。PG 负责用户、会话、运行设置、消息
-和历史回答用到的 retrieved contexts 快照；当前 chunk text 存在 Qdrant payload
-里，并且可以从 S3 原文重新构建。
+PostgreSQL不保存文档chunk的canonical副本。PG负责用户、运行设置和完整的Session/
+消息归档，包括历史回答的retrieved contexts快照；Redis是活跃Session读写路径。
+带滑动TTL的Session cache key可以被`volatile-lru`淘汰；Pending Hash和Archive
+Stream没有TTL，不会被淘汰。Archiver必须先PG commit，之后才能确认并清理Redis
+归档数据。完整exchange只在Hot Messages List和Pending Hash中各保存一份；Stream
+只保存`event_id`和`session_id`引用，Archiver会批量读取对应Pending payload，不再在
+Stream entry中复制完整内容。
+只有Redis仍可访问时才允许cache miss冷加载，这样返回前可以合并PG历史与
+尚未归档的Pending exchange。Redis不可用或Archive backlog达到上限时，Session读写
+统一返回带`Retry-After: 3`的HTTP `503`；不会返回可能过期的PG-only历史，也不会同步
+fallback写PG。账号鉴权仍可访问PG，因为账号数据本来就以PG为canonical source，
+不属于活跃会话状态。第一次尚未被后台探测发现的故障最多消耗一次Redis socket
+timeout；之后进程内熔断会立即返回503。恢复探测只由后台health supervisor执行，
+不会让用户请求周期性等待Redis恢复检查。文档chunk text仍保存在Qdrant payload，
+并且可以从S3原文重新构建。
+`appendfsync everysec`明确接受约1秒AOF持久化窗口。Redis容器在32GB `maxmemory`
+外预留到48GB；Linux宿主机应设置`vm.overcommit_memory=1`，避免AOF rewrite fork被
+内核拒绝。
 
 检索降级不会 silent failure。后台会独立探测 `embedding`、`qdrant` 和
 `reranker` 三个组件：正常状态每 10 秒探测一次，连续 2 次失败后才进入 degraded；
@@ -487,6 +631,13 @@ degraded 或调用失败时才使用 RRF 粗排结果并按 `Final K` 截断。
 重启 unhealthy 容器；`ray-head` 和 Ray worker 保留 `restart: unless-stopped`，仅在
 Ray 进程退出时由 Docker 重启。Ray actor 级异常由 Ray 的 actor restart 和应用健康
 探测/fallback 处理，避免单独重启 head 后留下旧 worker/actor 连接。
+
+这里有意只做进程级恢复，不实现索引存储灾备状态机。Qdrant普通重启会继续挂载
+`qdrant_storage`，无需重新chunk或embedding；collection或volume损坏时保持
+BM25-only，由运维显式从S3执行CPU offline rebuild。该低概率路径保持手动，避免为
+长期只读的数据卷引入过高复杂度。BM25S是`main`内存索引：单次异常会降级到
+Qdrant-only，但目前没有独立BM25S健康探测和后台自动重建；重启`main`或成功提交
+文档更新会重建或替换它。
 
 默认 Compose 配置会把 GPU 暴露给 `ray-worker-embedding-1`、
 `ray-worker-reranker-1` 和 `ray-worker-reranker-2`；`main` 容器只是 Ray client，
@@ -552,12 +703,14 @@ data/code/lightgbm/ # 另一个源码仓库
 ```
 
 普通重启不会扫描本地 Markdown。local 模式下，文档索引用
-`python scripts/ingest_docs.py` 手动触发。S3 模式下，容器只会按 Docker image
-build id 初始化一次文档：`docker compose up --build` 生成镜像 marker，第一次启动
-会把 `DOCS_DIR` 同步到 S3 并构建版本化索引；之后 `docker compose restart` 会直接
-跳过，不扫描文档。如果源码没有变化但需要强制重新初始化 S3，可在
+`python scripts/ingest_docs.py` 手动触发。S3 模式下，`docs-indexer`按Docker image
+build id和索引配置指纹初始化文档：`docker compose up --build`生成镜像marker，
+marker或配置指纹变化时才把`DOCS_DIR`同步到S3并构建版本化索引；之后
+`docker compose restart`会跳过本地同步和diff。如果源码没有变化但需要强制
+初始化，可在
 `docker compose up --build` 前把 `DOCS_INIT_BUILD_ID` 改成新值。代码索引按需触发：
-打开浏览器 UI，切换到 `Code`，选择 `data/code` 下的仓库并点击 `Index`。也可以登录后调用 API：
+打开浏览器UI，切换到`Code`，选择`data/code`下的仓库并点击`Index`。也可以登录后
+调用API：
 
 ```bash
 curl -sS http://localhost:8080/code/index \
@@ -602,11 +755,27 @@ OpenAI-compatible 使用 `GET /models`，Anthropic 使用
 
 local 模式下，`data/docs/` 下的 Markdown 文件是 RAG 语料来源。S3 模式下，
 配置的 S3 bucket/prefix 是语料真源，`QDRANT_COLLECTION` 会作为稳定 alias 指向
-当前生效的版本化 Qdrant collection。当前提交的样例语料是家是本餐饮创业案例，
-包含公司概览、FAQ、菜单与定价、顾客评价、B站评论、社交媒体存档、财务模拟、
-时间线、朱剑秋人物侧写、勇哥连线事件、“巨大历史机遇/巨大历史鲫鱼”梗文档和
-歌曲文档。检索链路使用 BM25 关键词召回、Qdrant 向量召回、RRF 融合和可选
-reranker。
+当前生效的版本化 Qdrant collection。当前语料递归存放在`data/docs/RAGBench/`，
+包含RAGBench `cuad`测试集的102份Markdown合同文档。`RAGBench_Eval/corpus.jsonl`
+保存原始记录，`RAGBench_Eval/queries.jsonl`保存500条标注query。文档召回评测应使用
+`RAG-only`。当前`DOMAIN_RAG_PHRASES`、`DOMAIN_RAG_PATTERNS`和intent-router评测
+样例仍用于演示上一版语料域；正式评估CUAD的自动意图路由前需要单独更新。检索链路
+使用BM25关键词召回、Qdrant向量召回、RRF融合和可选reranker。
+
+Markdown chunker会复用`jinaai/jina-embeddings-v5-text-small`附带的Qwen3 tokenizer，
+但`main`只加载tokenizer，不加载embedding权重。同一标题section内按完整段落装箱，
+body目标1600 token且硬上限同为1600 token；遇到标题变化立即结束当前chunk，因此
+很短的section保持短chunk。超长正文优先按句子切，单句仍过长时继续按子句、词和
+最终token边界切，不按任意字符位置截断。每个text chunk可从前一个和后一个body
+分别加入目标/最大100 token的双向overlap，且禁止跨标题；分隔符计入各自overlap
+预算，因此组装后的派生硬上限是`1600 + 100 + 100 = 1800` token。text、code、table
+继续分开处理；只有显式围栏代码块才按code处理，视觉缩进的长正文仍作为text装箱。
+代码围栏保持完整；标题存入metadata并加入embedding input，不重复写入chunk正文。
+YAML frontmatter会先被解析并从正文移除，其中`title`作为文档级
+标题metadata，正文原始行号保持不变。Qdrant payload会保存body、前后overlap和
+组装后的token计数。S3 manifest会记录chunk算法版本、tokenizer和全部token预算，
+因此之后手动
+更新文档时会构建新索引版本，不会复用旧chunker生成的向量。
 
 替换知识库步骤：
 
@@ -617,12 +786,28 @@ reranker。
    python scripts/ingest_docs.py --recreate
    ```
 
-   S3 模式下先同步对象存储，再构建新索引版本：
+   Compose S3模式使用统一离线生命周期脚本，不要直接让在线actor执行ingest：
 
    ```bash
-   python scripts/sync_docs_to_s3.py --docs-dir data/docs --delete-removed
-   python scripts/ingest_docs.py --source s3
+   ./scripts/update_docs.sh
    ```
+
+   对外暴露`main`前必须把`DOCS_COMMIT_TOKEN`改成非默认值；内部prepare/commit端点
+   会校验该共享token。CPU更新容量和超时由`DOCS_CPU_INGEST_THREADS`、
+   `DOCS_CPU_INGEST_ACTOR_NUM_CPUS`、`EMBEDDING_CPU_INGEST_BATCH_SIZE`和
+   `DOCS_CPU_INGEST_TIMEOUT_SECONDS`控制。
+
+   脚本只启动`docs-update` profile中的CPU ingest worker和一次性updater，不会停止
+   或重建在线embedding与两个reranker。临时Ray node声明0 GPU，并使用独立的
+   `ray_worker_embedding_ingest`资源和`kba_embedding_ingest_cpu` actor名，因此
+   离线actor不会被调度到在线GPU worker。更新结束前会用`no_restart`永久删除该
+   detached actor，再停止临时Ray node，避免退出后被Ray重新调度。
+
+   S3同步、manifest diff、chunk、CPU embedding、Qdrant候选写入和完整BM25S候选
+   重建期间，上一版索引持续服务。`main`在内存中保留`active`和`candidate`两个
+   BM25S引用；后台从完整候选manifest构建`candidate`，线上查询始终读取`active`。
+   代价是准备阶段BM25S内存短暂翻倍，但不会暴露半成品。若diff为空，不加载
+   embedding模型，也不切换任何索引指针。
 
 3. 如需让意图路由识别新语料主题，更新 `app/intent_router.py` 中的
    `DOMAIN_RAG_PHRASES`、`DOMAIN_RAG_PATTERNS`、LLM fallback 的语料描述，以及
@@ -636,32 +821,40 @@ S3 增量更新 pipeline：
 
 ```mermaid
 flowchart TD
-    A["编辑 data/docs 下的 Markdown"] --> B["sync_docs_to_s3.py --delete-removed"]
-    B --> C["上传新增或变更的 .md 对象，并写 content-sha256 metadata"]
-    B --> D["为已删除的 Markdown 写 delete marker"]
-    C --> E["S3 当前对象列表"]
-    D --> E
-    E --> F["ingest_docs.py --source s3"]
-    F --> G["读取 active manifest"]
-    F --> H["完整扫描当前 S3 .md 列表"]
-    G --> I["按 source_doc_id、VersionId、ETag、size、content hash 做 diff"]
-    H --> I
-    I --> J["新增或修改文档"]
-    I --> K["未变化文档"]
-    I --> L["已删除文档"]
-    J --> M["按精确 S3 VersionId 读取、Markdown chunk、embed、upsert"]
-    K --> N["从上一版 collection 复制已有 Qdrant points 和 vectors"]
-    L --> O["不复制已删除文档的 chunks"]
-    M --> P["新的候选 Qdrant collection"]
-    N --> P
-    O --> P
-    P --> Q{"校验 chunk 数量"}
-    Q -- "失败" --> R["删除候选 collection，alias 保持上一版 active"]
-    Q -- "通过" --> S["写 version manifest"]
-    S --> T["把 Qdrant alias 切到候选 collection"]
-    T --> U["写 active manifest"]
-    U --> V["稳定保留: S3 每 key 5 版; Qdrant 当前版加回滚版"]
+    A["编辑 data/docs 下的 Markdown"] --> B["scripts/update_docs.sh"]
+    B --> C["启动docs-updater + 临时CPU Ray worker<br/>在线GPU actor继续服务"]
+    C --> D["把新增/修改/删除同步到版本化MinIO"]
+    D --> E["写processing候选manifest<br/>固定精确S3 VersionId"]
+    E --> F["读取上一版manifest + 完整候选manifest"]
+    F --> G["按source_doc_id、VersionId、ETag、size、content hash和索引配置diff"]
+    G --> H["新增 / 修改文档"]
+    G --> I["未变化文档"]
+    G --> J["已删除文档"]
+    E --> BM["main后台构建完整BM25S candidate<br/>active BM25S继续服务"]
+    H --> K["Qwen3切新增chunk<br/>CPU actor只向量化新chunk"]
+    I --> L["复制原Qdrant points + vectors"]
+    J --> M["不复制已删除文档的任何chunk"]
+    K --> N["候选Qdrant collection"]
+    L --> N
+    M --> N
+    N --> Q{"Qdrant数量校验通过且<br/>BM25 candidate ready?"}
+    BM --> Q
+    Q -- "否" --> Fail["丢弃Qdrant/BM25候选<br/>active alias和BM25不变"]
+    Q -- "是" --> Gate["关闭召回闸门<br/>新召回排队；进行中召回排空"]
+    Gate --> Alias["Qdrant alias切到候选collection"]
+    Alias --> Manifest["提交并校验S3 active manifest"]
+    Manifest --> Swap["交换BM25 active/candidate引用"]
+    Swap --> Release["打开闸门<br/>排队召回统一读取新版本"]
+    Release --> Cleanup["no_restart删除CPU actor<br/>停止临时Ray node"]
+    Cleanup --> Keep["稳定保留：S3最新5版<br/>Qdrant active + rollback"]
+    Gate -. "不等待" .-> Outside["Reranker和LLM在闸门外继续执行"]
+    D -. "pipeline错误" .-> Fail
 ```
+
+只有最后的短提交窗口会关闭召回闸门。排空和排队范围仅包括query embedding、
+BM25S、Qdrant和RRF；已经离开召回阶段的reranker与LLM不读取可变索引，因此继续
+执行且不计入drain。提交窗口依次切换Qdrant alias、提交active S3 manifest并交换
+BM25S引用，然后统一释放排队请求。
 
 local ingest 会递归扫描子目录，并用当前 Markdown 文件替换同一 source 的旧 chunk，
 避免修改或缩短文件后留下陈旧 chunk。删除文档、整体替换语料或修改 embedding
@@ -674,8 +867,10 @@ S3 文件列表生成 manifest，而不是只扫描“变动/新增”的文件�
 `DOCS_S3_MANIFEST_PREFIX` 下；每个 chunk payload 都带 `source_doc_id` 和
 `version_id`。构建新版本时，会创建新的物理 Qdrant collection：未变更文档从旧
 collection 复制已有向量，新增/修改文档重新 chunk + embed，删除文档不会被复制进
-新 collection。验证通过后才把 `QDRANT_COLLECTION` alias 切到新 collection；旧
-collection 和 S3 对象版本会保留，方便回滚。
+新 collection。Qdrant和BM25S两个候选都通过校验后，协调提交才会在同一个召回
+闸门内切换`QDRANT_COLLECTION` alias和BM25S active引用；旧collection和S3对象
+版本继续保留。提交前失败只丢弃候选；提交过程失败会在重新打开闸门前尝试恢复
+上一版alias和manifest。
 
 版本保留策略默认开启。稳定状态下，S3 每个 Markdown key 保留最新 5 个对象版本
 （包含最新可用版本）；Qdrant 保留最新 2 个文档索引 collection（包含当前 alias
@@ -727,7 +922,7 @@ curl http://localhost:8080/rag \
     \"question\": \"When should I choose DuckDB over ClickHouse?\",
     \"bm25_top_k\": 100,
     \"recall_top_k\": 100,
-    \"rrf_top_k\": 100,
+    \"rrf_top_k\": 64,
     \"top_k\": 5
   }"
 ```
@@ -735,7 +930,8 @@ curl http://localhost:8080/rag \
 `/rag` 的历史由服务端根据 `session_id` 从 PostgreSQL 管理，客户端不需要传完整
 history。
 
-返回的 `contexts` 会同时写入 PostgreSQL 的 assistant 消息，是验证检索链路最可靠
+返回的 `contexts` 会先写入Redis热消息，再由Archiver写入PostgreSQL assistant消息，
+是验证检索链路最可靠
 的位置。`retrieval_source=hybrid` 表示同一个 chunk 同时被 BM25 和向量召回命中；
 纯向量或纯 BM25 命中只会有对应的 `vector_score` 或 `bm25_score`。`rrf_score`
 表示已经经过 RRF 融合，`rerank_score` 表示 Jina cross-encoder reranker 已运行。
@@ -764,13 +960,137 @@ pip install -r requirements.txt
 python -m compileall app scripts
 python scripts/test_settings.py
 python scripts/test_session_store.py
+docker compose exec -T main python scripts/test_redis_session.py
 python scripts/test_prompt_budget.py
 python scripts/test_chunking.py
+# 在main镜像/共享HF cache内按真实Qwen3 token验证语料。
+python scripts/test_chunking.py --real-tokenizer
 python scripts/test_intent_router.py
 python scripts/intent_router_ab.py --fake-embedder
 python scripts/test_reranker.py
+python scripts/test_embedding_batcher.py
 python scripts/test_vector_store.py
+python scripts/test_document_commit.py
 ```
+
+### Session链路压测
+
+Compose服务已经启动时，用固定10 QPS压测Session存储链路：
+
+```bash
+docker compose run --rm --no-deps \
+  -v /tmp:/bench-output \
+  --entrypoint python main \
+  scripts/bench_session_pipeline.py \
+  --rate 10 --duration 60 --warmup-seconds 10 \
+  --session-count 32 --workers 32 \
+  --output /bench-output/kba_session_benchmark_10qps.json
+```
+
+脚本直接调用`RedisSessionStore`，只覆盖
+`Redis -> Stream -> session-archiver -> PostgreSQL`，明确不包含HTTP、LLM生成、
+意图路由和检索。报告包含实际完成QPS、服务处理/排队/定时端到端的
+P50/P95/P99、Stream峰值/平均/最终backlog、归档吞吐和排空时间，以及精确的
+消息数与event id一致性校验。脚本结束后会删除本次压测Session。
+
+2026-07-10本机固定10 QPS验证结果：正式阶段600/600写入成功、错误数0，实际完成
+QPS为10.016；服务处理延迟P50 2.875 ms / P95 3.440 ms / P99 3.941 ms；
+定时端到端延迟P50 3.038 ms / P95 3.629 ms / P99 4.140 ms；Stream backlog
+峰值1、最终0；归档吞吐10.000 events/s。该结果是固定负载下的正确性基线，
+不是系统最大容量。
+
+闭环模式用于测量短时接收峰值：
+
+```bash
+docker compose run --rm --no-deps \
+  -v /tmp:/bench-output \
+  --entrypoint python main \
+  scripts/bench_session_pipeline.py \
+  --mode closed-loop --concurrency 1 --duration 5 \
+  --warmup-seconds 0 --session-count 128 --workers 1 \
+  --max-requests 5000 --max-backlog 5000 \
+  --output /bench-output/kba_session_peak.json
+```
+
+同一套本机部署保持Redis AOF开启，得到两个必须分开解释的容量指标。5秒受控突发
+完成5000/5000 event，接收峰值为1016.4 QPS、服务P99为2.44 ms，但backlog
+以325.6 events/s增长，停止写入后需要2.49秒排空，因此它只是突发峰值，不是
+可持续吞吐。固定450 QPS运行60秒时，27000/27000 event成功，实际完成449.18
+QPS，归档吞吐448.99 events/s；Stream结束backlog为0、峰值79、拟合增长斜率
+0.034 events/s，PG中的54000条消息全部存在且event id唯一。服务延迟P50为
+2.40 ms、P95为143.28 ms、P99为149.72 ms，定时端到端P99为391.19 ms；
+尾延迟包含自动AOF rewrite成本。600 QPS offered-load测试实际饱和在约451 QPS并
+产生客户端排队，因此不能写成可持续容量。
+
+### 检索链路压测
+
+检索压测直接调用生产检索协调器：
+
+```text
+BM25S ───────────────┐
+                    ├─ RRF ─ 两个Ray Reranker副本
+Ray Embedding ─ Qdrant ┘
+```
+
+测试明确排除HTTP、Session持久化、意图路由和LLM生成。闭环饱和测试与固定速率
+持续测试命令如下：
+
+```bash
+docker compose run --rm --no-deps \
+  -v /tmp:/bench-output \
+  --entrypoint python main \
+  scripts/bench_retrieval_pipeline.py \
+  --mode closed-loop --concurrency 16 --workers 16 \
+  --duration 30 --warmup-requests 4 --max-requests 600 \
+  --output /bench-output/kba_retrieval_dynamic16_peak_c16.json
+
+docker compose run --rm --no-deps \
+  -v /tmp:/bench-output \
+  --entrypoint python main \
+  scripts/bench_retrieval_pipeline.py \
+  --mode fixed-rate --rate 9 --workers 16 \
+  --duration 60 --warmup-requests 4 --max-requests 700 \
+  --output /bench-output/kba_retrieval_dynamic16_sustained_9qps_60s.json
+```
+
+2026-07-10本机RTX 5090的合批前基线使用1个Jina v5 text Embedding Actor、2个
+Jina Reranker v3 Actor，BM25/向量Top K均为100、RRF K为64、Final K为5。
+并发8闭环完成213/213请求，无degradation，峰值10.27 QPS；检索延迟P50为
+769.0 ms、P95为806.6 ms、P99为928.7 ms。固定9 QPS运行60秒完成540/540，
+实际8.962 QPS；检索P50/P99为250.2/418.2 ms，客户端排队增长仅0.024 ms/s。
+12 QPS过载对照饱和在9.66 QPS，排队以211.5 ms/s增长，检索P99为1.82秒。
+
+启用此前“最大8、等待5 ms”的动态合批后，并发8闭环完成212/212，吞吐10.22
+QPS。Embedding P50从592.5 ms降至175.4 ms，但成批释放请求把排队转移到两个
+reranker：reranker P50从161.1 ms升至546.4 ms，检索P99升至1.229秒。Actor
+对214个正式query embedding组成161个batch，平均batch size为1.33，观测到的
+最大batch为7。固定9 QPS下，请求间隔较大，平均batch size仅1.002；实际吞吐
+8.982 QPS，检索P50/P99为265.4/426.8 ms，排队斜率保持在0.013 ms/s。
+
+12 QPS过载对比体现了保护效果：完成吞吐从9.66升至10.31 QPS，客户端排队斜率
+从211.5降至126.0 ms/s，端到端P99从7.32秒降至5.70秒，Embedding P50从
+1.47秒降至181.5 ms。但该负载仍不可持续，reranker P99升至2.59秒。因此动态
+合批能在竞争时提高embedding效率，却不能单独提高平衡后的端到端容量；下一步约束
+是reranker准入控制或增加下游容量。BM25S和Qdrant仍只占总延迟的小部分。由于
+每次Rerank最多传输64个候选chunk，累计任务payload超过10 MB后Ray Client会提示
+细粒度任务传输开销；压缩Actor参数或使用object reference仍属于后续优化。
+
+随后对当前“最大16、等待10 ms”配置使用相同检索参数重新完整压测。四组测试均为
+0 error、0 degradation：
+
+| 负载 | 实际完成QPS | 端到端P50 / P95 / P99 | 排队斜率 | 平均Embedding batch | 定性 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 闭环并发16 | 10.301 | 1.540 / 2.562 / 2.637 s | 不适用 | 1.498 | 短时峰值 |
+| 固定9 QPS，60秒 | 8.968 | 325.9 / 424.8 / 535.3 ms | 0.048 ms/s | 1.017 | 保守可持续负载 |
+| 固定10 QPS，60秒 | 9.963 | 398.8 / 566.1 / 639.3 ms | 0.021 ms/s | 1.210 | 实测容量边界 |
+| 固定12 QPS，30秒 | 10.390 | 2.231 / 5.481 / 5.780 s | 83.419 ms/s | 1.504 | 过载，不可持续 |
+
+闭环测试观测到的最大Embedding batch为15。固定9 QPS时均匀请求间隔约111 ms，
+所以10 ms窗口几乎无法合批，这是预期行为。固定10 QPS在60秒观察期内没有客户端
+backlog增长，但服务延迟仍有2.044 ms/s的正斜率，因此它是容量边界，不是长时间
+稳定性保证。固定12 QPS时系统饱和在约10.39 QPS，reranker P99达到3.67秒，说明
+当前过载约束是两个reranker replica，而不是embedding显存。可复现JSON报告保存在
+压测宿主机的`/tmp/kba_retrieval_dynamic16_*.json`。
 
 手动运行 FastAPI：
 
@@ -793,7 +1113,7 @@ HF_ENDPOINT=https://hf-mirror.com
 ```bash
 DOCKER_HTTP_PROXY=http://host.docker.internal:7890
 DOCKER_HTTPS_PROXY=http://host.docker.internal:7890
-DOCKER_NO_PROXY=postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+DOCKER_NO_PROXY=postgres,pgbouncer,redis,session-archiver,qdrant,minio,vllm,main,docs-indexer,docs-updater,ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-ingest-cpu,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 GRPC_ENABLE_FORK_SUPPORT=0
 ```
 

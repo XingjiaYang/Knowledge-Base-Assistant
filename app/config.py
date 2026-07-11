@@ -139,6 +139,16 @@ class Settings:
         "DOCS_S3_MANIFEST_PREFIX",
         "_kba/manifests/docs",
     )
+    docs_commit_url: str = os.getenv("DOCS_COMMIT_URL", "")
+    docs_commit_token: str = os.getenv("DOCS_COMMIT_TOKEN", "")
+    docs_commit_http_timeout_seconds: float = _env_float(
+        "DOCS_COMMIT_HTTP_TIMEOUT_SECONDS",
+        1800.0,
+    )
+    docs_commit_drain_timeout_seconds: float = _env_float(
+        "DOCS_COMMIT_DRAIN_TIMEOUT_SECONDS",
+        360.0,
+    )
     qdrant_retain_versions: int = _env_int("QDRANT_RETAIN_VERSIONS", 2)
     qdrant_processing_retain_versions: int = _env_int(
         "QDRANT_PROCESSING_RETAIN_VERSIONS",
@@ -169,11 +179,40 @@ class Settings:
         "EMBEDDING_CLASSIFICATION_PROMPT_NAME",
         "",
     )
-    chunk_size: int = _env_int("CHUNK_SIZE", 2000)
-    chunk_overlap: int = _env_int("CHUNK_OVERLAP", 300)
+    embedding_dynamic_batch_enabled: bool = _env_bool(
+        "EMBEDDING_DYNAMIC_BATCH_ENABLED",
+        True,
+    )
+    embedding_dynamic_batch_max_size: int = _env_int(
+        "EMBEDDING_DYNAMIC_BATCH_MAX_SIZE",
+        16,
+    )
+    embedding_dynamic_batch_wait_ms: float = _env_float(
+        "EMBEDDING_DYNAMIC_BATCH_WAIT_MS",
+        10.0,
+    )
+    embedding_offline_batch_size: int = _env_int(
+        "EMBEDDING_OFFLINE_BATCH_SIZE",
+        64,
+    )
+    chunk_tokenizer_model: str = os.getenv(
+        "CHUNK_TOKENIZER_MODEL",
+        os.getenv("EMBEDDING_MODEL", "jinaai/jina-embeddings-v5-text-small"),
+    )
+    chunk_tokenizer_trust_remote_code: bool = _env_bool(
+        "CHUNK_TOKENIZER_TRUST_REMOTE_CODE",
+        True,
+    )
+    chunk_body_target_tokens: int = _env_int("CHUNK_BODY_TARGET_TOKENS", 1600)
+    chunk_body_max_tokens: int = _env_int("CHUNK_BODY_MAX_TOKENS", 1600)
+    chunk_overlap_target_tokens: int = _env_int(
+        "CHUNK_OVERLAP_TARGET_TOKENS",
+        100,
+    )
+    chunk_overlap_max_tokens: int = _env_int("CHUNK_OVERLAP_MAX_TOKENS", 100)
     bm25_top_k: int = _env_int("BM25_TOP_K", 100)
     recall_top_k: int = _env_int("RECALL_TOP_K", 100)
-    rrf_top_k: int = _env_int("RRF_TOP_K", 100)
+    rrf_top_k: int = _env_int("RRF_TOP_K", 64)
     retrieve_top_k: int = _env_int("RETRIEVE_TOP_K", 5)
     retrieve_score_threshold: float = _env_float("RETRIEVE_SCORE_THRESHOLD", 0.0)
     api_top_k_max: int = _env_int("API_TOP_K_MAX", 20)
@@ -358,6 +397,50 @@ class Settings:
     auth_session_ttl_seconds: int = _env_int("AUTH_SESSION_TTL_SECONDS", 604800)
     session_list_limit: int = _env_int("SESSION_LIST_LIMIT", 50)
     session_title_max_chars: int = _env_int("SESSION_TITLE_MAX_CHARS", 80)
+    redis_session_enabled: bool = _env_bool("REDIS_SESSION_ENABLED", False)
+    redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_key_prefix: str = os.getenv("REDIS_KEY_PREFIX", "kba")
+    redis_session_ttl_seconds: int = _env_int(
+        "REDIS_SESSION_TTL_SECONDS",
+        604800,
+    )
+    redis_auth_cache_ttl_seconds: int = _env_int(
+        "REDIS_AUTH_CACHE_TTL_SECONDS",
+        60,
+    )
+    redis_socket_timeout_seconds: float = _env_float(
+        "REDIS_SOCKET_TIMEOUT_SECONDS",
+        2.0,
+    )
+    redis_archive_stream: str = os.getenv(
+        "REDIS_ARCHIVE_STREAM",
+        "session:archive",
+    )
+    redis_archive_group: str = os.getenv(
+        "REDIS_ARCHIVE_GROUP",
+        "pg-archiver",
+    )
+    redis_archive_batch_size: int = _env_int(
+        "REDIS_ARCHIVE_BATCH_SIZE",
+        200,
+    )
+    redis_archive_block_ms: int = _env_int("REDIS_ARCHIVE_BLOCK_MS", 1000)
+    redis_archive_claim_idle_ms: int = _env_int(
+        "REDIS_ARCHIVE_CLAIM_IDLE_MS",
+        30000,
+    )
+    redis_archive_backlog_max: int = _env_int(
+        "REDIS_ARCHIVE_BACKLOG_MAX",
+        100000,
+    )
+    redis_session_lock_timeout_seconds: int = _env_int(
+        "REDIS_SESSION_LOCK_TIMEOUT_SECONDS",
+        30,
+    )
+    redis_archiver_heartbeat_ttl_seconds: int = _env_int(
+        "REDIS_ARCHIVER_HEARTBEAT_TTL_SECONDS",
+        15,
+    )
 
     history_recent_turns: int = _env_int("HISTORY_RECENT_TURNS", 16)
     history_compact_after_turns: int = _env_int("HISTORY_COMPACT_AFTER_TURNS", 40)
@@ -408,14 +491,24 @@ class Settings:
     def __post_init__(self) -> None:
         if not self.auth_enabled:
             object.__setattr__(self, "auth_enabled", True)
-        if self.chunk_size <= 0:
-            raise ValueError("CHUNK_SIZE must be greater than 0.")
-        if self.chunk_overlap < 0:
-            raise ValueError("CHUNK_OVERLAP must be greater than or equal to 0.")
-        if self.chunk_overlap >= self.chunk_size:
-            raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE.")
-        if self.chunk_overlap and self.chunk_overlap >= self.chunk_size - 1:
-            raise ValueError("CHUNK_OVERLAP must leave room for new chunk content.")
+        if not self.chunk_tokenizer_model.strip():
+            raise ValueError("CHUNK_TOKENIZER_MODEL must not be empty.")
+        if self.chunk_body_max_tokens <= 0:
+            raise ValueError("CHUNK_BODY_MAX_TOKENS must be greater than 0.")
+        if not 0 < self.chunk_body_target_tokens <= self.chunk_body_max_tokens:
+            raise ValueError(
+                "CHUNK_BODY_TARGET_TOKENS must be between 1 and "
+                "CHUNK_BODY_MAX_TOKENS."
+            )
+        if self.chunk_overlap_target_tokens < 0:
+            raise ValueError(
+                "CHUNK_OVERLAP_TARGET_TOKENS must be greater than or equal to 0."
+            )
+        if self.chunk_overlap_max_tokens < self.chunk_overlap_target_tokens:
+            raise ValueError(
+                "CHUNK_OVERLAP_MAX_TOKENS must be greater than or equal to "
+                "CHUNK_OVERLAP_TARGET_TOKENS."
+            )
         if self.docs_source not in {"local", "s3"}:
             raise ValueError("DOCS_SOURCE must be local or s3.")
         if self.docs_source == "s3" and not self.docs_s3_bucket.strip():
@@ -424,6 +517,18 @@ class Settings:
             raise ValueError("DOCS_S3_PREFIX must not start with '/'.")
         if self.docs_s3_manifest_prefix.startswith("/"):
             raise ValueError("DOCS_S3_MANIFEST_PREFIX must not start with '/'.")
+        if self.docs_commit_url.strip() and not self.docs_commit_token.strip():
+            raise ValueError(
+                "DOCS_COMMIT_TOKEN must not be empty when DOCS_COMMIT_URL is set."
+            )
+        if self.docs_commit_http_timeout_seconds <= 0:
+            raise ValueError(
+                "DOCS_COMMIT_HTTP_TIMEOUT_SECONDS must be greater than 0."
+            )
+        if self.docs_commit_drain_timeout_seconds <= 0:
+            raise ValueError(
+                "DOCS_COMMIT_DRAIN_TIMEOUT_SECONDS must be greater than 0."
+            )
         if self.docs_s3_retain_versions <= 0:
             raise ValueError("DOCS_S3_RETAIN_VERSIONS must be greater than 0.")
         if self.docs_s3_processing_retain_versions < self.docs_s3_retain_versions:
@@ -437,6 +542,38 @@ class Settings:
             raise ValueError(
                 "QDRANT_PROCESSING_RETAIN_VERSIONS must be greater than or "
                 "equal to QDRANT_RETAIN_VERSIONS."
+        )
+        if self.redis_session_enabled and not self.redis_url.strip():
+            raise ValueError(
+                "REDIS_URL must not be empty when Redis sessions are enabled."
+            )
+        if not self.redis_key_prefix.strip():
+            raise ValueError("REDIS_KEY_PREFIX must not be empty.")
+        if self.redis_session_ttl_seconds <= 0:
+            raise ValueError("REDIS_SESSION_TTL_SECONDS must be greater than 0.")
+        if self.redis_auth_cache_ttl_seconds <= 0:
+            raise ValueError("REDIS_AUTH_CACHE_TTL_SECONDS must be greater than 0.")
+        if self.redis_socket_timeout_seconds <= 0:
+            raise ValueError("REDIS_SOCKET_TIMEOUT_SECONDS must be greater than 0.")
+        if not self.redis_archive_stream.strip():
+            raise ValueError("REDIS_ARCHIVE_STREAM must not be empty.")
+        if not self.redis_archive_group.strip():
+            raise ValueError("REDIS_ARCHIVE_GROUP must not be empty.")
+        if self.redis_archive_batch_size <= 0:
+            raise ValueError("REDIS_ARCHIVE_BATCH_SIZE must be greater than 0.")
+        if self.redis_archive_block_ms <= 0:
+            raise ValueError("REDIS_ARCHIVE_BLOCK_MS must be greater than 0.")
+        if self.redis_archive_claim_idle_ms <= 0:
+            raise ValueError("REDIS_ARCHIVE_CLAIM_IDLE_MS must be greater than 0.")
+        if self.redis_archive_backlog_max <= 0:
+            raise ValueError("REDIS_ARCHIVE_BACKLOG_MAX must be greater than 0.")
+        if self.redis_session_lock_timeout_seconds <= 0:
+            raise ValueError(
+                "REDIS_SESSION_LOCK_TIMEOUT_SECONDS must be greater than 0."
+            )
+        if self.redis_archiver_heartbeat_ttl_seconds <= 0:
+            raise ValueError(
+                "REDIS_ARCHIVER_HEARTBEAT_TTL_SECONDS must be greater than 0."
             )
         if not self.embedding_model.strip():
             raise ValueError("EMBEDDING_MODEL must not be empty.")
@@ -448,6 +585,16 @@ class Settings:
             raise ValueError("RECALL_TOP_K must be greater than 0.")
         if self.rrf_top_k <= 0:
             raise ValueError("RRF_TOP_K must be greater than 0.")
+        if self.embedding_dynamic_batch_max_size <= 0:
+            raise ValueError(
+                "EMBEDDING_DYNAMIC_BATCH_MAX_SIZE must be greater than 0."
+            )
+        if self.embedding_dynamic_batch_wait_ms < 0:
+            raise ValueError(
+                "EMBEDDING_DYNAMIC_BATCH_WAIT_MS must be greater than or equal to 0."
+            )
+        if self.embedding_offline_batch_size <= 0:
+            raise ValueError("EMBEDDING_OFFLINE_BATCH_SIZE must be greater than 0.")
         if self.retrieve_score_threshold < 0:
             raise ValueError(
                 "RETRIEVE_SCORE_THRESHOLD must be greater than or equal to 0."
@@ -602,6 +749,10 @@ class Settings:
             raise ValueError("SESSION_TITLE_MAX_CHARS must be greater than 0.")
         if self.intent_llm_max_tokens <= 0:
             raise ValueError("INTENT_LLM_MAX_TOKENS must be greater than 0.")
+
+    @property
+    def chunk_total_max_tokens(self) -> int:
+        return self.chunk_body_max_tokens + 2 * self.chunk_overlap_max_tokens
 
 
 settings = Settings()

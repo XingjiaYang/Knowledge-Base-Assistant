@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -77,6 +78,8 @@ class StoredChatMessage:
     reranker_degraded: bool
     degradation_reason: str
     created_at: datetime
+    event_id: str = ""
+    session_seq: int = 0
 
 
 @dataclass(frozen=True)
@@ -173,9 +176,17 @@ class SessionStore:
                         conversation_summary TEXT NOT NULL DEFAULT '',
                         compacted_message_count INTEGER NOT NULL DEFAULT 0
                             CHECK (compacted_message_count >= 0),
+                        archive_seq BIGINT NOT NULL DEFAULT 0
+                            CHECK (archive_seq >= 0),
                         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                     )
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_sessions
+                    ADD COLUMN IF NOT EXISTS archive_seq BIGINT NOT NULL DEFAULT 0
                     """
                 )
                 cur.execute(
@@ -201,6 +212,8 @@ class SessionStore:
                         qdrant_degraded BOOLEAN NOT NULL DEFAULT FALSE,
                         reranker_degraded BOOLEAN NOT NULL DEFAULT FALSE,
                         degradation_reason TEXT NOT NULL DEFAULT '',
+                        event_id UUID,
+                        session_seq BIGINT,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
                     )
                     """
@@ -237,8 +250,73 @@ class SessionStore:
                 )
                 cur.execute(
                     """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS event_id UUID
+                    """
+                )
+                cur.execute(
+                    """
+                    ALTER TABLE chat_messages
+                    ADD COLUMN IF NOT EXISTS session_seq BIGINT
+                    """
+                )
+                cur.execute(
+                    """
+                    WITH existing AS (
+                        SELECT session_id, COALESCE(MAX(session_seq), 0) AS max_seq
+                        FROM chat_messages
+                        WHERE session_seq IS NOT NULL
+                        GROUP BY session_id
+                    ),
+                    ranked AS (
+                        SELECT message.id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY message.session_id
+                                   ORDER BY message.id
+                               ) + COALESCE(existing.max_seq, 0) AS seq
+                        FROM chat_messages
+                        AS message
+                        LEFT JOIN existing ON existing.session_id = message.session_id
+                        WHERE message.session_seq IS NULL
+                    )
+                    UPDATE chat_messages AS message
+                    SET session_seq = ranked.seq
+                    FROM ranked
+                    WHERE message.id = ranked.id
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_event_id
+                    ON chat_messages(event_id)
+                    WHERE event_id IS NOT NULL
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_messages_session_seq
+                    ON chat_messages(session_id, session_seq)
+                    WHERE session_seq IS NOT NULL
+                    """
+                )
+                cur.execute(
+                    """
+                    UPDATE chat_sessions AS session
+                    SET archive_seq = archived.max_seq
+                    FROM (
+                        SELECT session_id, MAX(session_seq) AS max_seq
+                        FROM chat_messages
+                        WHERE session_seq IS NOT NULL
+                        GROUP BY session_id
+                    ) AS archived
+                    WHERE session.id = archived.session_id
+                      AND session.archive_seq < archived.max_seq
+                    """
+                )
+                cur.execute(
+                    """
                     CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id
-                    ON chat_messages(session_id, id)
+                    ON chat_messages(session_id, session_seq, id)
                     """
                 )
                 cur.execute(
@@ -960,6 +1038,24 @@ class SessionStore:
             ).fetchone()
         return chat_session_from_row(row) if row else None
 
+    def get_chat_session_by_id(self, session_id: UUID) -> ChatSessionRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id,
+                       user_id,
+                       title,
+                       conversation_summary,
+                       compacted_message_count,
+                       created_at,
+                       updated_at
+                FROM chat_sessions
+                WHERE id = %s
+                """,
+                (session_id,),
+            ).fetchone()
+        return chat_session_from_row(row) if row else None
+
     def rename_chat_session(
         self,
         user_id: UUID,
@@ -1001,6 +1097,8 @@ class SessionStore:
             rows = conn.execute(
                 """
                 SELECT id,
+                       event_id,
+                       session_seq,
                        role,
                        content,
                        contexts,
@@ -1015,7 +1113,7 @@ class SessionStore:
                        created_at
                 FROM chat_messages
                 WHERE session_id = %s
-                ORDER BY id
+                ORDER BY session_seq NULLS LAST, id
                 """,
                 (session_id,),
             ).fetchall()
@@ -1036,7 +1134,7 @@ class SessionStore:
                        route
                 FROM chat_messages
                 WHERE session_id = %s
-                ORDER BY id
+                ORDER BY session_seq NULLS LAST, id
                 OFFSET %s
                 """,
                 (session_id, compacted_message_count),
@@ -1080,10 +1178,23 @@ class SessionStore:
             for context in contexts or []
         ]
         with self._connect() as conn:
+            session_row = conn.execute(
+                "SELECT archive_seq FROM chat_sessions WHERE id = %s FOR UPDATE",
+                (session_id,),
+            ).fetchone()
+            if session_row is None:
+                raise ValueError("Chat session not found.")
+            session_seq = next_session_seq(
+                int(session_row["archive_seq"] or 0),
+                floor_offset=500,
+            )
+            event_id = uuid4()
             row = conn.execute(
                 """
                 INSERT INTO chat_messages (
                     session_id,
+                    event_id,
+                    session_seq,
                     role,
                     content,
                     contexts,
@@ -1096,8 +1207,13 @@ class SessionStore:
                     reranker_degraded,
                     degradation_reason
                 )
-                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (
+                    %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
+                    %s, %s, %s, %s, %s, %s
+                )
                 RETURNING id,
+                          event_id,
+                          session_seq,
                           role,
                           content,
                           contexts,
@@ -1113,6 +1229,8 @@ class SessionStore:
                 """,
                 (
                     session_id,
+                    event_id,
+                    session_seq,
                     role,
                     content,
                     json.dumps(context_payload),
@@ -1126,7 +1244,268 @@ class SessionStore:
                     degradation_reason,
                 ),
             ).fetchone()
+            conn.execute(
+                """
+                UPDATE chat_sessions
+                SET archive_seq = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (session_seq, session_id),
+            )
         return chat_message_from_row(row)
+
+    def append_exchange(
+        self,
+        session_id: UUID,
+        user_content: str,
+        assistant_content: str,
+        contexts: list[SearchResult] | None = None,
+        used_rag: bool | None = None,
+        route: str = "",
+        route_reason: str = "",
+        retrieval_degraded: bool = False,
+        embedding_degraded: bool = False,
+        qdrant_degraded: bool = False,
+        reranker_degraded: bool = False,
+        degradation_reason: str = "",
+        conversation_summary: str = "",
+        compacted_delta: int = 0,
+        title: str | None = None,
+    ) -> ChatSessionRecord:
+        """Persist one user/assistant exchange in a single PostgreSQL transaction."""
+        with self._connect() as conn:
+            session_row = conn.execute(
+                """
+                SELECT id,
+                       user_id,
+                       title,
+                       conversation_summary,
+                       compacted_message_count,
+                       archive_seq,
+                       created_at,
+                       updated_at
+                FROM chat_sessions
+                WHERE id = %s
+                FOR UPDATE
+                """,
+                (session_id,),
+            ).fetchone()
+            if session_row is None:
+                raise ValueError("Chat session not found.")
+
+            last_seq = int(session_row["archive_seq"] or 0)
+            first_seq = next_session_seq(last_seq, floor_offset=500)
+            updated_at = datetime.now(timezone.utc)
+            clean_title = (
+                clean_session_title(title, self.config.session_title_max_chars)
+                if title
+                else str(session_row["title"])
+            )
+            event = {
+                "event_id": str(uuid4()),
+                "session_id": str(session_id),
+                "last_seq": first_seq + 1,
+                "messages": [
+                    self._archive_message_payload(
+                        event_id=str(uuid4()),
+                        session_seq=first_seq,
+                        role="user",
+                        content=user_content,
+                        created_at=updated_at,
+                    ),
+                    self._archive_message_payload(
+                        event_id=str(uuid4()),
+                        session_seq=first_seq + 1,
+                        role="assistant",
+                        content=assistant_content,
+                        contexts=contexts,
+                        used_rag=used_rag,
+                        route=route,
+                        route_reason=route_reason,
+                        retrieval_degraded=retrieval_degraded,
+                        embedding_degraded=embedding_degraded,
+                        qdrant_degraded=qdrant_degraded,
+                        reranker_degraded=reranker_degraded,
+                        degradation_reason=degradation_reason,
+                        created_at=updated_at,
+                    ),
+                ],
+                "session": {
+                    "conversation_summary": conversation_summary,
+                    "compacted_message_count": int(
+                        session_row["compacted_message_count"] or 0
+                    )
+                    + max(0, compacted_delta),
+                    "title": clean_title,
+                    "updated_at": updated_at.isoformat(),
+                },
+            }
+            self._archive_session_event(conn, event)
+            row = conn.execute(
+                """
+                SELECT id,
+                       user_id,
+                       title,
+                       conversation_summary,
+                       compacted_message_count,
+                       created_at,
+                       updated_at
+                FROM chat_sessions
+                WHERE id = %s
+                """,
+                (session_id,),
+            ).fetchone()
+        return chat_session_from_row(row)
+
+    def archive_session_events(self, events: list[dict[str, Any]]) -> int:
+        """Idempotently archive Redis exchange events in one PG transaction."""
+        archived = 0
+        with self._connect() as conn:
+            for event in events:
+                if self._archive_session_event(conn, event):
+                    archived += 1
+        return archived
+
+    def _archive_session_event(
+        self,
+        conn: psycopg.Connection[Any],
+        event: dict[str, Any],
+    ) -> bool:
+        session_id = UUID(str(event["session_id"]))
+        session_exists = conn.execute(
+            "SELECT 1 FROM chat_sessions WHERE id = %s",
+            (session_id,),
+        ).fetchone()
+        if session_exists is None:
+            return False
+
+        messages = event.get("messages", [])
+        if not isinstance(messages, list):
+            raise ValueError("Session archive event messages must be a list.")
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError("Session archive message must be an object.")
+            conn.execute(
+                """
+                INSERT INTO chat_messages (
+                    session_id,
+                    event_id,
+                    session_seq,
+                    role,
+                    content,
+                    contexts,
+                    used_rag,
+                    route,
+                    route_reason,
+                    retrieval_degraded,
+                    embedding_degraded,
+                    qdrant_degraded,
+                    reranker_degraded,
+                    degradation_reason,
+                    created_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s
+                )
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    session_id,
+                    UUID(str(message["event_id"])),
+                    int(message["session_seq"]),
+                    message["role"],
+                    str(message.get("content", "")),
+                    json.dumps(message.get("contexts", [])),
+                    message.get("used_rag"),
+                    str(message.get("route", "")),
+                    str(message.get("route_reason", "")),
+                    bool(message.get("retrieval_degraded", False)),
+                    bool(message.get("embedding_degraded", False)),
+                    bool(message.get("qdrant_degraded", False)),
+                    bool(message.get("reranker_degraded", False)),
+                    str(message.get("degradation_reason", "")),
+                    self._archive_datetime(message.get("created_at")),
+                ),
+            )
+
+        session_payload = event.get("session", {})
+        if not isinstance(session_payload, dict):
+            raise ValueError("Session archive state must be an object.")
+        last_seq = int(event.get("last_seq", 0) or 0)
+        conn.execute(
+            """
+            UPDATE chat_sessions
+            SET conversation_summary = %s,
+                compacted_message_count = %s,
+                title = CASE
+                    WHEN title = 'New chat' THEN %s
+                    ELSE title
+                END,
+                updated_at = %s,
+                archive_seq = %s
+            WHERE id = %s
+              AND archive_seq < %s
+            """,
+            (
+                str(session_payload.get("conversation_summary", "")),
+                max(0, int(session_payload.get("compacted_message_count", 0) or 0)),
+                clean_session_title(
+                    str(session_payload.get("title", "New chat")),
+                    self.config.session_title_max_chars,
+                ),
+                self._archive_datetime(session_payload.get("updated_at")),
+                last_seq,
+                session_id,
+                last_seq,
+            ),
+        )
+        return True
+
+    @staticmethod
+    def _archive_datetime(value: object) -> datetime:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str) and value:
+            parsed = datetime.fromisoformat(value)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _archive_message_payload(
+        *,
+        event_id: str,
+        session_seq: int,
+        role: Literal["user", "assistant"],
+        content: str,
+        contexts: list[SearchResult] | None = None,
+        used_rag: bool | None = None,
+        route: str = "",
+        route_reason: str = "",
+        retrieval_degraded: bool = False,
+        embedding_degraded: bool = False,
+        qdrant_degraded: bool = False,
+        reranker_degraded: bool = False,
+        degradation_reason: str = "",
+        created_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "event_id": event_id,
+            "session_seq": session_seq,
+            "role": role,
+            "content": content,
+            "contexts": [search_result_to_dict(item) for item in contexts or []],
+            "used_rag": used_rag,
+            "route": route,
+            "route_reason": route_reason,
+            "retrieval_degraded": retrieval_degraded,
+            "embedding_degraded": embedding_degraded,
+            "qdrant_degraded": qdrant_degraded,
+            "reranker_degraded": reranker_degraded,
+            "degradation_reason": degradation_reason,
+            "created_at": (created_at or datetime.now(timezone.utc)).isoformat(),
+        }
 
     def update_chat_session_after_answer(
         self,
@@ -1297,6 +1676,14 @@ def clean_session_title(title: str, max_chars: int) -> str:
     return collapsed[:max_chars].rstrip()
 
 
+def next_session_seq(last_seq: int, *, floor_offset: int = 0) -> int:
+    if not 0 <= floor_offset < 1000:
+        raise ValueError("Session sequence floor offset must be between 0 and 999.")
+    # Redis starts at 0 and explicit PostgreSQL-only mode starts at 500 per millisecond.
+    clock_floor = (time.time_ns() // 1_000_000) * 1000 + floor_offset
+    return max(int(last_seq) + 1, clock_floor)
+
+
 def chat_session_from_row(row: dict[str, Any]) -> ChatSessionRecord:
     return ChatSessionRecord(
         id=row["id"],
@@ -1330,7 +1717,7 @@ def chat_message_from_row(row: dict[str, Any]) -> StoredChatMessage:
     if isinstance(contexts, str):
         contexts = json.loads(contexts)
     return StoredChatMessage(
-        id=row["id"],
+        id=int(row.get("session_seq") or row["id"]),
         role=row["role"],
         content=row["content"],
         contexts=contexts,
@@ -1343,6 +1730,8 @@ def chat_message_from_row(row: dict[str, Any]) -> StoredChatMessage:
         reranker_degraded=bool(row["reranker_degraded"]),
         degradation_reason=row["degradation_reason"] or "",
         created_at=row["created_at"],
+        event_id=str(row.get("event_id") or ""),
+        session_seq=int(row.get("session_seq") or 0),
     )
 
 

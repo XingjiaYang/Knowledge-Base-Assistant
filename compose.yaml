@@ -15,10 +15,10 @@ x-ray-worker-env: &ray-worker-env
   GRPC_ENABLE_FORK_SUPPORT: ${GRPC_ENABLE_FORK_SUPPORT:-0}
   HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
   HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-  NO_PROXY: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+  NO_PROXY: ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,docs-indexer,${DOCKER_NO_PROXY:-postgres,pgbouncer,redis,session-archiver,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,docs-indexer,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
   http_proxy: ${DOCKER_HTTP_PROXY:-}
   https_proxy: ${DOCKER_HTTPS_PROXY:-}
-  no_proxy: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+  no_proxy: ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,docs-indexer,${DOCKER_NO_PROXY:-postgres,pgbouncer,redis,session-archiver,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,docs-indexer,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
 
 services:
   postgres:
@@ -32,6 +32,130 @@ services:
       - postgres_data:/var/lib/postgresql/data
     expose:
       - "5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" -q
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  pgbouncer:
+    image: ${PGBOUNCER_IMAGE:-edoburu/pgbouncer:v1.25.2-p0}
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER:-kba}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-kba_password}
+      DB_NAME: ${POSTGRES_DB:-kba}
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: ${PGBOUNCER_POOL_MODE:-transaction}
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-200}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-20}
+      MIN_POOL_SIZE: ${PGBOUNCER_MIN_POOL_SIZE:-2}
+      RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE:-5}
+      MAX_PREPARED_STATEMENTS: ${PGBOUNCER_MAX_PREPARED_STATEMENTS:-100}
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits
+    expose:
+      - "5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -h 127.0.0.1 -p 5432
+          -U "$${DB_USER}" -d "$${DB_NAME}" -q
+      interval: 10s
+      timeout: 3s
+      retries: 2
+      start_period: 20s
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:8.2.7-alpine3.22}
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --aof-use-rdb-preamble
+      - "yes"
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - 64mb
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-32gb}
+      - --maxmemory-policy
+      - volatile-lru
+      - --save
+      - ""
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    mem_limit: ${REDIS_CONTAINER_MEMORY_LIMIT:-48g}
+    mem_reservation: ${REDIS_CONTAINER_MEMORY_RESERVATION:-36g}
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 10s
+      timeout: 3s
+      retries: 2
+      start_period: 20s
+
+  session-archiver:
+    build: *main-build
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    entrypoint:
+      - python
+      - -m
+      - app.session_archive
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-kba}:${POSTGRES_PASSWORD:-kba_password}@pgbouncer:5432/${POSTGRES_DB:-kba}
+      DATABASE_CONNECT_TIMEOUT_SECONDS: ${DATABASE_CONNECT_TIMEOUT_SECONDS:-5}
+      REDIS_SESSION_ENABLED: "1"
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-kba}
+      REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-2}
+      REDIS_ARCHIVE_STREAM: ${REDIS_ARCHIVE_STREAM:-session:archive}
+      REDIS_ARCHIVE_GROUP: ${REDIS_ARCHIVE_GROUP:-pg-archiver}
+      REDIS_ARCHIVE_BATCH_SIZE: ${REDIS_ARCHIVE_BATCH_SIZE:-200}
+      REDIS_ARCHIVE_BLOCK_MS: ${REDIS_ARCHIVE_BLOCK_MS:-1000}
+      REDIS_ARCHIVE_CLAIM_IDLE_MS: ${REDIS_ARCHIVE_CLAIM_IDLE_MS:-30000}
+      REDIS_ARCHIVER_HEARTBEAT_TTL_SECONDS: ${REDIS_ARCHIVER_HEARTBEAT_TTL_SECONDS:-15}
+      NO_PROXY: ${DOCKER_NO_PROXY:-postgres,pgbouncer,redis,session-archiver,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: ${DOCKER_NO_PROXY:-postgres,pgbouncer,redis,session-archiver,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -f /tmp/session-archiver-heartbeat &&
+          test "$$(($$(date +%s) - $$(stat -c %Y /tmp/session-archiver-heartbeat)))"
+          -lt "$${REDIS_ARCHIVER_HEARTBEAT_TTL_SECONDS}"
+      interval: 10s
+      timeout: 3s
+      retries: 2
+      start_period: 30s
 
   qdrant:
     image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.18.1}
@@ -147,14 +271,353 @@ services:
       retries: 2
       start_period: 60s
 
+  ray-worker-embedding-bootstrap:
+    build: *main-build
+    container_name: ray-worker-embedding-bootstrap
+    hostname: ray-worker-embedding-bootstrap
+    restart: "no"
+    depends_on:
+      ray-head:
+        condition: service_started
+    gpus: all
+    shm_size: "10gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - |
+        set -euo pipefail
+        python scripts/startup_pipeline_state.py begin \
+          --run-id-file /startup-state/run-id \
+          --ready-file /startup-state/docs-ready \
+          --failed-file /startup-state/docs-failed
+        on_bootstrap_error() {
+          status=$$?
+          trap - ERR
+          python scripts/startup_pipeline_state.py fail \
+            --run-id-file /startup-state/run-id \
+            --failed-file /startup-state/docs-failed || true
+          ray stop --force || true
+          exit "$$status"
+        }
+        trap on_bootstrap_error ERR
+        until ray start \
+          --address=ray-head:6379 \
+          --num-cpus="$${RAY_WORKER_EMBEDDING_NUM_CPUS:-2}" \
+          --num-gpus="$${RAY_WORKER_EMBEDDING_NUM_GPUS:-1}" \
+          --resources='{"ray_worker_embedding": 1}'; do
+          echo "Waiting for ray-head..."
+          sleep 3
+        done
+        python scripts/startup_pipeline_state.py wait \
+          --run-id-file /startup-state/run-id \
+          --ready-file /startup-state/docs-ready \
+          --failed-file /startup-state/docs-failed \
+          --timeout-seconds "$${SERVICE_TIMEOUT_SECONDS:-1800}"
+        ray stop --force
+        python scripts/startup_pipeline_state.py ready \
+          --run-id-file /startup-state/run-id \
+          --ready-file /startup-state/offline-stopped \
+          --failed-file /startup-state/docs-failed
+        trap - ERR
+    environment:
+      <<: *ray-worker-env
+      RAY_WORKER_EMBEDDING_NUM_CPUS: ${RAY_WORKER_EMBEDDING_NUM_CPUS:-2}
+      RAY_WORKER_EMBEDDING_NUM_GPUS: ${RAY_WORKER_EMBEDDING_NUM_GPUS:-1}
+      SERVICE_TIMEOUT_SECONDS: ${SERVICE_TIMEOUT_SECONDS:-1800}
+    volumes:
+      - startup_state:/startup-state
+      - huggingface_cache:/root/.cache/huggingface
+      - ./models:/models:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -s /startup-state/run-id &&
+          python -c "import socket;
+          s=socket.create_connection(('ray-head', 6379), 2);
+          s.close()"
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 60s
+
+  docs-indexer:
+    build: *main-build
+    restart: "no"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      ray-head:
+        condition: service_healthy
+      ray-worker-embedding-bootstrap:
+        condition: service_healthy
+    shm_size: "10gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - |
+        set -euo pipefail
+        on_index_error() {
+          status=$$?
+          trap - ERR
+          python scripts/startup_pipeline_state.py fail \
+            --run-id-file /startup-state/run-id \
+            --failed-file /startup-state/docs-failed || true
+          exit "$$status"
+        }
+        trap on_index_error ERR
+        python scripts/init_docs_on_build.py \
+          --build-id-file /app/.image_build_id
+        python scripts/startup_pipeline_state.py ready \
+          --run-id-file /startup-state/run-id \
+          --ready-file /startup-state/docs-ready \
+          --failed-file /startup-state/docs-failed
+        trap - ERR
+    environment:
+      <<: *ray-worker-env
+      DOCS_DIR: ${DOCS_DIR:-/app/data/docs}
+      DOCS_SOURCE: ${DOCS_SOURCE:-s3}
+      DOCS_INIT_DELETE_REMOVED: ${DOCS_INIT_DELETE_REMOVED:-1}
+      DOCS_BOOTSTRAP_FORCE: ${DOCS_BOOTSTRAP_FORCE:-0}
+      DOCS_S3_BUCKET: ${DOCS_S3_BUCKET:-kba-docs}
+      DOCS_S3_PREFIX: ${DOCS_S3_PREFIX:-docs}
+      DOCS_S3_ENDPOINT_URL: ${DOCS_S3_ENDPOINT_URL:-http://minio:9000}
+      DOCS_S3_REGION: ${DOCS_S3_REGION:-us-east-1}
+      DOCS_S3_ACCESS_KEY_ID: ${DOCS_S3_ACCESS_KEY_ID:-minioadmin}
+      DOCS_S3_SECRET_ACCESS_KEY: ${DOCS_S3_SECRET_ACCESS_KEY:-minioadmin}
+      DOCS_S3_SESSION_TOKEN: ${DOCS_S3_SESSION_TOKEN:-}
+      DOCS_S3_FORCE_PATH_STYLE: ${DOCS_S3_FORCE_PATH_STYLE:-1}
+      DOCS_S3_REQUIRE_VERSIONING: ${DOCS_S3_REQUIRE_VERSIONING:-1}
+      DOCS_S3_RETAIN_VERSIONS: ${DOCS_S3_RETAIN_VERSIONS:-5}
+      DOCS_S3_PROCESSING_RETAIN_VERSIONS: ${DOCS_S3_PROCESSING_RETAIN_VERSIONS:-6}
+      DOCS_S3_MANIFEST_PREFIX: ${DOCS_S3_MANIFEST_PREFIX:-_kba/manifests/docs}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-tech_docs}
+      QDRANT_RETAIN_VERSIONS: ${QDRANT_RETAIN_VERSIONS:-2}
+      QDRANT_PROCESSING_RETAIN_VERSIONS: ${QDRANT_PROCESSING_RETAIN_VERSIONS:-3}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-jinaai/jina-embeddings-v5-text-small}
+      EMBEDDING_TRUST_REMOTE_CODE: ${EMBEDDING_TRUST_REMOTE_CODE:-1}
+      EMBEDDING_PASSAGE_TASK: ${EMBEDDING_PASSAGE_TASK:-retrieval}
+      EMBEDDING_PASSAGE_PROMPT_NAME: ${EMBEDDING_PASSAGE_PROMPT_NAME:-document}
+      EMBEDDING_DYNAMIC_BATCH_ENABLED: ${EMBEDDING_DYNAMIC_BATCH_ENABLED:-1}
+      EMBEDDING_DYNAMIC_BATCH_MAX_SIZE: ${EMBEDDING_DYNAMIC_BATCH_MAX_SIZE:-16}
+      EMBEDDING_DYNAMIC_BATCH_WAIT_MS: ${EMBEDDING_DYNAMIC_BATCH_WAIT_MS:-10}
+      EMBEDDING_OFFLINE_BATCH_SIZE: ${EMBEDDING_OFFLINE_BATCH_SIZE:-64}
+      CHUNK_TOKENIZER_MODEL: ${CHUNK_TOKENIZER_MODEL:-jinaai/jina-embeddings-v5-text-small}
+      CHUNK_TOKENIZER_TRUST_REMOTE_CODE: ${CHUNK_TOKENIZER_TRUST_REMOTE_CODE:-1}
+      CHUNK_BODY_TARGET_TOKENS: ${CHUNK_BODY_TARGET_TOKENS:-1600}
+      CHUNK_BODY_MAX_TOKENS: ${CHUNK_BODY_MAX_TOKENS:-1600}
+      CHUNK_OVERLAP_TARGET_TOKENS: ${CHUNK_OVERLAP_TARGET_TOKENS:-100}
+      CHUNK_OVERLAP_MAX_TOKENS: ${CHUNK_OVERLAP_MAX_TOKENS:-100}
+      RAY_ENABLED: "1"
+      RAY_ADDRESS: ${RAY_ADDRESS:-ray://ray-head:10001}
+      RAY_LOCAL_FALLBACK: "0"
+      RAY_NAMESPACE: ${RAY_NAMESPACE:-kba}
+      RAY_ACTOR_NUM_CPUS: ${RAY_ACTOR_NUM_CPUS:-1}
+      RAY_EMBEDDING_ACTOR_NUM_GPUS: ${RAY_EMBEDDING_ACTOR_NUM_GPUS:-0.5}
+      RAY_EMBEDDING_ACTOR_NAME: ${RAY_EMBEDDING_ACTOR_NAME:-kba_embedding}
+      RAY_EMBEDDING_ACTOR_RESOURCE: ${RAY_EMBEDDING_ACTOR_RESOURCE:-ray_worker_embedding}
+      RAY_TASK_TIMEOUT_SECONDS: ${RAY_TASK_TIMEOUT_SECONDS:-300}
+    volumes:
+      - ./data:/app/data:ro
+      - startup_state:/startup-state
+      - huggingface_cache:/root/.cache/huggingface
+      - ./models:/models:ro
+
+  ray-worker-embedding-ingest-cpu:
+    profiles:
+      - docs-update
+    build: *main-build
+    container_name: ray-worker-embedding-ingest-cpu
+    hostname: ray-worker-embedding-ingest-cpu
+    restart: "no"
+    depends_on:
+      ray-head:
+        condition: service_started
+    shm_size: "10gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - |
+        set -euo pipefail
+        python scripts/startup_pipeline_state.py begin \
+          --run-id-file /startup-state/update-run-id \
+          --ready-file /startup-state/update-docs-ready \
+          --failed-file /startup-state/update-docs-failed
+        on_update_worker_error() {
+          status=$$?
+          trap - ERR
+          python scripts/startup_pipeline_state.py fail \
+            --run-id-file /startup-state/update-run-id \
+            --failed-file /startup-state/update-docs-failed || true
+          ray stop --force || true
+          exit "$$status"
+        }
+        trap on_update_worker_error ERR
+        until ray start \
+          --address=ray-head:6379 \
+          --num-cpus="$${RAY_WORKER_INGEST_NUM_CPUS:-16}" \
+          --num-gpus=0 \
+          --resources='{"ray_worker_embedding_ingest": 1}'; do
+          echo "Waiting for ray-head..."
+          sleep 3
+        done
+        python scripts/startup_pipeline_state.py wait \
+          --run-id-file /startup-state/update-run-id \
+          --ready-file /startup-state/update-docs-ready \
+          --failed-file /startup-state/update-docs-failed \
+          --timeout-seconds "$${SERVICE_TIMEOUT_SECONDS:-7200}"
+        ray stop --force
+        python scripts/startup_pipeline_state.py ready \
+          --run-id-file /startup-state/update-run-id \
+          --ready-file /startup-state/update-offline-stopped \
+          --failed-file /startup-state/update-docs-failed
+        trap - ERR
+    environment:
+      <<: *ray-worker-env
+      CUDA: "FALSE"
+      RAY_WORKER_INGEST_NUM_CPUS: ${RAY_WORKER_INGEST_NUM_CPUS:-16}
+      SERVICE_TIMEOUT_SECONDS: ${DOCS_CPU_INGEST_TIMEOUT_SECONDS:-7200}
+      OMP_NUM_THREADS: ${DOCS_CPU_INGEST_THREADS:-16}
+      MKL_NUM_THREADS: ${DOCS_CPU_INGEST_THREADS:-16}
+    volumes:
+      - startup_state:/startup-state
+      - huggingface_cache:/root/.cache/huggingface
+      - ./models:/models:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test -s /startup-state/update-run-id &&
+          python -c "import socket;
+          s=socket.create_connection(('ray-head', 6379), 2);
+          s.close()"
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 60s
+
+  docs-updater:
+    profiles:
+      - docs-update
+    build: *main-build
+    restart: "no"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      ray-head:
+        condition: service_healthy
+      main:
+        condition: service_healthy
+      ray-worker-embedding-ingest-cpu:
+        condition: service_healthy
+    shm_size: "10gb"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    entrypoint:
+      - /bin/bash
+      - -lc
+    command:
+      - |
+        set -euo pipefail
+        on_update_error() {
+          status=$$?
+          trap - ERR
+          python scripts/startup_pipeline_state.py fail \
+            --run-id-file /startup-state/update-run-id \
+            --failed-file /startup-state/update-docs-failed || true
+          exit "$$status"
+        }
+        trap on_update_error ERR
+        until test -s /startup-state/update-run-id; do
+          echo "Waiting for CPU ingest worker startup run..."
+          sleep 1
+        done
+        python scripts/init_docs_on_build.py \
+          --build-id-file /app/.image_build_id \
+          --force \
+          --destroy-embedding-actor-on-exit
+        python scripts/startup_pipeline_state.py ready \
+          --run-id-file /startup-state/update-run-id \
+          --ready-file /startup-state/update-docs-ready \
+          --failed-file /startup-state/update-docs-failed
+        trap - ERR
+    environment:
+      <<: *ray-worker-env
+      CUDA: "FALSE"
+      DOCS_DIR: ${DOCS_DIR:-/app/data/docs}
+      DOCS_SOURCE: ${DOCS_SOURCE:-s3}
+      DOCS_INIT_DELETE_REMOVED: ${DOCS_INIT_DELETE_REMOVED:-1}
+      DOCS_BOOTSTRAP_FORCE: "1"
+      DOCS_S3_BUCKET: ${DOCS_S3_BUCKET:-kba-docs}
+      DOCS_S3_PREFIX: ${DOCS_S3_PREFIX:-docs}
+      DOCS_S3_ENDPOINT_URL: ${DOCS_S3_ENDPOINT_URL:-http://minio:9000}
+      DOCS_S3_REGION: ${DOCS_S3_REGION:-us-east-1}
+      DOCS_S3_ACCESS_KEY_ID: ${DOCS_S3_ACCESS_KEY_ID:-minioadmin}
+      DOCS_S3_SECRET_ACCESS_KEY: ${DOCS_S3_SECRET_ACCESS_KEY:-minioadmin}
+      DOCS_S3_SESSION_TOKEN: ${DOCS_S3_SESSION_TOKEN:-}
+      DOCS_S3_FORCE_PATH_STYLE: ${DOCS_S3_FORCE_PATH_STYLE:-1}
+      DOCS_S3_REQUIRE_VERSIONING: ${DOCS_S3_REQUIRE_VERSIONING:-1}
+      DOCS_S3_RETAIN_VERSIONS: ${DOCS_S3_RETAIN_VERSIONS:-5}
+      DOCS_S3_PROCESSING_RETAIN_VERSIONS: ${DOCS_S3_PROCESSING_RETAIN_VERSIONS:-6}
+      DOCS_S3_MANIFEST_PREFIX: ${DOCS_S3_MANIFEST_PREFIX:-_kba/manifests/docs}
+      DOCS_COMMIT_URL: http://main:8080/internal/docs/index
+      DOCS_COMMIT_TOKEN: ${DOCS_COMMIT_TOKEN:-local-docs-commit-token-change-me}
+      DOCS_COMMIT_HTTP_TIMEOUT_SECONDS: ${DOCS_COMMIT_HTTP_TIMEOUT_SECONDS:-1800}
+      DOCS_COMMIT_DRAIN_TIMEOUT_SECONDS: ${DOCS_COMMIT_DRAIN_TIMEOUT_SECONDS:-360}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-tech_docs}
+      QDRANT_RETAIN_VERSIONS: ${QDRANT_RETAIN_VERSIONS:-2}
+      QDRANT_PROCESSING_RETAIN_VERSIONS: ${QDRANT_PROCESSING_RETAIN_VERSIONS:-3}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-jinaai/jina-embeddings-v5-text-small}
+      EMBEDDING_TRUST_REMOTE_CODE: ${EMBEDDING_TRUST_REMOTE_CODE:-1}
+      EMBEDDING_PASSAGE_TASK: ${EMBEDDING_PASSAGE_TASK:-retrieval}
+      EMBEDDING_PASSAGE_PROMPT_NAME: ${EMBEDDING_PASSAGE_PROMPT_NAME:-document}
+      EMBEDDING_OFFLINE_BATCH_SIZE: ${EMBEDDING_CPU_INGEST_BATCH_SIZE:-16}
+      CHUNK_TOKENIZER_MODEL: ${CHUNK_TOKENIZER_MODEL:-jinaai/jina-embeddings-v5-text-small}
+      CHUNK_TOKENIZER_TRUST_REMOTE_CODE: ${CHUNK_TOKENIZER_TRUST_REMOTE_CODE:-1}
+      CHUNK_BODY_TARGET_TOKENS: ${CHUNK_BODY_TARGET_TOKENS:-1600}
+      CHUNK_BODY_MAX_TOKENS: ${CHUNK_BODY_MAX_TOKENS:-1600}
+      CHUNK_OVERLAP_TARGET_TOKENS: ${CHUNK_OVERLAP_TARGET_TOKENS:-100}
+      CHUNK_OVERLAP_MAX_TOKENS: ${CHUNK_OVERLAP_MAX_TOKENS:-100}
+      RAY_ENABLED: "1"
+      RAY_ADDRESS: ${RAY_ADDRESS:-ray://ray-head:10001}
+      RAY_LOCAL_FALLBACK: "0"
+      RAY_NAMESPACE: ${RAY_NAMESPACE:-kba}
+      RAY_ACTOR_NUM_CPUS: ${DOCS_CPU_INGEST_ACTOR_NUM_CPUS:-4}
+      RAY_EMBEDDING_ACTOR_NUM_GPUS: "0"
+      RAY_EMBEDDING_ACTOR_NAME: ${RAY_CPU_INGEST_ACTOR_NAME:-kba_embedding_ingest_cpu}
+      RAY_EMBEDDING_ACTOR_RESOURCE: ray_worker_embedding_ingest
+      RAY_TASK_TIMEOUT_SECONDS: ${DOCS_CPU_INGEST_RAY_TASK_TIMEOUT_SECONDS:-7200}
+      OMP_NUM_THREADS: ${DOCS_CPU_INGEST_THREADS:-16}
+      MKL_NUM_THREADS: ${DOCS_CPU_INGEST_THREADS:-16}
+    volumes:
+      - ./data:/app/data:ro
+      - startup_state:/startup-state
+      - huggingface_cache:/root/.cache/huggingface
+      - ./models:/models:ro
+
   ray-worker-embedding-1:
     build: *main-build
     container_name: ray-worker-embedding-1
     hostname: ray-worker-embedding-1
     restart: unless-stopped
     depends_on:
-      ray-head:
-        condition: service_started
+      ray-worker-embedding-bootstrap:
+        condition: service_completed_successfully
     gpus: all
     shm_size: "10gb"
     extra_hosts:
@@ -198,8 +661,8 @@ services:
     hostname: ray-worker-reranker-1
     restart: unless-stopped
     depends_on:
-      ray-head:
-        condition: service_started
+      ray-worker-embedding-bootstrap:
+        condition: service_completed_successfully
     gpus: all
     shm_size: "10gb"
     extra_hosts:
@@ -243,8 +706,8 @@ services:
     hostname: ray-worker-reranker-2
     restart: unless-stopped
     depends_on:
-      ray-head:
-        condition: service_started
+      ray-worker-embedding-bootstrap:
+        condition: service_completed_successfully
     gpus: all
     shm_size: "10gb"
     extra_hosts:
@@ -297,10 +760,10 @@ services:
       HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      NO_PROXY: minio,${DOCKER_NO_PROXY:-postgres,pgbouncer,qdrant,minio,vllm,main,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: minio,${DOCKER_NO_PROXY:-postgres,pgbouncer,qdrant,minio,vllm,main,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       VLLM_USE_FLASHINFER_SAMPLER: ${VLLM_USE_FLASHINFER_SAMPLER:-0}
     volumes:
       - huggingface_cache:/root/.cache/huggingface
@@ -334,16 +797,18 @@ services:
         condition: service_started
       postgres:
         condition: service_started
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      session-archiver:
+        condition: service_started
       minio-init:
         condition: service_completed_successfully
       ray-head:
         condition: service_started
-      ray-worker-embedding-1:
-        condition: service_started
-      ray-worker-reranker-1:
-        condition: service_started
-      ray-worker-reranker-2:
-        condition: service_started
+      ray-worker-embedding-bootstrap:
+        condition: service_healthy
     shm_size: "10gb"
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -366,8 +831,15 @@ services:
       DOCS_S3_RETAIN_VERSIONS: ${DOCS_S3_RETAIN_VERSIONS:-5}
       DOCS_S3_PROCESSING_RETAIN_VERSIONS: ${DOCS_S3_PROCESSING_RETAIN_VERSIONS:-6}
       DOCS_S3_MANIFEST_PREFIX: ${DOCS_S3_MANIFEST_PREFIX:-_kba/manifests/docs}
-      DOCS_INIT_ON_IMAGE_BUILD: ${DOCS_INIT_ON_IMAGE_BUILD:-1}
+      DOCS_COMMIT_TOKEN: ${DOCS_COMMIT_TOKEN:-local-docs-commit-token-change-me}
+      DOCS_COMMIT_HTTP_TIMEOUT_SECONDS: ${DOCS_COMMIT_HTTP_TIMEOUT_SECONDS:-1800}
+      DOCS_COMMIT_DRAIN_TIMEOUT_SECONDS: ${DOCS_COMMIT_DRAIN_TIMEOUT_SECONDS:-360}
+      DOCS_INIT_ON_IMAGE_BUILD: "0"
       DOCS_INIT_DELETE_REMOVED: ${DOCS_INIT_DELETE_REMOVED:-1}
+      WAIT_FOR_DOCS_BOOTSTRAP: "1"
+      DOCS_STARTUP_RUN_ID_FILE: /startup-state/run-id
+      DOCS_STARTUP_READY_FILE: /startup-state/offline-stopped
+      DOCS_STARTUP_FAILED_FILE: /startup-state/docs-failed
       QDRANT_URL: http://qdrant:6333
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-tech_docs}
       QDRANT_RETAIN_VERSIONS: ${QDRANT_RETAIN_VERSIONS:-2}
@@ -397,11 +869,19 @@ services:
       EMBEDDING_QUERY_PROMPT_NAME: ${EMBEDDING_QUERY_PROMPT_NAME:-query}
       EMBEDDING_PASSAGE_PROMPT_NAME: ${EMBEDDING_PASSAGE_PROMPT_NAME:-document}
       EMBEDDING_CLASSIFICATION_PROMPT_NAME: ${EMBEDDING_CLASSIFICATION_PROMPT_NAME:-}
-      CHUNK_SIZE: ${CHUNK_SIZE:-2000}
-      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-300}
+      EMBEDDING_DYNAMIC_BATCH_ENABLED: ${EMBEDDING_DYNAMIC_BATCH_ENABLED:-1}
+      EMBEDDING_DYNAMIC_BATCH_MAX_SIZE: ${EMBEDDING_DYNAMIC_BATCH_MAX_SIZE:-16}
+      EMBEDDING_DYNAMIC_BATCH_WAIT_MS: ${EMBEDDING_DYNAMIC_BATCH_WAIT_MS:-10}
+      EMBEDDING_OFFLINE_BATCH_SIZE: ${EMBEDDING_OFFLINE_BATCH_SIZE:-64}
+      CHUNK_TOKENIZER_MODEL: ${CHUNK_TOKENIZER_MODEL:-jinaai/jina-embeddings-v5-text-small}
+      CHUNK_TOKENIZER_TRUST_REMOTE_CODE: ${CHUNK_TOKENIZER_TRUST_REMOTE_CODE:-1}
+      CHUNK_BODY_TARGET_TOKENS: ${CHUNK_BODY_TARGET_TOKENS:-1600}
+      CHUNK_BODY_MAX_TOKENS: ${CHUNK_BODY_MAX_TOKENS:-1600}
+      CHUNK_OVERLAP_TARGET_TOKENS: ${CHUNK_OVERLAP_TARGET_TOKENS:-100}
+      CHUNK_OVERLAP_MAX_TOKENS: ${CHUNK_OVERLAP_MAX_TOKENS:-100}
       BM25_TOP_K: ${BM25_TOP_K:-100}
       RECALL_TOP_K: ${RECALL_TOP_K:-100}
-      RRF_TOP_K: ${RRF_TOP_K:-100}
+      RRF_TOP_K: ${RRF_TOP_K:-64}
       RETRIEVE_TOP_K: ${RETRIEVE_TOP_K:-5}
       RETRIEVE_SCORE_THRESHOLD: ${RETRIEVE_SCORE_THRESHOLD:-0}
       RERANKER_ENABLED: ${RERANKER_ENABLED:-1}
@@ -456,7 +936,7 @@ services:
       API_QUESTION_MAX_CHARS: ${API_QUESTION_MAX_CHARS:-16000}
       API_SUMMARY_MAX_CHARS: ${API_SUMMARY_MAX_CHARS:-12000}
       API_HISTORY_MAX_MESSAGES: ${API_HISTORY_MAX_MESSAGES:-120}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-kba}:${POSTGRES_PASSWORD:-kba_password}@postgres:5432/${POSTGRES_DB:-kba}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-kba}:${POSTGRES_PASSWORD:-kba_password}@pgbouncer:5432/${POSTGRES_DB:-kba}
       DATABASE_CONNECT_TIMEOUT_SECONDS: ${DATABASE_CONNECT_TIMEOUT_SECONDS:-5}
       AUTH_DEFAULT_ADMIN_ENABLED: ${AUTH_DEFAULT_ADMIN_ENABLED:-1}
       AUTH_DEFAULT_ADMIN_USERNAME: ${AUTH_DEFAULT_ADMIN_USERNAME:-admin}
@@ -465,7 +945,21 @@ services:
       AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-604800}
       SESSION_LIST_LIMIT: ${SESSION_LIST_LIMIT:-50}
       SESSION_TITLE_MAX_CHARS: ${SESSION_TITLE_MAX_CHARS:-80}
-      POSTGRES_HOST: postgres
+      REDIS_SESSION_ENABLED: ${REDIS_SESSION_ENABLED:-1}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-kba}
+      REDIS_SESSION_TTL_SECONDS: ${REDIS_SESSION_TTL_SECONDS:-604800}
+      REDIS_AUTH_CACHE_TTL_SECONDS: ${REDIS_AUTH_CACHE_TTL_SECONDS:-60}
+      REDIS_SOCKET_TIMEOUT_SECONDS: ${REDIS_SOCKET_TIMEOUT_SECONDS:-2}
+      REDIS_ARCHIVE_STREAM: ${REDIS_ARCHIVE_STREAM:-session:archive}
+      REDIS_ARCHIVE_GROUP: ${REDIS_ARCHIVE_GROUP:-pg-archiver}
+      REDIS_ARCHIVE_BATCH_SIZE: ${REDIS_ARCHIVE_BATCH_SIZE:-200}
+      REDIS_ARCHIVE_BLOCK_MS: ${REDIS_ARCHIVE_BLOCK_MS:-1000}
+      REDIS_ARCHIVE_CLAIM_IDLE_MS: ${REDIS_ARCHIVE_CLAIM_IDLE_MS:-30000}
+      REDIS_ARCHIVE_BACKLOG_MAX: ${REDIS_ARCHIVE_BACKLOG_MAX:-100000}
+      REDIS_SESSION_LOCK_TIMEOUT_SECONDS: ${REDIS_SESSION_LOCK_TIMEOUT_SECONDS:-30}
+      REDIS_ARCHIVER_HEARTBEAT_TTL_SECONDS: ${REDIS_ARCHIVER_HEARTBEAT_TTL_SECONDS:-15}
+      POSTGRES_HOST: pgbouncer
       POSTGRES_PORT: "5432"
       HISTORY_RECENT_TURNS: ${HISTORY_RECENT_TURNS:-16}
       HISTORY_COMPACT_AFTER_TURNS: ${HISTORY_COMPACT_AFTER_TURNS:-40}
@@ -498,12 +992,13 @@ services:
       HF_HUB_DISABLE_XET: ${HF_HUB_DISABLE_XET:-1}
       HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
       HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
-      NO_PROXY: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      NO_PROXY: ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,docs-indexer,${DOCKER_NO_PROXY:-postgres,pgbouncer,redis,session-archiver,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,docs-indexer,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       http_proxy: ${DOCKER_HTTP_PROXY:-}
       https_proxy: ${DOCKER_HTTPS_PROXY:-}
-      no_proxy: ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,${DOCKER_NO_PROXY:-postgres,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      no_proxy: ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,docs-indexer,${DOCKER_NO_PROXY:-postgres,pgbouncer,redis,session-archiver,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,docs-indexer,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
     volumes:
       - ./data:/app/data:ro
+      - startup_state:/startup-state
       - huggingface_cache:/root/.cache/huggingface
       - ./models:/models:ro
     healthcheck:
@@ -515,10 +1010,12 @@ services:
       interval: 10s
       timeout: 3s
       retries: 2
-      start_period: 60s
+      start_period: ${DOCS_BOOTSTRAP_HEALTH_START_PERIOD:-1800s}
 
 volumes:
   postgres_data:
+  redis_data:
   qdrant_storage:
   minio_data:
   huggingface_cache:
+  startup_state:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import logging
 import math
@@ -9,6 +10,7 @@ import time
 from typing import Literal
 
 from app.config import Settings, settings
+from app.document_commit import RetrievalRequestGate
 from app.intent_router import IntentDecision, IntentRouter
 from app.llm_client import LLMClient
 from app.prompt_budget import PromptBudget, TrimStrategy
@@ -99,12 +101,14 @@ class RAGPipeline:
         intent_router: IntentRouter | None = None,
         reranker: Reranker | None = None,
         health_monitor: object | None = None,
+        retrieval_gate: RetrievalRequestGate | None = None,
     ) -> None:
         self.config = config
         self.budget = PromptBudget.from_config(config)
         self.vector_store = vector_store or VectorStore(config)
         self.llm_client = llm_client or LLMClient(config)
         self.health_monitor = health_monitor
+        self.retrieval_gate = retrieval_gate
         intent_embedder = self._intent_embedder(self.vector_store)
         if intent_embedder is not None and health_monitor is not None:
             intent_embedder = _HealthAwareEmbedder(intent_embedder, health_monitor)
@@ -243,13 +247,19 @@ class RAGPipeline:
         reranker_degraded = False
         degradation_reasons: list[str] = []
 
-        recall_outcome = self._recall_contexts(
-            search_query,
-            bm25_limit=bm25_limit,
-            vector_limit=vector_limit,
-            rrf_limit=rrf_limit,
-            degradation_reasons=degradation_reasons,
+        gate_context = (
+            self.retrieval_gate.request()
+            if self.retrieval_gate is not None
+            else nullcontext()
         )
+        with gate_context:
+            recall_outcome = self._recall_contexts(
+                search_query,
+                bm25_limit=bm25_limit,
+                vector_limit=vector_limit,
+                rrf_limit=rrf_limit,
+                degradation_reasons=degradation_reasons,
+            )
         recalled_contexts = recall_outcome.contexts
         recall_degraded = bool(degradation_reasons)
         embedding_degraded = recall_outcome.embedding_degraded
@@ -735,7 +745,7 @@ class RAGPipeline:
         return self.config
 
     def _expected_reference_tokens(self, top_k: int | None) -> int:
-        per_context_tokens = max(1, self.config.chunk_size + 256)
+        per_context_tokens = max(1, self.config.chunk_total_max_tokens + 256)
         return self._final_top_k(top_k) * per_context_tokens
 
     @staticmethod

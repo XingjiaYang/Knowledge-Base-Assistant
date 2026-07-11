@@ -20,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("RAY_ENABLED", "0")
 
 from app.config import Settings
+from app.document_commit import PreparedIndexCommit, RetrievalRequestGate
 from app.rag import RAGPipeline
 from app.s3_documents import S3DocumentRecord, VersionedS3DocumentIndexer
 import app.vector_store as vector_store_module
@@ -29,6 +30,7 @@ from app.vector_store import SearchResult, VectorStore
 class FakeEmbeddingModel:
     def __init__(self) -> None:
         self.encode_kwargs: list[dict[str, object]] = []
+        self.input_batch_sizes: list[int] = []
 
     def get_embedding_dimension(self) -> int:
         return 2
@@ -40,9 +42,28 @@ class FakeEmbeddingModel:
         **kwargs: object,
     ) -> np.ndarray:
         self.encode_kwargs.append(dict(kwargs))
+        self.input_batch_sizes.append(1 if isinstance(texts, str) else len(texts))
         if isinstance(texts, str):
             return np.asarray([1.0, 0.0], dtype=np.float32)
         return np.asarray([[1.0, 0.0] for _ in texts], dtype=np.float32)
+
+
+class FakeChunkTokenizer:
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [ord(character) for character in text]
+
+    def decode(
+        self,
+        token_ids: list[int],
+        *,
+        skip_special_tokens: bool = False,
+    ) -> str:
+        del skip_special_tokens
+        return "".join(chr(token_id) for token_id in token_ids)
+
+
+FAKE_CHUNK_TOKENIZER = FakeChunkTokenizer()
 
 
 class FakeRuntimeCudaEmbeddingModel(FakeEmbeddingModel):
@@ -153,13 +174,22 @@ class FakeS3DocumentStore:
     def load_active_manifest(self) -> dict[str, object] | None:
         return self.active_manifest
 
+    def load_version_manifest(self, index_version: str) -> dict[str, object] | None:
+        for manifest in reversed(self.version_manifests):
+            if manifest.get("index_version") == index_version:
+                return manifest
+        return None
+
     def write_active_manifest(self, manifest: dict[str, object]) -> None:
         if self.fail_active_manifest_write:
             raise RuntimeError("active manifest write failed")
-        self.active_manifest = manifest
+        self.active_manifest = dict(manifest)
+
+    def delete_active_manifest(self) -> None:
+        self.active_manifest = None
 
     def write_version_manifest(self, manifest: dict[str, object]) -> None:
-        self.version_manifests.append(manifest)
+        self.version_manifests.append(dict(manifest))
 
     def prune_document_versions(self, retain_versions: int) -> dict[str, int]:
         self.prune_calls.append(retain_versions)
@@ -170,7 +200,7 @@ class FakeS3DocumentStore:
         }
 
     def find_manifest_by_collection(self, collection_name: str) -> dict[str, object] | None:
-        for manifest in self.version_manifests:
+        for manifest in reversed(self.version_manifests):
             if manifest.get("qdrant_collection") == collection_name:
                 return manifest
         return None
@@ -179,6 +209,32 @@ class FakeS3DocumentStore:
 class FailingQdrantClient:
     def __getattr__(self, name: str) -> object:
         raise RuntimeError(f"Qdrant should not be used during this test: {name}")
+
+
+class InProcessDocumentCommitter:
+    def __init__(
+        self,
+        indexer: VersionedS3DocumentIndexer,
+        vector_store: VectorStore,
+    ) -> None:
+        self.indexer = indexer
+        self.vector_store = vector_store
+        self.gate = RetrievalRequestGate()
+        self.events: list[str] = []
+
+    def prepare(self, index_version: str) -> int:
+        self.events.append(f"prepare:{index_version}")
+        return self.vector_store.prepare_bm25_candidate(index_version)
+
+    def commit(self, prepared: PreparedIndexCommit) -> str:
+        self.events.append(f"commit:{prepared.index_version}")
+        with self.gate.exclusive(drain_timeout_seconds=1):
+            result = self.indexer.commit_prepared_version(prepared)
+        return str(result["previous_collection"])
+
+    def discard(self, index_version: str) -> None:
+        self.events.append(f"discard:{index_version}")
+        self.vector_store.discard_bm25_candidate(index_version)
 
 
 def _records(client: QdrantClient, collection_name: str) -> list[Record]:
@@ -221,13 +277,16 @@ def assert_incremental_ingest_replaces_source_points() -> None:
         config = Settings(
             docs_dir=docs_dir,
             collection_name=collection_name,
-            chunk_size=80,
-            chunk_overlap=10,
+            chunk_body_target_tokens=50,
+            chunk_body_max_tokens=60,
+            chunk_overlap_target_tokens=10,
+            chunk_overlap_max_tokens=10,
         )
         store = VectorStore(
             config,
             client=client,
             model=FakeEmbeddingModel(),
+            chunk_tokenizer=FAKE_CHUNK_TOKENIZER,
         )
 
         file_path.write_text(
@@ -244,6 +303,13 @@ def assert_incremental_ingest_replaces_source_points() -> None:
             raise AssertionError("Expected the initial document to produce multiple chunks.")
         first_records = _records(client, collection_name)
         first_ids = {record.id for record in first_records}
+        if any(
+            not record.payload
+            or int(record.payload.get("body_token_count", 0)) <= 0
+            or int(record.payload.get("token_count", 0)) <= 0
+            for record in first_records
+        ):
+            raise AssertionError("Qdrant payloads should expose chunk token counts.")
         if any(Path(record.payload["source"]).is_absolute() for record in first_records):
             raise AssertionError("Public source payload should not expose server paths.")
         if not all(record.payload.get("source_key") for record in first_records):
@@ -447,7 +513,7 @@ def assert_jina_embedding_tasks_are_routed_by_use_case() -> None:
     expected = [
         {"task": "retrieval", "prompt_name": "query"},
         {"task": "classification"},
-        {"task": "retrieval", "prompt_name": "document"},
+        {"task": "retrieval", "prompt_name": "document", "batch_size": 1},
     ]
     if model.encode_kwargs != expected:
         raise AssertionError(f"Embedding task routing mismatch: {model.encode_kwargs}")
@@ -494,11 +560,14 @@ def assert_ingest_streams_files_and_skips_recreate_deletes() -> None:
             Settings(
                 docs_dir=docs_dir,
                 collection_name="streaming-ingest-test",
-                chunk_size=80,
-                chunk_overlap=10,
+                chunk_body_target_tokens=50,
+                chunk_body_max_tokens=60,
+                chunk_overlap_target_tokens=10,
+                chunk_overlap_max_tokens=10,
             ),
             client=client,
             model=FakeEmbeddingModel(),
+            chunk_tokenizer=FAKE_CHUNK_TOKENIZER,
         )
 
         with warnings.catch_warnings():
@@ -543,12 +612,15 @@ def assert_search_score_threshold() -> None:
             Settings(
                 docs_dir=docs_dir,
                 collection_name="score-threshold-test",
-                chunk_size=80,
-                chunk_overlap=10,
+                chunk_body_target_tokens=50,
+                chunk_body_max_tokens=60,
+                chunk_overlap_target_tokens=10,
+                chunk_overlap_max_tokens=10,
                 retrieve_score_threshold=1.1,
             ),
             client=client,
             model=FakeEmbeddingModel(),
+            chunk_tokenizer=FAKE_CHUNK_TOKENIZER,
         )
 
         with warnings.catch_warnings():
@@ -578,12 +650,15 @@ def assert_bm25_recalls_keyword_matches() -> None:
         store = VectorStore(
             Settings(
                 docs_dir=docs_dir,
-                chunk_size=120,
-                chunk_overlap=10,
+                chunk_body_target_tokens=80,
+                chunk_body_max_tokens=100,
+                chunk_overlap_target_tokens=10,
+                chunk_overlap_max_tokens=10,
                 bm25_top_k=2,
             ),
             client=QdrantClient(":memory:"),
             model=FakeEmbeddingModel(),
+            chunk_tokenizer=FAKE_CHUNK_TOKENIZER,
         )
 
         results = store.search_bm25("巨大历史鲫鱼是什么梗？", top_k=1)
@@ -658,8 +733,11 @@ def assert_s3_versioned_ingest_switches_alias_and_removes_orphans() -> None:
         docs_s3_prefix="docs",
         docs_s3_require_versioning=False,
         collection_name="s3_docs_test",
-        chunk_size=240,
-        chunk_overlap=20,
+        chunk_body_target_tokens=160,
+        chunk_body_max_tokens=200,
+        chunk_overlap_target_tokens=20,
+        chunk_overlap_max_tokens=20,
+        embedding_offline_batch_size=2,
     )
     document_store = FakeS3DocumentStore(
         {
@@ -668,10 +746,12 @@ def assert_s3_versioned_ingest_switches_alias_and_removes_orphans() -> None:
             "c.md": ("c-v1", "# C\n\ncharlie old text"),
         }
     )
+    embedding_model = FakeEmbeddingModel()
     vector_store = VectorStore(
         config,
         client=client,
-        model=FakeEmbeddingModel(),
+        model=embedding_model,
+        chunk_tokenizer=FAKE_CHUNK_TOKENIZER,
         document_store=document_store,
     )
     with warnings.catch_warnings():
@@ -707,6 +787,31 @@ def assert_s3_versioned_ingest_switches_alias_and_removes_orphans() -> None:
         raise AssertionError("S3 ingest should create and point the alias to v1.")
     if first.total_chunks != 3:
         raise AssertionError(f"Expected one chunk per initial document: {first}")
+    if embedding_model.input_batch_sizes[-2:] != [2, 1]:
+        raise AssertionError(
+            "S3 ingest should batch chunks across document boundaries: "
+            f"{embedding_model.input_batch_sizes}"
+        )
+    manifest = document_store.active_manifest or {}
+    expected_chunk_config = {
+        "chunking_version": vector_store_module.CHUNKING_VERSION,
+        "chunk_tokenizer_model": "jinaai/jina-embeddings-v5-text-small",
+        "chunk_tokenizer_trust_remote_code": True,
+        "chunk_body_target_tokens": 160,
+        "chunk_body_max_tokens": 200,
+        "chunk_overlap_target_tokens": 20,
+        "chunk_overlap_max_tokens": 20,
+    }
+    if any(manifest.get(key) != value for key, value in expected_chunk_config.items()):
+        raise AssertionError(
+            f"S3 manifest should fingerprint chunking behavior: {manifest}"
+        )
+    original_signature = vector_store._s3_docs_signature()  # noqa: SLF001
+    document_store.active_manifest = {**manifest, "chunk_body_target_tokens": 161}
+    changed_signature = vector_store._s3_docs_signature()  # noqa: SLF001
+    document_store.active_manifest = manifest
+    if changed_signature == original_signature:
+        raise AssertionError("BM25 signature should change with chunk configuration.")
     collection_names = {collection.name for collection in client.get_collections().collections}
     if not any(name.startswith("s3_docs_test__vlegacy_") for name in collection_names):
         raise AssertionError("Existing physical collection should be archived before alias creation.")
@@ -751,6 +856,7 @@ def assert_s3_versioned_ingest_switches_alias_and_removes_orphans() -> None:
         config,
         client=FailingQdrantClient(),  # type: ignore[arg-type]
         model=FakeEmbeddingModel(),
+        chunk_tokenizer=FAKE_CHUNK_TOKENIZER,
         document_store=document_store,
     )
     offline_results = offline_store.search_bm25("delta new", top_k=1)
@@ -785,6 +891,86 @@ def assert_s3_versioned_ingest_switches_alias_and_removes_orphans() -> None:
     print("S3 versioned ingest alias/orphan behavior -> ok")
 
 
+def assert_s3_remote_commit_swaps_prebuilt_bm25() -> None:
+    client = QdrantClient(":memory:")
+    config = Settings(
+        docs_source="s3",
+        docs_s3_bucket="bucket",
+        docs_s3_prefix="docs",
+        docs_s3_require_versioning=False,
+        collection_name="s3_remote_commit_test",
+        chunk_body_target_tokens=160,
+        chunk_body_max_tokens=200,
+        chunk_overlap_target_tokens=20,
+        chunk_overlap_max_tokens=20,
+        embedding_offline_batch_size=2,
+    )
+    document_store = FakeS3DocumentStore(
+        {
+            "a.md": ("a-v1", "# A\n\nalpha old text"),
+            "b.md": ("b-v1", "# B\n\nbeta stable text"),
+        }
+    )
+    offline_store = VectorStore(
+        config,
+        client=client,
+        model=FakeEmbeddingModel(),
+        chunk_tokenizer=FAKE_CHUNK_TOKENIZER,
+        document_store=document_store,
+    )
+    offline_indexer = VersionedS3DocumentIndexer(
+        config,
+        document_store=document_store,
+        vector_store=offline_store,
+    )
+    first = offline_indexer.ingest()
+
+    online_store = VectorStore(
+        config,
+        client=client,
+        model=FakeEmbeddingModel(),
+        chunk_tokenizer=FAKE_CHUNK_TOKENIZER,
+        document_store=document_store,
+    )
+    online_indexer = VersionedS3DocumentIndexer(
+        config,
+        document_store=document_store,
+        vector_store=online_store,
+    )
+    online_store.rebuild_bm25_index(expected_index_version=first.index_version)
+    old_index = online_store._bm25_index  # noqa: SLF001
+
+    document_store.set_documents(
+        {
+            "b.md": ("b-v1", "# B\n\nbeta stable text"),
+            "c.md": ("c-v1", "# C\n\ngamma candidate text"),
+        }
+    )
+    committer = InProcessDocumentCommitter(online_indexer, online_store)
+    second = offline_indexer.ingest(committer=committer)
+
+    if _alias_target(client, config.collection_name) != second.qdrant_collection:
+        raise AssertionError("Remote commit should switch the Qdrant alias.")
+    if online_store.active_bm25_index_version() != second.index_version:
+        raise AssertionError("Remote commit should activate the matching BM25S index.")
+    if online_store.prepared_bm25_candidate_version():
+        raise AssertionError("BM25S candidate should be cleared after pointer swap.")
+    if old_index is None or old_index is online_store._bm25_index:  # noqa: SLF001
+        raise AssertionError("BM25S commit should exchange active index references.")
+    if not old_index.documents:
+        raise AssertionError("The old BM25S index reference should remain usable.")
+    if [event.split(":", 1)[0] for event in committer.events] != [
+        "prepare",
+        "commit",
+    ]:
+        raise AssertionError(f"Unexpected commit lifecycle: {committer.events}")
+    results = online_store.search_bm25("gamma candidate", top_k=1)
+    if not results or results[0].source != "c.md":
+        raise AssertionError(f"Swapped BM25S index returned stale data: {results}")
+
+    print("S3 candidate BM25S double-buffer commit -> ok")
+
+
 def assert_s3_versioned_ingest_rolls_back_on_failure() -> None:
     client = QdrantClient(":memory:")
     config = Settings(
@@ -793,8 +979,10 @@ def assert_s3_versioned_ingest_rolls_back_on_failure() -> None:
         docs_s3_prefix="docs",
         docs_s3_require_versioning=False,
         collection_name="s3_rollback_test",
-        chunk_size=240,
-        chunk_overlap=20,
+        chunk_body_target_tokens=160,
+        chunk_body_max_tokens=200,
+        chunk_overlap_target_tokens=20,
+        chunk_overlap_max_tokens=20,
     )
     document_store = FakeS3DocumentStore(
         {"a.md": ("a-v1", "# A\n\nalpha initial")}
@@ -803,6 +991,7 @@ def assert_s3_versioned_ingest_rolls_back_on_failure() -> None:
         config,
         client=client,
         model=FakeEmbeddingModel(),
+        chunk_tokenizer=FAKE_CHUNK_TOKENIZER,
         document_store=document_store,
     )
     indexer = VersionedS3DocumentIndexer(
@@ -853,6 +1042,7 @@ def main() -> None:
     assert_rrf_fuses_vector_and_bm25_results()
     assert_incremental_ingest_replaces_source_points()
     assert_s3_versioned_ingest_switches_alias_and_removes_orphans()
+    assert_s3_remote_commit_swaps_prebuilt_bm25()
     assert_s3_versioned_ingest_rolls_back_on_failure()
 
 

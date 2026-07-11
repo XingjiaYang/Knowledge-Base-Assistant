@@ -76,3 +76,9 @@ docker-compose.override.yml
 
 # Notebooks
 .ipynb_checkpoints/
+
+# Local reference checkouts and generated evaluation reports
+reference/
+*_results*.json
+*_recall_eval_*.json
+docs_rag_recall_eval_*.json

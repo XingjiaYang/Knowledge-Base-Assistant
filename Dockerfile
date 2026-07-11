@@ -18,8 +18,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY app ./app
 COPY scripts ./scripts
 COPY docker ./docker
+COPY data/docs ./data/docs
 
-RUN mkdir -p data/docs
 RUN if [ "$DOCS_INIT_BUILD_ID" = "auto" ]; then \
       date -u +%Y%m%d%H%M%S%N > /app/.image_build_id; \
     else \

@@ -140,8 +140,10 @@ def assert_compaction_threshold() -> None:
         llm_context_prompt_overhead_tokens=0,
         llm_max_tokens=1,
         retrieve_top_k=1,
-        chunk_size=20,
-        chunk_overlap=0,
+        chunk_body_target_tokens=10,
+        chunk_body_max_tokens=20,
+        chunk_overlap_target_tokens=0,
+        chunk_overlap_max_tokens=0,
     )
     pipeline = make_pipeline(config)
     history = [

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 import hashlib
 import logging
@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 from threading import Lock
 import time
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from markdown_it import MarkdownIt
@@ -24,6 +24,7 @@ from qdrant_client.models import (
     VectorParams,
 )
 from sentence_transformers import SentenceTransformer
+import yaml
 
 from app.config import PROJECT_ROOT, Settings, settings
 from app.device import preferred_torch_device
@@ -86,6 +87,10 @@ class MarkdownChunk:
     h3: str
     start_line: int
     end_line: int
+    body_token_count: int
+    prefix_overlap_token_count: int
+    suffix_overlap_token_count: int
+    token_count: int
 
 
 @dataclass(frozen=True)
@@ -101,62 +106,148 @@ _TABLE_DIVIDER_RE = re.compile(
 )
 _ASCII_TOKEN_RE = re.compile(r"[a-z0-9_]+")
 _CJK_BLOCK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+_SENTENCE_RE = re.compile(
+    r".+?(?:(?:[。！？]+[”’」』）】]*)|"
+    r"(?:[.!?]+[\"'”’\)\]]*(?=\s|$))|\n+|$)",
+    re.DOTALL,
+)
+_CLAUSE_RE = re.compile(
+    r".+?(?:(?:[，；：、]+)|(?:[,;:]+(?=\s|$))|$)",
+    re.DOTALL,
+)
 _MARKDOWN = MarkdownIt("gfm-like", {"linkify": False})
 _RRF_RANK_CONSTANT = 60
+CHUNKING_VERSION = "markdown-qwen3-token-section-overlap-v4"
+
+
+class TokenizerLike(Protocol):
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]: ...
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool = False,
+    ) -> str: ...
 
 
 class _NonFiniteEmbeddingError(RuntimeError):
     pass
 
 
-def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+def chunk_text(
+    text: str,
+    *,
+    tokenizer: TokenizerLike,
+    body_target_tokens: int,
+    body_max_tokens: int,
+    overlap_target_tokens: int,
+    overlap_max_tokens: int,
+) -> list[str]:
     return [
         chunk.embedding_text
-        for chunk in chunk_markdown(text, chunk_size=chunk_size, overlap=overlap)
+        for chunk in chunk_markdown(
+            text,
+            tokenizer=tokenizer,
+            body_target_tokens=body_target_tokens,
+            body_max_tokens=body_max_tokens,
+            overlap_target_tokens=overlap_target_tokens,
+            overlap_max_tokens=overlap_max_tokens,
+        )
     ]
 
 
-def chunk_markdown(text: str, chunk_size: int, overlap: int) -> list[MarkdownChunk]:
-    if chunk_size <= 0:
-        raise ValueError("chunk_size must be greater than 0")
-    if overlap < 0:
-        raise ValueError("overlap must be greater than or equal to 0")
-    if overlap >= chunk_size:
-        raise ValueError("overlap must be smaller than chunk_size")
-    if overlap and overlap >= chunk_size - 1:
-        raise ValueError("overlap must leave room for non-overlap text")
+def chunk_markdown(
+    text: str,
+    *,
+    tokenizer: TokenizerLike,
+    body_target_tokens: int,
+    body_max_tokens: int,
+    overlap_target_tokens: int,
+    overlap_max_tokens: int,
+) -> list[MarkdownChunk]:
+    if body_max_tokens <= 0:
+        raise ValueError("body_max_tokens must be greater than 0")
+    if not 0 < body_target_tokens <= body_max_tokens:
+        raise ValueError(
+            "body_target_tokens must be between 1 and body_max_tokens"
+        )
+    if overlap_target_tokens < 0:
+        raise ValueError("overlap_target_tokens must be greater than or equal to 0")
+    if overlap_max_tokens < overlap_target_tokens:
+        raise ValueError(
+            "overlap_max_tokens must be greater than or equal to "
+            "overlap_target_tokens"
+        )
 
-    blocks = _markdown_blocks(text)
+    body, frontmatter, line_offset = _extract_frontmatter(text)
+    document_heading = str(
+        frontmatter.get("title") or frontmatter.get("id") or ""
+    ).strip()
+    blocks = _markdown_blocks(
+        body,
+        initial_heading=document_heading,
+        line_offset=line_offset,
+    )
     if not blocks:
         return []
 
-    chunks: list[MarkdownChunk] = []
-    effective_chunk_size = _effective_chunk_size(chunk_size, overlap)
-
-    for block in blocks:
-        if block.content_type == "code":
-            parts = _split_code_block(block.text, chunk_size)
-        elif block.content_type == "table":
-            parts = _split_table_block(block.text, chunk_size)
-        else:
-            parts = _split_with_overlap(block.text, effective_chunk_size, overlap)
-
-        chunks.extend(_chunk_from_block(block, part) for part in parts if part)
-
-    return chunks
-
-
-def _effective_chunk_size(chunk_size: int, overlap: int) -> int:
-    if not overlap:
-        return chunk_size
-    # Reserve one separator character for the overlapped tail that is prepended.
-    return chunk_size - overlap - 1
+    cores = _pack_markdown_blocks(
+        blocks,
+        tokenizer=tokenizer,
+        target_tokens=body_target_tokens,
+        max_tokens=body_max_tokens,
+    )
+    return _chunks_with_sentence_overlap(
+        cores,
+        tokenizer=tokenizer,
+        body_max_tokens=body_max_tokens,
+        overlap_target_tokens=overlap_target_tokens,
+        overlap_max_tokens=overlap_max_tokens,
+    )
 
 
-def _markdown_blocks(text: str) -> list[MarkdownBlock]:
+def _extract_frontmatter(text: str) -> tuple[str, dict[str, object], int]:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return text, {}, 0
+
+    closing_index = next(
+        (
+            index
+            for index, line in enumerate(lines[1:], start=1)
+            if line.strip() == "---"
+        ),
+        -1,
+    )
+    if closing_index < 0:
+        return text, {}, 0
+
+    try:
+        payload = yaml.safe_load("\n".join(lines[1:closing_index])) or {}
+    except yaml.YAMLError:
+        logger.warning("Ignoring invalid Markdown YAML frontmatter.", exc_info=True)
+        return text, {}, 0
+    if not isinstance(payload, dict):
+        logger.warning("Ignoring Markdown frontmatter that is not a mapping.")
+        return text, {}, 0
+
+    body = "\n".join(lines[closing_index + 1 :])
+    metadata = {str(key): value for key, value in payload.items()}
+    return body, metadata, closing_index + 1
+
+
+def _markdown_blocks(
+    text: str,
+    *,
+    initial_heading: str = "",
+    line_offset: int = 0,
+) -> list[MarkdownBlock]:
     lines = text.splitlines()
     tokens = _MARKDOWN.parse(text)
-    heading_stack: list[tuple[int, str]] = []
+    heading_stack: list[tuple[int, str]] = (
+        [(1, initial_heading)] if initial_heading else []
+    )
     blocks: list[MarkdownBlock] = []
 
     for idx, token in enumerate(tokens):
@@ -187,8 +278,8 @@ def _markdown_blocks(text: str) -> list[MarkdownBlock]:
                 h1=h1,
                 h2=h2,
                 h3=h3,
-                start_line=token.map[0] + 1,
-                end_line=token.map[1],
+                start_line=token.map[0] + 1 + line_offset,
+                end_line=token.map[1] + line_offset,
             )
         )
 
@@ -208,14 +299,294 @@ def _slice_lines(lines: list[str], start: int, end: int) -> str:
 
 
 def _content_type(token_type: str) -> ContentType:
-    if token_type in {"fence", "code_block"}:
+    if token_type == "fence":
         return "code"
     if token_type == "table_open":
         return "table"
+    # Long-form corpora commonly indent prose for visual layout. Only explicit
+    # fenced blocks are treated as code so indentation does not fragment prose.
     return "text"
 
 
-def _chunk_from_block(block: MarkdownBlock, text: str) -> MarkdownChunk:
+def _pack_markdown_blocks(
+    blocks: list[MarkdownBlock],
+    *,
+    tokenizer: TokenizerLike,
+    target_tokens: int,
+    max_tokens: int,
+) -> list[MarkdownBlock]:
+    packed: list[MarkdownBlock] = []
+    group: list[MarkdownBlock] = []
+    group_key: tuple[tuple[str, ...], ContentType] | None = None
+
+    def flush_group() -> None:
+        nonlocal group
+        if not group:
+            return
+        packed.extend(
+            _pack_block_group(
+                group,
+                tokenizer=tokenizer,
+                target_tokens=target_tokens,
+                max_tokens=max_tokens,
+            )
+        )
+        group = []
+
+    for block in blocks:
+        key = (block.headings, block.content_type)
+        if group_key is not None and key != group_key:
+            flush_group()
+        group_key = key
+        group.extend(
+            _expand_block(
+                block,
+                tokenizer=tokenizer,
+                max_tokens=max_tokens,
+            )
+        )
+    flush_group()
+    return packed
+
+
+def _expand_block(
+    block: MarkdownBlock,
+    *,
+    tokenizer: TokenizerLike,
+    max_tokens: int,
+) -> list[MarkdownBlock]:
+    if _token_count(tokenizer, block.text) <= max_tokens:
+        return [block]
+    if block.content_type == "code":
+        parts = _split_code_block(block.text, max_tokens, tokenizer)
+    elif block.content_type == "table":
+        parts = _split_table_block(block.text, max_tokens, tokenizer)
+    else:
+        parts = _long_paragraph_units(block.text, max_tokens, tokenizer)
+    return [replace(block, text=part) for part in parts if part.strip()]
+
+
+def _pack_block_group(
+    blocks: list[MarkdownBlock],
+    *,
+    tokenizer: TokenizerLike,
+    target_tokens: int,
+    max_tokens: int,
+) -> list[MarkdownBlock]:
+    groups: list[list[MarkdownBlock]] = []
+    current: list[MarkdownBlock] = []
+
+    for block in blocks:
+        current_text = _join_chunk_parts([item.text for item in current])
+        candidate = _join_chunk_parts([*(item.text for item in current), block.text])
+        current_tokens = _token_count(tokenizer, current_text)
+        candidate_tokens = _token_count(tokenizer, candidate)
+        should_flush = bool(current) and candidate_tokens > max_tokens
+        if (
+            current
+            and candidate_tokens > target_tokens
+            and abs(current_tokens - target_tokens)
+            <= abs(candidate_tokens - target_tokens)
+        ):
+            should_flush = True
+        if should_flush:
+            groups.append(current)
+            current = []
+        current.append(block)
+    if current:
+        groups.append(current)
+
+    cores = [_block_group_to_core(group) for group in groups if group]
+    oversized = [
+        _token_count(tokenizer, core.text)
+        for core in cores
+        if _token_count(tokenizer, core.text) > max_tokens
+    ]
+    if oversized:
+        raise RuntimeError(f"Packed Markdown bodies exceeded token budget: {oversized}")
+    return cores
+
+
+def _block_group_to_core(group: list[MarkdownBlock]) -> MarkdownBlock:
+    first = group[0]
+    return replace(
+        first,
+        text=_join_chunk_parts([block.text for block in group]),
+        start_line=min(block.start_line for block in group),
+        end_line=max(block.end_line for block in group),
+    )
+
+
+def _long_paragraph_units(
+    text: str,
+    max_tokens: int,
+    tokenizer: TokenizerLike,
+) -> list[str]:
+    units: list[str] = []
+    for sentence in _sentence_units(text):
+        if _token_count(tokenizer, sentence) <= max_tokens:
+            units.append(sentence)
+            continue
+        clauses = _clause_units(sentence)
+        if len(clauses) == 1 and clauses[0] == sentence:
+            units.extend(
+                _word_boundary_token_chunks(sentence, max_tokens, tokenizer)
+            )
+            continue
+        for clause in clauses:
+            if _token_count(tokenizer, clause) <= max_tokens:
+                units.append(clause)
+            else:
+                units.extend(
+                    _word_boundary_token_chunks(clause, max_tokens, tokenizer)
+                )
+    return [unit for unit in units if unit]
+
+
+def _sentence_units(text: str) -> list[str]:
+    return [
+        match.group(0).strip()
+        for match in _SENTENCE_RE.finditer(text)
+        if match.group(0).strip()
+    ]
+
+
+def _clause_units(text: str) -> list[str]:
+    return [
+        match.group(0).strip()
+        for match in _CLAUSE_RE.finditer(text)
+        if match.group(0).strip()
+    ]
+
+
+def _word_boundary_token_chunks(
+    text: str,
+    max_tokens: int,
+    tokenizer: TokenizerLike,
+) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    for word in re.findall(r"\S+\s*", text):
+        candidate = "".join([*current, word]).strip()
+        if current and _token_count(tokenizer, candidate) > max_tokens:
+            chunks.append("".join(current).strip())
+            current = []
+        if _token_count(tokenizer, word) > max_tokens:
+            if current:
+                chunks.append("".join(current).strip())
+                current = []
+            chunks.extend(_token_boundary_chunks(word, max_tokens, tokenizer))
+            continue
+        current.append(word)
+    if current:
+        chunks.append("".join(current).strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _chunks_with_sentence_overlap(
+    cores: list[MarkdownBlock],
+    *,
+    tokenizer: TokenizerLike,
+    body_max_tokens: int,
+    overlap_target_tokens: int,
+    overlap_max_tokens: int,
+) -> list[MarkdownChunk]:
+    chunks: list[MarkdownChunk] = []
+    separator_tokens = _token_count(tokenizer, "\n\n")
+    overlap_content_target = max(0, overlap_target_tokens - separator_tokens)
+    overlap_content_max = max(0, overlap_max_tokens - separator_tokens)
+    total_max_tokens = body_max_tokens + 2 * overlap_max_tokens
+    for index, core in enumerate(cores):
+        previous = cores[index - 1] if index > 0 else None
+        following = cores[index + 1] if index + 1 < len(cores) else None
+        prefix = ""
+        suffix = ""
+        if previous is not None and _can_overlap(previous, core):
+            prefix = _sentence_overlap(
+                previous.text,
+                target_tokens=overlap_content_target,
+                max_tokens=overlap_content_max,
+                from_tail=True,
+                tokenizer=tokenizer,
+            )
+        if following is not None and _can_overlap(core, following):
+            suffix = _sentence_overlap(
+                following.text,
+                target_tokens=overlap_content_target,
+                max_tokens=overlap_content_max,
+                from_tail=False,
+                tokenizer=tokenizer,
+            )
+        combined = _join_chunk_parts([prefix, core.text, suffix])
+        body_tokens = _token_count(tokenizer, core.text)
+        combined_tokens = _token_count(tokenizer, combined)
+        if combined_tokens > total_max_tokens:
+            raise RuntimeError(
+                "Sentence overlap exceeded the derived maximum token budget: "
+                f"{combined_tokens} > {total_max_tokens}."
+            )
+        chunks.append(
+            _chunk_from_block(
+                core,
+                combined,
+                body_token_count=body_tokens,
+                prefix_overlap_token_count=_token_count(tokenizer, prefix),
+                suffix_overlap_token_count=_token_count(tokenizer, suffix),
+                token_count=combined_tokens,
+            )
+        )
+    return chunks
+
+
+def _can_overlap(left: MarkdownBlock, right: MarkdownBlock) -> bool:
+    return (
+        left.content_type == "text"
+        and right.content_type == "text"
+        and left.headings == right.headings
+    )
+
+
+def _sentence_overlap(
+    text: str,
+    *,
+    target_tokens: int,
+    max_tokens: int,
+    from_tail: bool,
+    tokenizer: TokenizerLike,
+) -> str:
+    if target_tokens <= 0 or max_tokens <= 0:
+        return ""
+    units: list[str] = []
+    for sentence in _sentence_units(text):
+        if _token_count(tokenizer, sentence) <= max_tokens:
+            units.append(sentence)
+        else:
+            units.extend(_long_paragraph_units(sentence, max_tokens, tokenizer))
+    if not units:
+        return ""
+    ordered = list(reversed(units)) if from_tail else units
+    selected: list[str] = []
+    for unit in ordered:
+        candidate = _join_chunk_parts([*selected, unit])
+        if _token_count(tokenizer, candidate) > max_tokens:
+            break
+        selected.append(unit)
+        if _token_count(tokenizer, candidate) >= target_tokens:
+            break
+    if from_tail:
+        selected.reverse()
+    return _join_chunk_parts(selected)
+
+
+def _chunk_from_block(
+    block: MarkdownBlock,
+    text: str,
+    *,
+    body_token_count: int,
+    prefix_overlap_token_count: int,
+    suffix_overlap_token_count: int,
+    token_count: int,
+) -> MarkdownChunk:
     return MarkdownChunk(
         text=text,
         embedding_text=_embedding_text(block, text),
@@ -226,6 +597,10 @@ def _chunk_from_block(block: MarkdownBlock, text: str) -> MarkdownChunk:
         h3=block.h3,
         start_line=block.start_line,
         end_line=block.end_line,
+        body_token_count=body_token_count,
+        prefix_overlap_token_count=prefix_overlap_token_count,
+        suffix_overlap_token_count=suffix_overlap_token_count,
+        token_count=token_count,
     )
 
 
@@ -238,165 +613,155 @@ def _embedding_text(block: MarkdownBlock, text: str) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _split_with_overlap(
+def _split_code_block(
     text: str,
-    effective_chunk_size: int,
-    overlap: int,
+    max_tokens: int,
+    tokenizer: TokenizerLike,
 ) -> list[str]:
-    effective_chunk_size = max(1, effective_chunk_size)
-    parts = _word_boundary_chunks(text, effective_chunk_size)
-    if not parts or overlap <= 0:
-        return parts
-
-    chunks: list[str] = []
-    previous_tail = ""
-    for part in parts:
-        chunk = " ".join(
-            segment
-            for segment in [previous_tail, part.strip()]
-            if segment
-        )
-        chunks.append(chunk)
-        previous_tail = _tail_text(part, overlap)
-    return chunks
-
-
-def _split_code_block(text: str, chunk_size: int) -> list[str]:
-    if len(text) <= chunk_size:
+    if _token_count(tokenizer, text) <= max_tokens:
         return [text.strip()]
 
     lines = text.splitlines()
     if len(lines) < 2 or not _FENCE_RE.match(lines[0]):
-        return _word_boundary_chunks(text, chunk_size)
+        return _word_boundary_token_chunks(text, max_tokens, tokenizer)
 
     opening = lines[0]
     closing = lines[-1] if _FENCE_RE.match(lines[-1]) else lines[0]
     body_lines = lines[1:-1] if closing == lines[-1] else lines[1:]
-    body_budget = max(1, chunk_size - len(opening) - len(closing) - 2)
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
 
-    def flush() -> None:
-        nonlocal current, current_len
-        if not current:
-            return
-        chunks.append("\n".join([opening, *current, closing]).strip())
-        current = []
-        current_len = 0
+    def render(parts: list[str]) -> str:
+        return "\n".join([opening, *parts, closing]).strip()
 
-    for line in body_lines:
-        line_len = len(line) + 1
-        if line_len > body_budget:
-            flush()
-            for part in _word_boundary_chunks(line, body_budget):
-                chunks.append("\n".join([opening, part, closing]).strip())
-            continue
-
-        if current and current_len + line_len > body_budget:
-            flush()
-
-        current.append(line)
-        current_len += line_len
-
-    flush()
-    return chunks
+    return _pack_wrapped_lines(body_lines, render, max_tokens, tokenizer)
 
 
-def _split_table_block(text: str, chunk_size: int) -> list[str]:
-    if len(text) <= chunk_size:
+def _split_table_block(
+    text: str,
+    max_tokens: int,
+    tokenizer: TokenizerLike,
+) -> list[str]:
+    if _token_count(tokenizer, text) <= max_tokens:
         return [text.strip()]
 
     lines = text.splitlines()
     if len(lines) < 3 or not _TABLE_DIVIDER_RE.match(lines[1]):
-        return _word_boundary_chunks(text, chunk_size)
+        return _word_boundary_token_chunks(text, max_tokens, tokenizer)
 
     header = lines[:2]
     rows = lines[2:]
-    header_text = "\n".join(header)
-    row_budget = max(1, chunk_size - len(header_text) - 1)
+
+    def render(parts: list[str]) -> str:
+        return "\n".join([*header, *parts]).strip()
+
+    return _pack_wrapped_lines(rows, render, max_tokens, tokenizer)
+
+
+def _pack_wrapped_lines(
+    lines: list[str],
+    render: Callable[[list[str]], str],
+    max_tokens: int,
+    tokenizer: TokenizerLike,
+) -> list[str]:
     chunks: list[str] = []
     current: list[str] = []
-    current_len = 0
 
     def flush() -> None:
-        nonlocal current, current_len
+        nonlocal current
         if not current:
             return
-        chunks.append("\n".join([*header, *current]).strip())
+        chunks.append(render(current))
         current = []
-        current_len = 0
 
-    for row in rows:
-        row_len = len(row) + 1
-        if row_len > row_budget:
-            flush()
-            for part in _word_boundary_chunks(row, row_budget):
-                chunks.append("\n".join([*header, part]).strip())
+    for line in lines:
+        candidate = render([*current, line])
+        if _token_count(tokenizer, candidate) <= max_tokens:
+            current.append(line)
             continue
 
-        if current and current_len + row_len > row_budget:
+        if current:
             flush()
-
-        current.append(row)
-        current_len += row_len
+        single = render([line])
+        if _token_count(tokenizer, single) <= max_tokens:
+            current.append(line)
+            continue
+        chunks.extend(
+            _split_text_to_fit_wrapper(
+                line,
+                render=render,
+                max_tokens=max_tokens,
+                tokenizer=tokenizer,
+            )
+        )
 
     flush()
     return chunks
 
 
-def _word_boundary_chunks(text: str, max_chars: int) -> list[str]:
-    if len(text) <= max_chars:
-        return [text.strip()] if text.strip() else []
-
+def _split_text_to_fit_wrapper(
+    text: str,
+    *,
+    render: Callable[[list[str]], str],
+    max_tokens: int,
+    tokenizer: TokenizerLike,
+) -> list[str]:
+    token_ids = _token_ids(tokenizer, text)
     chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-
-    for token in re.findall(r"\S+\s*", text):
-        if current and current_len + len(token) > max_chars:
-            chunks.append("".join(current).strip())
-            current = []
-            current_len = 0
-
-        while len(token) > max_chars:
-            if current:
-                chunks.append("".join(current).strip())
-                current = []
-                current_len = 0
-            chunks.append(token[:max_chars].strip())
-            token = token[max_chars:]
-
-        current.append(token)
-        current_len += len(token)
-
-    if current:
-        chunks.append("".join(current).strip())
-
-    return [chunk for chunk in chunks if chunk]
+    while token_ids:
+        low = 1
+        high = len(token_ids)
+        best = 0
+        best_text = ""
+        while low <= high:
+            middle = (low + high) // 2
+            candidate_text = _decode_tokens(tokenizer, token_ids[:middle]).strip()
+            if _token_count(tokenizer, render([candidate_text])) <= max_tokens:
+                best = middle
+                best_text = candidate_text
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best <= 0:
+            raise ValueError("Wrapper metadata leaves no room for content tokens.")
+        chunks.append(render([best_text]))
+        token_ids = token_ids[best:]
+    return chunks
 
 
 def _join_chunk_parts(parts: list[str]) -> str:
     return "\n\n".join(part.strip() for part in parts if part.strip()).strip()
 
 
-def _tail_text(text: str, max_chars: int) -> str:
-    if max_chars <= 0:
-        return ""
+def _token_ids(tokenizer: TokenizerLike, text: str) -> list[int]:
+    encoded = tokenizer.encode(text, add_special_tokens=False)
+    return [int(token_id) for token_id in encoded]
 
-    tokens = re.findall(r"\S+\s*", text.strip())
-    tail_tokens: list[str] = []
-    current_len = 0
-    for token in reversed(tokens):
-        token_len = len(token)
-        if token_len > max_chars and not tail_tokens:
-            return token[-max_chars:].strip()
-        if current_len + token_len > max_chars:
-            break
-        tail_tokens.append(token)
-        current_len += token_len
 
-    return "".join(reversed(tail_tokens)).strip()
+def _token_count(tokenizer: TokenizerLike, text: str) -> int:
+    return len(_token_ids(tokenizer, text))
+
+
+def _decode_tokens(tokenizer: TokenizerLike, token_ids: Sequence[int]) -> str:
+    return str(tokenizer.decode(token_ids, skip_special_tokens=False))
+
+
+def _token_boundary_chunks(
+    text: str,
+    max_tokens: int,
+    tokenizer: TokenizerLike,
+) -> list[str]:
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be greater than 0")
+    token_ids = _token_ids(tokenizer, text)
+    return [
+        decoded.strip()
+        for offset in range(0, len(token_ids), max_tokens)
+        if (
+            decoded := _decode_tokens(
+                tokenizer,
+                token_ids[offset : offset + max_tokens],
+            )
+        ).strip()
+    ]
 
 
 def _bm25_tokens(text: str) -> list[str]:
@@ -417,19 +782,23 @@ class VectorStore:
         config: Settings = settings,
         client: QdrantClient | None = None,
         model: SentenceTransformer | None = None,
+        chunk_tokenizer: TokenizerLike | None = None,
         use_ray: bool = True,
         document_store: object | None = None,
     ) -> None:
         self.config = config
         self._client = client
         self._model = model
+        self._chunk_tokenizer = chunk_tokenizer
         self._model_device = "cpu" if model is not None else None
         self._use_ray = use_ray and model is None
         self._document_store = document_store
         self._client_lock = Lock()
         self._model_lock = Lock()
+        self._chunk_tokenizer_lock = Lock()
         self._bm25_lock = Lock()
         self._bm25_index: _BM25Index | None = None
+        self._bm25_candidate: tuple[str, _BM25Index] | None = None
         self._ensured_payload_indexes: set[str] = set()
         self._vector_size: int | None = None
 
@@ -441,6 +810,26 @@ class VectorStore:
                     logger.info("Connecting to Qdrant at %s.", self.config.qdrant_url)
                     self._client = QdrantClient(url=self.config.qdrant_url)
         return self._client
+
+    @property
+    def chunk_tokenizer(self) -> TokenizerLike:
+        if self._chunk_tokenizer is None:
+            with self._chunk_tokenizer_lock:
+                if self._chunk_tokenizer is None:
+                    from transformers import AutoTokenizer
+
+                    logger.info(
+                        "Loading chunk tokenizer %s.",
+                        self.config.chunk_tokenizer_model,
+                    )
+                    self._chunk_tokenizer = AutoTokenizer.from_pretrained(
+                        self.config.chunk_tokenizer_model,
+                        trust_remote_code=(
+                            self.config.chunk_tokenizer_trust_remote_code
+                        ),
+                        use_fast=True,
+                    )
+        return self._chunk_tokenizer
 
     @property
     def model(self) -> SentenceTransformer:
@@ -515,6 +904,7 @@ class VectorStore:
             self._ensured_payload_indexes.clear()
         with self._bm25_lock:
             self._bm25_index = None
+            self._bm25_candidate = None
 
         if client is not None and hasattr(client, "close"):
             client.close()
@@ -673,6 +1063,7 @@ class VectorStore:
         )
         with self._bm25_lock:
             self._bm25_index = None
+            self._bm25_candidate = None
         return inserted
 
     @staticmethod
@@ -905,8 +1296,11 @@ class VectorStore:
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         chunks = chunk_markdown(
             text,
-            chunk_size=self.config.chunk_size,
-            overlap=self.config.chunk_overlap,
+            tokenizer=self.chunk_tokenizer,
+            body_target_tokens=self.config.chunk_body_target_tokens,
+            body_max_tokens=self.config.chunk_body_max_tokens,
+            overlap_target_tokens=self.config.chunk_overlap_target_tokens,
+            overlap_max_tokens=self.config.chunk_overlap_max_tokens,
         )
         if not chunks:
             return []
@@ -942,6 +1336,14 @@ class VectorStore:
                         "headings": list(chunk.headings),
                         "start_line": chunk.start_line,
                         "end_line": chunk.end_line,
+                        "body_token_count": chunk.body_token_count,
+                        "prefix_overlap_token_count": (
+                            chunk.prefix_overlap_token_count
+                        ),
+                        "suffix_overlap_token_count": (
+                            chunk.suffix_overlap_token_count
+                        ),
+                        "token_count": chunk.token_count,
                     },
                 )
             )
@@ -1114,6 +1516,11 @@ class VectorStore:
         prompt_name: str | None = None,
     ) -> object:
         encode_kwargs = self._encode_kwargs(task, prompt_name=prompt_name)
+        if not isinstance(texts, str):
+            encode_kwargs["batch_size"] = min(
+                len(texts),
+                self.config.embedding_offline_batch_size,
+            )
         try:
             return self.model.encode(
                 texts,
@@ -1244,7 +1651,7 @@ class VectorStore:
     def _encode_kwargs(
         task: str | None,
         prompt_name: str | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         task = (task or "").strip()
         prompt_name = (prompt_name or "").strip()
         if task == "retrieval.query" and not prompt_name:
@@ -1252,7 +1659,7 @@ class VectorStore:
         if task == "retrieval.passage" and not prompt_name:
             return {"task": "retrieval", "prompt_name": "document"}
 
-        kwargs: dict[str, str] = {}
+        kwargs: dict[str, object] = {}
         if task:
             kwargs["task"] = task
         if prompt_name:
@@ -1277,6 +1684,103 @@ class VectorStore:
                 return self._bm25_index
             self._bm25_index = self._build_bm25_index(signature)
             return self._bm25_index
+
+    def rebuild_bm25_index(self, *, expected_index_version: str = "") -> int:
+        """Synchronously rebuild and publish one complete in-memory BM25S index."""
+        with self._bm25_lock:
+            signature = self._docs_signature()
+            if expected_index_version:
+                expected_prefix = f"s3-manifest:{expected_index_version}"
+                if not signature or signature[0][0] != expected_prefix:
+                    raise RuntimeError(
+                        "Active S3 manifest does not match the expected BM25 version: "
+                        f"expected={expected_index_version} signature={signature[:1]}."
+                    )
+            rebuilt = self._build_bm25_index(signature)
+            if self._docs_signature() != signature:
+                raise RuntimeError(
+                    "Document manifest changed while the BM25S index was rebuilding."
+                )
+            self._bm25_index = rebuilt
+            self._bm25_candidate = None
+            return len(rebuilt.documents)
+
+    def prepare_bm25_candidate(self, index_version: str) -> int:
+        if self.config.docs_source != "s3":
+            raise RuntimeError("Versioned BM25 candidates require DOCS_SOURCE=s3.")
+        manifest = self._s3_document_store().load_version_manifest(index_version)
+        if not manifest:
+            raise RuntimeError(f"S3 index manifest is missing: {index_version}")
+        if str(manifest.get("index_version", "")) != index_version:
+            raise RuntimeError("S3 index manifest version does not match its key.")
+
+        try:
+            import bm25s
+        except ImportError as exc:
+            raise RuntimeError(
+                "BM25S is required for keyword recall. Install requirements.api.txt."
+            ) from exc
+
+        signature = self._s3_docs_signature(manifest)
+        candidate = self._build_bm25_index_from_s3_manifest(
+            signature,
+            bm25s,
+            manifest=manifest,
+        )
+        latest_manifest = self._s3_document_store().load_version_manifest(
+            index_version
+        )
+        if not latest_manifest or self._s3_docs_signature(latest_manifest) != signature:
+            raise RuntimeError("S3 index manifest changed during BM25S preparation.")
+        with self._bm25_lock:
+            if (
+                self._bm25_candidate is not None
+                and self._bm25_candidate[0] != index_version
+            ):
+                raise RuntimeError(
+                    "Another BM25S candidate is already prepared: "
+                    f"{self._bm25_candidate[0]}."
+                )
+            self._bm25_candidate = (index_version, candidate)
+        return len(candidate.documents)
+
+    def activate_bm25_candidate(self, index_version: str) -> int:
+        expected_prefix = f"s3-manifest:{index_version}"
+        with self._bm25_lock:
+            if (
+                self._bm25_index is not None
+                and self._bm25_index.signature
+                and self._bm25_index.signature[0][0] == expected_prefix
+            ):
+                return len(self._bm25_index.documents)
+            if self._bm25_candidate is None:
+                raise RuntimeError("No prepared BM25S candidate is available.")
+            candidate_version, candidate = self._bm25_candidate
+            if candidate_version != index_version:
+                raise RuntimeError(
+                    "Prepared BM25S candidate version mismatch: "
+                    f"expected={index_version} actual={candidate_version}."
+                )
+            self._bm25_index = candidate
+            self._bm25_candidate = None
+            return len(candidate.documents)
+
+    def discard_bm25_candidate(self, index_version: str) -> None:
+        with self._bm25_lock:
+            if self._bm25_candidate and self._bm25_candidate[0] == index_version:
+                self._bm25_candidate = None
+
+    def active_bm25_index_version(self) -> str:
+        with self._bm25_lock:
+            if self._bm25_index is None or not self._bm25_index.signature:
+                return ""
+            marker = self._bm25_index.signature[0][0]
+        prefix = "s3-manifest:"
+        return marker[len(prefix) :] if marker.startswith(prefix) else ""
+
+    def prepared_bm25_candidate_version(self) -> str:
+        with self._bm25_lock:
+            return self._bm25_candidate[0] if self._bm25_candidate else ""
 
     def _build_bm25_index(
         self,
@@ -1306,8 +1810,11 @@ class VectorStore:
             text = file_path.read_text(encoding="utf-8")
             chunks = chunk_markdown(
                 text,
-                chunk_size=self.config.chunk_size,
-                overlap=self.config.chunk_overlap,
+                tokenizer=self.chunk_tokenizer,
+                body_target_tokens=self.config.chunk_body_target_tokens,
+                body_max_tokens=self.config.chunk_body_max_tokens,
+                overlap_target_tokens=self.config.chunk_overlap_target_tokens,
+                overlap_max_tokens=self.config.chunk_overlap_max_tokens,
             )
             source = self._display_source(file_path)
             for idx, chunk in enumerate(chunks):
@@ -1417,8 +1924,10 @@ class VectorStore:
         self,
         signature: tuple[tuple[str, int, int], ...],
         bm25s_module: object,
+        *,
+        manifest: dict[str, object] | None = None,
     ) -> _BM25Index:
-        records = self._s3_active_records()
+        records = self._s3_active_records(manifest)
         documents: list[SearchResult] = []
         tokenized_documents: list[list[str]] = []
 
@@ -1427,8 +1936,11 @@ class VectorStore:
             text = document_store.read_markdown(record)
             chunks = chunk_markdown(
                 text,
-                chunk_size=self.config.chunk_size,
-                overlap=self.config.chunk_overlap,
+                tokenizer=self.chunk_tokenizer,
+                body_target_tokens=self.config.chunk_body_target_tokens,
+                body_max_tokens=self.config.chunk_body_max_tokens,
+                overlap_target_tokens=self.config.chunk_overlap_target_tokens,
+                overlap_max_tokens=self.config.chunk_overlap_max_tokens,
             )
             for idx, chunk in enumerate(chunks):
                 tokens = _bm25_tokens(chunk.embedding_text)
@@ -1510,10 +2022,13 @@ class VectorStore:
             self._document_store = S3DocumentStore(self.config)
         return self._document_store
 
-    def _s3_active_records(self) -> list[object]:
+    def _s3_active_records(
+        self,
+        manifest: dict[str, object] | None = None,
+    ) -> list[object]:
         from app.s3_documents import S3DocumentRecord
 
-        manifest = self._s3_document_store().load_active_manifest()
+        manifest = manifest or self._s3_document_store().load_active_manifest()
         if not manifest:
             raise RuntimeError("No active S3 document manifest is available.")
         docs = manifest.get("documents", [])
@@ -1543,9 +2058,36 @@ class VectorStore:
             )
         return records
 
-    def _s3_docs_signature(self) -> tuple[tuple[str, int, int], ...]:
-        records = self._s3_active_records()
-        signature: list[tuple[str, int, int]] = []
+    def _s3_docs_signature(
+        self,
+        manifest: dict[str, object] | None = None,
+    ) -> tuple[tuple[str, int, int], ...]:
+        manifest = manifest or self._s3_document_store().load_active_manifest() or {}
+        records = self._s3_active_records(manifest)
+        manifest_identity = "|".join(
+            str(manifest.get(key, ""))
+            for key in (
+                "index_version",
+                "chunking_version",
+                "chunk_tokenizer_model",
+                "chunk_tokenizer_trust_remote_code",
+                "chunk_body_target_tokens",
+                "chunk_body_max_tokens",
+                "chunk_overlap_target_tokens",
+                "chunk_overlap_max_tokens",
+            )
+        )
+        manifest_digest = int(
+            hashlib.sha256(manifest_identity.encode("utf-8")).hexdigest()[:12],
+            16,
+        )
+        signature: list[tuple[str, int, int]] = [
+            (
+                f"s3-manifest:{manifest.get('index_version', '')}",
+                len(records),
+                manifest_digest,
+            )
+        ]
         for record in records:
             version = (
                 getattr(record, "version_id", "")
