@@ -222,8 +222,9 @@ services by default:
   versioning.
 - `ray-head`: owns the Ray cluster control plane and Ray client endpoint.
 - `ray-worker-embedding-bootstrap`: temporary GPU worker used only for offline
-  document embedding. It exits after a successful index build, destroying its
-  CUDA context and retained allocator cache.
+  document embedding through the dedicated `kba_embedding_bootstrap` actor.
+  The indexer explicitly destroys that detached actor before the worker exits,
+  releasing its CUDA context and retained allocator cache.
 - `docs-indexer`: one-shot CPU chunker and index coordinator. It syncs Markdown
   into MinIO, creates 64-chunk cross-document embedding batches through Ray,
   validates the candidate Qdrant collection, and atomically switches the alias.
@@ -240,8 +241,10 @@ services by default:
   to heal as a single container, such as `redis`, `session-archiver`,
   `pgbouncer`, `qdrant`, and `main`.
 - `main`: starts alongside the infrastructure but holds Uvicorn behind the
-  current startup-run marker. It connects to Ray and serves FastAPI only after
-  the document index is committed and the online model workers are released.
+  current startup-run marker and the online model readiness barrier. It serves
+  FastAPI only after the document index is committed, the online model workers
+  are released, maximum concurrent GPU capacity is validated, and
+  representative caches are warmed.
 
 Docker service architecture:
 
@@ -379,12 +382,30 @@ flowchart TD
     Stop --> Online["Start online embedding worker<br/>query dynamic batch 16 / 10ms"]
     Stop --> RR1["Start reranker replica 1"]
     Stop --> RR2["Start reranker replica 2"]
-    Stop --> MainWarm["main passes startup gate<br/>warm online actors"]
-    Online --> MainWarm
-    RR1 --> MainWarm
-    RR2 --> MainWarm
-    MainWarm --> API["Uvicorn/FastAPI ready"]
+    Stop --> LoadR1["Load reranker-1 weights"]
+    RR1 --> LoadR1
+    LoadR1 --> LoadR2["Load reranker-2 weights"]
+    RR2 --> LoadR2
+    LoadR2 --> LoadE["Load online embedding weights"]
+    Online --> LoadE
+    LoadE --> Capacity["Concurrent maximum-capacity validation<br/>Embedding: 16 x 3000 tokens<br/>Each reranker: 64 x 1800-token docs + 512-token query"]
+    Capacity -. "any failure" .-> NotReady["Startup fails<br/>retrieval never becomes ready"]
+    Capacity --> Empty["Release temporary CUDA allocator cache"]
+    Empty --> PerfE["Embedding representative warmup<br/>dynamic batch 16 x 256 tokens, 2 rounds"]
+    PerfE --> PerfR1["Reranker-1 representative warmup<br/>64 x 1800-token docs + 256-token query"]
+    PerfR1 --> PerfR2["Reranker-2 representative warmup<br/>64 x 1800-token docs + 256-token query"]
+    PerfR2 --> API["Uvicorn/FastAPI ready"]
 ```
+
+The capacity phase deliberately submits all three maximum workloads before
+waiting for any result. This validates the real cross-request peak in which
+query embedding and both reranker replicas overlap on the same physical GPU.
+Each actor reports allocated, reserved, and peak CUDA memory. Temporary
+capacity-test cache is released, then performance warmup runs serially and
+retains only the representative runtime cache. The reranker performance shape
+uses the full 1,800-token assembled chunk maximum for all 64 RRF candidates and
+a 256-token query. FastAPI lifespan does not complete if loading, capacity
+validation, or representative warmup fails.
 
 Plain `docker compose restart` does not rescan local Markdown. A new image build
 id or changed index-config fingerprint makes `docs-indexer` sync and run the
@@ -418,6 +439,16 @@ DOCS_INIT_DELETE_REMOVED=1 # docs-indexer removes remote docs missing locally
 EMBEDDING_OFFLINE_BATCH_SIZE=64 # cross-document build/update batches
 EMBEDDING_DYNAMIC_BATCH_MAX_SIZE=16 # online cross-request query batch
 EMBEDDING_DYNAMIC_BATCH_WAIT_MS=10  # online batch collection window
+MODEL_WARMUP_CAPACITY_ENABLED=1     # validate all three maximum GPU workloads
+MODEL_WARMUP_TIMEOUT_SECONDS=900
+EMBEDDING_WARMUP_CAPACITY_TOKENS=3000
+EMBEDDING_WARMUP_REPRESENTATIVE_TOKENS=256
+EMBEDDING_WARMUP_ROUNDS=2
+RERANKER_WARMUP_CAPACITY_QUERY_TOKENS=512
+RERANKER_WARMUP_REPRESENTATIVE_QUERY_TOKENS=256
+RERANKER_WARMUP_REPRESENTATIVE_DOCUMENT_TOKENS=1800
+RERANKER_WARMUP_ROUNDS=1
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 WAIT_FOR_LLM=0           # set to 1 when a local LLM service must be ready first
 APP_PORT=8080            # host port mapped to FastAPI/UI
 QDRANT_IMAGE=qdrant/qdrant:v1.18.1
@@ -436,6 +467,7 @@ MINIO_CONSOLE_PORT=9001  # local MinIO browser console
 RAY_ADDRESS=ray://ray-head:10001
 RAY_LOCAL_FALLBACK=0     # do not load embedding/reranker models in main
 GRPC_ENABLE_FORK_SUPPORT=0 # keep Ray Client stable inside Compose containers
+RAY_BOOTSTRAP_EMBEDDING_ACTOR_NAME=kba_embedding_bootstrap
 RAY_EMBEDDING_ACTOR_RESOURCE=ray_worker_embedding
 RAY_RERANKER_ACTOR_REPLICAS=2
 RAY_RERANKER_ACTOR_RESOURCE=ray_worker_reranker # base; replicas use _1 and _2
@@ -1213,6 +1245,13 @@ Smoke-test cross-request embedding batching with a fake encoder:
 
 ```bash
 python scripts/test_embedding_batcher.py
+```
+
+Validate the ordered online-model startup and capacity gate with fake Ray
+actors:
+
+```bash
+python scripts/test_model_warmup.py
 ```
 
 Smoke-test prompt budgeting and history trimming:

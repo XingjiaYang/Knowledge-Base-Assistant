@@ -64,14 +64,15 @@ _ACTOR_RECOVERY_WARMUP_MIN_INTERVAL_SECONDS = 60.0
 _actor_recovery_warmup_last_at: dict[str, float] = {}
 
 
-async def _warmup_model_actors_background() -> None:
+async def _warmup_model_actors_before_ready() -> dict[str, object]:
     try:
-        await asyncio.to_thread(warmup_model_actors, settings)
+        return await asyncio.to_thread(warmup_model_actors, settings)
     except Exception:
         logger.exception(
-            "Startup degraded: Ray model actor warmup failed; "
-            "falling back to lazy or local model loading when needed."
+            "Ray online model startup validation failed; FastAPI will not "
+            "become ready."
         )
+        raise
 
 
 async def _warmup_code_embedding_background(code_retrieval: CodeRetrieval) -> None:
@@ -155,9 +156,13 @@ async def lifespan(_app: FastAPI):
                 "reranker",
                 lambda: _probe_reranker_component(),
             )
+    _app.state.model_warmup_report = {
+        "ready": not settings.ray_enabled,
+        "reason": "Ray disabled" if not settings.ray_enabled else "pending",
+    }
     if settings.ray_enabled:
-        _app.state.model_actor_warmup_task = asyncio.create_task(
-            _warmup_model_actors_background()
+        _app.state.model_warmup_report = (
+            await _warmup_model_actors_before_ready()
         )
     _app.state.reranker = Reranker(settings)
     if (
@@ -203,7 +208,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
-        for task_name in ("model_actor_warmup_task", "code_embedding_warmup_task"):
+        for task_name in ("code_embedding_warmup_task",):
             task = getattr(_app.state, task_name, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -1349,6 +1354,16 @@ async def health_details(request: Request) -> dict[str, object]:
         "embedding_query_prompt_name": settings.embedding_query_prompt_name,
         "embedding_passage_prompt_name": settings.embedding_passage_prompt_name,
         "embedding_classification_prompt_name": settings.embedding_classification_prompt_name,
+        "model_warmup": request.app.state.model_warmup_report,
+        "model_warmup_capacity_enabled": settings.model_warmup_capacity_enabled,
+        "model_warmup_timeout_seconds": settings.model_warmup_timeout_seconds,
+        "embedding_warmup_capacity_tokens": (
+            settings.embedding_warmup_capacity_tokens
+        ),
+        "embedding_warmup_representative_tokens": (
+            settings.embedding_warmup_representative_tokens
+        ),
+        "embedding_warmup_rounds": settings.embedding_warmup_rounds,
         "bm25_top_k": settings.bm25_top_k,
         "recall_top_k": settings.recall_top_k,
         "rrf_top_k": settings.rrf_top_k,
@@ -1360,6 +1375,16 @@ async def health_details(request: Request) -> dict[str, object]:
         "reranker_enabled": settings.reranker_enabled,
         "reranker_preload": settings.reranker_preload,
         "reranker_model": settings.reranker_model,
+        "reranker_warmup_capacity_query_tokens": (
+            settings.reranker_warmup_capacity_query_tokens
+        ),
+        "reranker_warmup_representative_query_tokens": (
+            settings.reranker_warmup_representative_query_tokens
+        ),
+        "reranker_warmup_representative_document_tokens": (
+            settings.reranker_warmup_representative_document_tokens
+        ),
+        "reranker_warmup_rounds": settings.reranker_warmup_rounds,
         "ray_enabled": settings.ray_enabled,
         "ray_address": settings.ray_address,
         "ray_local_fallback": settings.ray_local_fallback,
