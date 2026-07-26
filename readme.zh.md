@@ -157,11 +157,12 @@ docker compose down -v
 默认 `compose.yaml` 会启动 Redis、Session Archiver、PostgreSQL、PgBouncer、Qdrant、
 MinIO、Ray head、在线三个Ray model worker和`main` API服务，并增加三个有序的
 startup服务：`minio-init`、`ray-worker-embedding-bootstrap`和`docs-indexer`。
-bootstrap worker只服务离线文档embedding；`docs-indexer`负责同步MinIO、Qwen3
+bootstrap worker只服务独立的`kba_embedding_bootstrap`离线Actor；`docs-indexer`负责同步MinIO、Qwen3
 tokenizer切分、跨文档64条批量embedding、候选collection验证和alias原子切换。
-成功后bootstrap worker退出并销毁CUDA context，再同时启动在线embedding worker和
-两个reranker replica。`main`提前启动但在本轮UUID ready marker前不启动Uvicorn，
-因此不会暴露半完成索引。
+成功后`docs-indexer`显式销毁detached离线Actor，bootstrap worker再退出并销毁
+CUDA context，随后同时启动在线embedding worker和两个reranker replica。`main`
+提前启动，但必须同时通过本轮UUID marker和在线模型readiness门槛后才完成FastAPI
+lifespan，因此不会暴露半完成索引或未预热模型。
 
 `docs-update` profile另外提供按需启动的`ray-worker-embedding-ingest-cpu`和
 `docs-updater`。它们只负责运行中手动增量更新，使用独立的CPU embedding actor，
@@ -316,12 +317,28 @@ flowchart TD
     Stop --> Online["启动在线embedding worker<br/>动态batch 16 / 10ms"]
     Stop --> RR1["启动reranker replica 1"]
     Stop --> RR2["启动reranker replica 2"]
-    Stop --> MainWarm["main通过启动门并warmup在线actor"]
-    Online --> MainWarm
-    RR1 --> MainWarm
-    RR2 --> MainWarm
-    MainWarm --> API["Uvicorn/FastAPI ready"]
+    Stop --> LoadR1["加载reranker-1权重"]
+    RR1 --> LoadR1
+    LoadR1 --> LoadR2["加载reranker-2权重"]
+    RR2 --> LoadR2
+    LoadR2 --> LoadE["加载online embedding权重"]
+    Online --> LoadE
+    LoadE --> Capacity["三路并发最大容量验证<br/>Embedding: 16 x 3000 tokens<br/>每个Reranker: 64 x 1800-token文档 + 512-token Query"]
+    Capacity -. "任一路失败" .-> NotReady["启动失败<br/>Retrieval不进入Ready"]
+    Capacity --> Empty["释放容量测试产生的临时CUDA cache"]
+    Empty --> PerfE["Embedding代表性性能预热<br/>动态batch 16 x 256 tokens，共2轮"]
+    PerfE --> PerfR1["Reranker-1代表性性能预热<br/>64 x 1800-token文档 + 256-token Query"]
+    PerfR1 --> PerfR2["Reranker-2代表性性能预热<br/>64 x 1800-token文档 + 256-token Query"]
+    PerfR2 --> API["Uvicorn/FastAPI ready"]
 ```
+
+容量阶段会先提交Embedding和两个Reranker的三路最大工作负载，再等待结果，用于覆盖
+不同请求导致三路GPU推理同时运行的真实峰值。每个Actor都会报告allocated、
+reserved和peak CUDA显存。容量验证结束后释放其临时allocator cache，再串行执行
+代表性性能预热，仅保留生产shape对应的缓存。Reranker性能预热会让全部64个RRF
+候选使用assembled Chunk的1,800-token硬上限，并搭配256-token Query。加载、容量
+验证或代表性预热任一失败时，FastAPI lifespan不会完成，也不会对外宣称
+Retrieval Ready。
 
 普通`docker compose restart`不会重新扫描本地Markdown。新的image build id或索引
 配置指纹变化会让`docs-indexer`执行同步和manifest diff；只有语料或索引配置变化时
@@ -433,6 +450,16 @@ EMBEDDING_DYNAMIC_BATCH_ENABLED=1
 EMBEDDING_DYNAMIC_BATCH_MAX_SIZE=16
 EMBEDDING_DYNAMIC_BATCH_WAIT_MS=10
 EMBEDDING_OFFLINE_BATCH_SIZE=64
+MODEL_WARMUP_CAPACITY_ENABLED=1
+MODEL_WARMUP_TIMEOUT_SECONDS=900
+EMBEDDING_WARMUP_CAPACITY_TOKENS=3000
+EMBEDDING_WARMUP_REPRESENTATIVE_TOKENS=256
+EMBEDDING_WARMUP_ROUNDS=2
+RERANKER_WARMUP_CAPACITY_QUERY_TOKENS=512
+RERANKER_WARMUP_REPRESENTATIVE_QUERY_TOKENS=256
+RERANKER_WARMUP_REPRESENTATIVE_DOCUMENT_TOKENS=1800
+RERANKER_WARMUP_ROUNDS=1
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 BM25_TOP_K=100
 RECALL_TOP_K=100
 RRF_TOP_K=64
@@ -449,6 +476,7 @@ RERANKER_PRELOAD=1
 RERANKER_TRUST_REMOTE_CODE=1
 RERANKER_DTYPE=auto
 RERANKER_MAX_DOCUMENTS_PER_CALL=64
+RAY_BOOTSTRAP_EMBEDDING_ACTOR_NAME=kba_embedding_bootstrap
 RAY_RERANKER_ACTOR_REPLICAS=2
 
 HISTORY_RECENT_TURNS=16
@@ -969,6 +997,7 @@ python scripts/test_intent_router.py
 python scripts/intent_router_ab.py --fake-embedder
 python scripts/test_reranker.py
 python scripts/test_embedding_batcher.py
+python scripts/test_model_warmup.py
 python scripts/test_vector_store.py
 python scripts/test_document_commit.py
 ```

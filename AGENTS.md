@@ -35,9 +35,16 @@ configurable LLM provider.
 - `cp .env.example .env`: create local deployment settings.
 - `docker compose up --build`: build and start infrastructure plus the
   two-phase document pipeline. A temporary embedding worker serves the
-  one-shot `docs-indexer`, exits after alias commit to release CUDA cache, then
-  the online embedding worker and two reranker workers start together before
-  FastAPI becomes ready. Run-scoped ready/failed markers reject stale handoffs.
+  one-shot `docs-indexer`; after alias commit, the indexer destroys its
+  dedicated bootstrap actor and the worker exits to release the CUDA context.
+  Main then loads reranker replica 1, reranker replica 2, and the online
+  embedding actor in order. It concurrently validates all three actors at
+  their configured maximum workloads, clears temporary CUDA caches, and runs
+  representative performance warmups in embedding/reranker-1/reranker-2
+  order. Each reranker representative warmup uses 64 documents at the
+  1,800-token assembled chunk maximum plus a 256-token query. FastAPI becomes
+  ready only after every stage passes. Run-scoped ready/failed markers reject
+  stale handoffs.
 - `./scripts/update_docs.sh`: manually apply a running-corpus diff without
   stopping online GPU actors. A dedicated CPU Ray actor embeds changed chunks,
   Main builds a candidate BM25S index in parallel, and a retrieval-only gate
@@ -75,6 +82,9 @@ configurable LLM provider.
   the labeled routing set; this may download model weights.
 - `python scripts/test_reranker.py`: smoke-test cross-encoder reranker ordering
   with a fake model.
+- `python scripts/test_model_warmup.py`: validate ordered model loading,
+  concurrent maximum-capacity probes, cache release, representative warmup,
+  and startup failure gating with fake Ray actors.
 - `python scripts/test_prompt_budget.py`: validate prompt trimming, query
   budgets, and history compaction behavior.
 - `python scripts/test_settings.py`: validate configuration wiring, auth gates,
@@ -151,9 +161,16 @@ hard maximum; query embeddings use `retrieval` with prompt `query`,
 document chunks use `retrieval` with prompt `document`, and intent-routing
 embeddings use `classification`.
 Offline S3 indexing batches 64 chunks across document boundaries on
-`ray-worker-embedding-bootstrap`. The worker exits after a validated Qdrant
-alias switch; online query embedding then starts in a fresh process with a
-maximum dynamic batch of 16 and a 10ms collection window.
+`ray-worker-embedding-bootstrap` through the dedicated
+`kba_embedding_bootstrap` actor. The indexer destroys that actor after a
+validated Qdrant alias switch, and the worker exits. Online model startup then
+loads both rerankers before the query embedding actor. Before traffic is
+accepted, all three GPU actors must pass a concurrent maximum-capacity
+validation, release temporary CUDA caches, and complete serial representative
+performance warmups. Each reranker representative warmup runs 64
+1,800-token documents with a 256-token query. Any load, capacity, or
+representative warmup failure keeps FastAPI unready. Online query embedding
+uses a maximum dynamic batch of 16 and a 10ms collection window.
 Manual incremental updates instead use the `docs-update` profile's CPU-only
 embedding actor while all online actors remain available. Main builds a full
 candidate BM25S index beside the active index. The final gate drains only query
@@ -165,9 +182,8 @@ candidates from Markdown chunks, Qdrant recalls `RECALL_TOP_K`
 cosine-similarity candidates, reciprocal rank fusion keeps `RRF_TOP_K`
 candidates, `jinaai/jina-reranker-v3` reranks them through its native
 `AutoModel.rerank()` interface, and only `RETRIEVE_TOP_K` chunks enter the
-prompt. The API preloads and warms the reranker during startup by default with
-`RERANKER_PRELOAD=1`; warmup failure is logged as
-`retrieval_degraded=True`/`reranker_degraded=True` but does not prevent startup.
+prompt. The API requires the embedding actor and every configured reranker
+replica to finish the startup validation sequence before becoming ready.
 Keep Hugging Face cache, mirror, or proxy settings ready before rebuilding
 containers. The browser exposes these limits as `BM25 K`, `Cosine K`, `RRF K`,
 and `Final K`, defaulting to `100`, `100`, `64`, and `5`.

@@ -195,6 +195,36 @@ class Settings:
         "EMBEDDING_OFFLINE_BATCH_SIZE",
         64,
     )
+    model_warmup_capacity_enabled: bool = _env_bool(
+        "MODEL_WARMUP_CAPACITY_ENABLED",
+        True,
+    )
+    model_warmup_timeout_seconds: float = _env_float(
+        "MODEL_WARMUP_TIMEOUT_SECONDS",
+        900.0,
+    )
+    embedding_warmup_capacity_tokens: int = _env_int(
+        "EMBEDDING_WARMUP_CAPACITY_TOKENS",
+        3000,
+    )
+    embedding_warmup_representative_tokens: int = _env_int(
+        "EMBEDDING_WARMUP_REPRESENTATIVE_TOKENS",
+        256,
+    )
+    embedding_warmup_rounds: int = _env_int("EMBEDDING_WARMUP_ROUNDS", 2)
+    reranker_warmup_capacity_query_tokens: int = _env_int(
+        "RERANKER_WARMUP_CAPACITY_QUERY_TOKENS",
+        512,
+    )
+    reranker_warmup_representative_query_tokens: int = _env_int(
+        "RERANKER_WARMUP_REPRESENTATIVE_QUERY_TOKENS",
+        256,
+    )
+    reranker_warmup_representative_document_tokens: int = _env_int(
+        "RERANKER_WARMUP_REPRESENTATIVE_DOCUMENT_TOKENS",
+        1800,
+    )
+    reranker_warmup_rounds: int = _env_int("RERANKER_WARMUP_ROUNDS", 1)
     chunk_tokenizer_model: str = os.getenv(
         "CHUNK_TOKENIZER_MODEL",
         os.getenv("EMBEDDING_MODEL", "jinaai/jina-embeddings-v5-text-small"),
@@ -595,6 +625,55 @@ class Settings:
             )
         if self.embedding_offline_batch_size <= 0:
             raise ValueError("EMBEDDING_OFFLINE_BATCH_SIZE must be greater than 0.")
+        if self.model_warmup_timeout_seconds <= 0:
+            raise ValueError("MODEL_WARMUP_TIMEOUT_SECONDS must be greater than 0.")
+        if self.embedding_warmup_capacity_tokens <= 0:
+            raise ValueError(
+                "EMBEDDING_WARMUP_CAPACITY_TOKENS must be greater than 0."
+            )
+        if self.embedding_warmup_representative_tokens <= 0:
+            raise ValueError(
+                "EMBEDDING_WARMUP_REPRESENTATIVE_TOKENS must be greater than 0."
+            )
+        if (
+            self.embedding_warmup_representative_tokens
+            > self.embedding_warmup_capacity_tokens
+        ):
+            raise ValueError(
+                "EMBEDDING_WARMUP_REPRESENTATIVE_TOKENS must not exceed "
+                "EMBEDDING_WARMUP_CAPACITY_TOKENS."
+            )
+        if self.embedding_warmup_rounds <= 0:
+            raise ValueError("EMBEDDING_WARMUP_ROUNDS must be greater than 0.")
+        if self.reranker_warmup_capacity_query_tokens <= 0:
+            raise ValueError(
+                "RERANKER_WARMUP_CAPACITY_QUERY_TOKENS must be greater than 0."
+            )
+        if self.reranker_warmup_representative_query_tokens <= 0:
+            raise ValueError(
+                "RERANKER_WARMUP_REPRESENTATIVE_QUERY_TOKENS must be greater than 0."
+            )
+        if (
+            self.reranker_warmup_representative_query_tokens
+            > self.reranker_warmup_capacity_query_tokens
+        ):
+            raise ValueError(
+                "RERANKER_WARMUP_REPRESENTATIVE_QUERY_TOKENS must not exceed "
+                "RERANKER_WARMUP_CAPACITY_QUERY_TOKENS."
+            )
+        if self.reranker_warmup_representative_document_tokens <= 0:
+            raise ValueError(
+                "RERANKER_WARMUP_REPRESENTATIVE_DOCUMENT_TOKENS must be greater than 0."
+            )
+        if self.reranker_warmup_representative_document_tokens > (
+            self.chunk_body_max_tokens + (2 * self.chunk_overlap_max_tokens)
+        ):
+            raise ValueError(
+                "RERANKER_WARMUP_REPRESENTATIVE_DOCUMENT_TOKENS must not exceed "
+                "the assembled chunk token maximum."
+            )
+        if self.reranker_warmup_rounds <= 0:
+            raise ValueError("RERANKER_WARMUP_ROUNDS must be greater than 0.")
         if self.retrieve_score_threshold < 0:
             raise ValueError(
                 "RETRIEVE_SCORE_THRESHOLD must be greater than or equal to 0."

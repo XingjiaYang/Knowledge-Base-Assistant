@@ -106,6 +106,7 @@ async def assert_query_batching() -> None:
     if results != expected:
         raise AssertionError("Dynamic batch results were not returned to the right caller.")
 
+    actor._warmup_state = "ready"  # noqa: SLF001 - fake store bypasses startup warmup
     health = actor.health()
     batching = health["dynamic_batching"]
     if not isinstance(batching, dict):

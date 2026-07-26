@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import gc
 import logging
 from threading import Lock
 import time
@@ -11,6 +12,7 @@ from app.config import Settings, settings
 
 
 logger = logging.getLogger(__name__)
+_MEBIBYTE = 1024 * 1024
 
 _ray_lock = Lock()
 _embedding_actor: Any | None = None
@@ -24,6 +26,123 @@ _unavailable_actor_names: set[str] = set()
 class _EmbeddingBatchRequest:
     text: str
     future: asyncio.Future[list[list[float]]]
+
+
+class ModelWarmupError(RuntimeError):
+    """Raised when the online model fleet cannot satisfy its startup envelope."""
+
+
+def _cuda_memory_snapshot(device: str | None) -> dict[str, object]:
+    if not device or not device.startswith("cuda"):
+        return {
+            "cuda": False,
+            "allocated_mb": 0.0,
+            "reserved_mb": 0.0,
+            "peak_allocated_mb": 0.0,
+            "peak_reserved_mb": 0.0,
+        }
+
+    import torch
+
+    if not torch.cuda.is_available():
+        return {
+            "cuda": False,
+            "allocated_mb": 0.0,
+            "reserved_mb": 0.0,
+            "peak_allocated_mb": 0.0,
+            "peak_reserved_mb": 0.0,
+        }
+
+    torch.cuda.synchronize()
+    return {
+        "cuda": True,
+        "allocated_mb": round(torch.cuda.memory_allocated() / _MEBIBYTE, 2),
+        "reserved_mb": round(torch.cuda.memory_reserved() / _MEBIBYTE, 2),
+        "peak_allocated_mb": round(
+            torch.cuda.max_memory_allocated() / _MEBIBYTE,
+            2,
+        ),
+        "peak_reserved_mb": round(
+            torch.cuda.max_memory_reserved() / _MEBIBYTE,
+            2,
+        ),
+    }
+
+
+def _reset_cuda_peak_memory(device: str | None) -> None:
+    if not device or not device.startswith("cuda"):
+        return
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _release_cuda_cache(device: str | None) -> dict[str, object]:
+    gc.collect()
+    if device and device.startswith("cuda"):
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    return _cuda_memory_snapshot(device)
+
+
+def _token_ids(tokenizer: object, text: str) -> list[int]:
+    if hasattr(tokenizer, "encode"):
+        encoded = tokenizer.encode(text, add_special_tokens=False)
+    else:
+        encoded = tokenizer(text, add_special_tokens=False)["input_ids"]
+    if encoded and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    return [int(token_id) for token_id in encoded]
+
+
+def _synthetic_text(tokenizer: object, target_tokens: int, label: str) -> tuple[str, int]:
+    if target_tokens <= 0:
+        raise ValueError("Warmup token target must be greater than 0.")
+
+    seed = f"{label} retrieval capacity validation input. "
+    text = seed
+    token_ids = _token_ids(tokenizer, text)
+    while len(token_ids) < target_tokens:
+        multiplier = max(2, (target_tokens + len(token_ids) - 1) // len(token_ids))
+        text *= multiplier
+        token_ids = _token_ids(tokenizer, text)
+
+    if hasattr(tokenizer, "decode"):
+        text = tokenizer.decode(
+            token_ids[:target_tokens],
+            skip_special_tokens=True,
+        )
+        token_ids = _token_ids(tokenizer, text)
+
+    while len(token_ids) < target_tokens:
+        text += seed
+        token_ids = _token_ids(tokenizer, text)
+    return text, len(token_ids)
+
+
+def _stage_report(
+    *,
+    role: str,
+    stage: str,
+    device: str | None,
+    started_at: float,
+    **details: object,
+) -> dict[str, object]:
+    return {
+        "role": role,
+        "stage": stage,
+        "ready": stage == "performance",
+        "device": device or "unknown",
+        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "memory": _cuda_memory_snapshot(device),
+        **details,
+    }
 
 
 class EmbeddingActor:
@@ -50,6 +169,9 @@ class EmbeddingActor:
         self._batch_size_total = 0
         self._last_batch_size = 0
         self._max_observed_batch_size = 0
+        self._warmup_state = "cold"
+        self._warmup_error = ""
+        self._last_warmup_report: dict[str, object] = {}
 
     async def encode_matrix(
         self,
@@ -168,19 +290,235 @@ class EmbeddingActor:
     def vector_size(self) -> int:
         return self.store.vector_size
 
-    def warmup(self) -> int:
-        return self.vector_size()
+    def load_model(self) -> dict[str, object]:
+        self._warmup_state = "loading"
+        self._warmup_error = ""
+        started_at = time.perf_counter()
+        try:
+            vector_size = self.vector_size()
+            self._require_expected_device()
+            self._warmup_state = "loaded"
+            report = _stage_report(
+                role="embedding",
+                stage="load",
+                device=self._model_device(),
+                started_at=started_at,
+                vector_size=vector_size,
+            )
+            self._last_warmup_report = report
+            return report
+        except Exception as exc:
+            self._record_warmup_failure(exc)
+            raise
+
+    async def capacity_probe(
+        self,
+        batch_size: int,
+        input_tokens: int,
+    ) -> dict[str, object]:
+        self._warmup_state = "capacity"
+        self._warmup_error = ""
+        started_at = time.perf_counter()
+        try:
+            self._require_expected_device()
+            tokenizer = self._tokenizer()
+            text, actual_tokens = _synthetic_text(
+                tokenizer,
+                input_tokens,
+                "embedding",
+            )
+            _reset_cuda_peak_memory(self._model_device())
+            rows = await self._encode_strict(
+                [text] * max(1, batch_size),
+                normalize_embeddings=True,
+                task=self.config.embedding_query_task,
+                prompt_name=self.config.embedding_query_prompt_name,
+            )
+            if len(rows) != max(1, batch_size):
+                raise RuntimeError(
+                    "Embedding capacity probe returned an unexpected row count."
+                )
+            self._require_expected_device()
+            self._warmup_state = "capacity_validated"
+            report = _stage_report(
+                role="embedding",
+                stage="capacity",
+                device=self._model_device(),
+                started_at=started_at,
+                batch_size=max(1, batch_size),
+                input_tokens=actual_tokens,
+                padded_tokens=actual_tokens * max(1, batch_size),
+            )
+            self._last_warmup_report = report
+            return report
+        except Exception as exc:
+            self._record_warmup_failure(exc)
+            raise
+
+    async def performance_warmup(
+        self,
+        batch_size: int,
+        input_tokens: int,
+        rounds: int,
+    ) -> dict[str, object]:
+        self._warmup_state = "performance"
+        self._warmup_error = ""
+        started_at = time.perf_counter()
+        try:
+            self._require_expected_device()
+            text, actual_tokens = _synthetic_text(
+                self._tokenizer(),
+                input_tokens,
+                "embedding",
+            )
+            _reset_cuda_peak_memory(self._model_device())
+            for _round in range(max(1, rounds)):
+                if self.config.embedding_dynamic_batch_enabled:
+                    rows = await asyncio.gather(
+                        *(
+                            self.encode_matrix(
+                                text,
+                                True,
+                                self.config.embedding_query_task,
+                                self.config.embedding_query_prompt_name,
+                            )
+                            for _index in range(max(1, batch_size))
+                        )
+                    )
+                    if len(rows) != max(1, batch_size):
+                        raise RuntimeError(
+                            "Embedding performance warmup lost batched requests."
+                        )
+                else:
+                    rows = await self._encode_strict(
+                        [text] * max(1, batch_size),
+                        normalize_embeddings=True,
+                        task=self.config.embedding_query_task,
+                        prompt_name=self.config.embedding_query_prompt_name,
+                    )
+                    if len(rows) != max(1, batch_size):
+                        raise RuntimeError(
+                            "Embedding performance warmup returned an unexpected "
+                            "row count."
+                        )
+            self._require_expected_device()
+            self._warmup_state = "ready"
+            report = _stage_report(
+                role="embedding",
+                stage="performance",
+                device=self._model_device(),
+                started_at=started_at,
+                batch_size=max(1, batch_size),
+                input_tokens=actual_tokens,
+                padded_tokens=actual_tokens * max(1, batch_size),
+                rounds=max(1, rounds),
+            )
+            self._last_warmup_report = report
+            return report
+        except Exception as exc:
+            self._record_warmup_failure(exc)
+            raise
+
+    async def warmup(self) -> dict[str, object]:
+        await asyncio.to_thread(self.load_model)
+        if self.config.model_warmup_capacity_enabled and self._expects_cuda():
+            await self.capacity_probe(
+                self.config.embedding_dynamic_batch_max_size,
+                self.config.embedding_warmup_capacity_tokens,
+            )
+            await asyncio.to_thread(self.release_cuda_cache)
+        return await self.performance_warmup(
+            self.config.embedding_dynamic_batch_max_size,
+            self.config.embedding_warmup_representative_tokens,
+            self.config.embedding_warmup_rounds,
+        )
+
+    def release_cuda_cache(self) -> dict[str, object]:
+        return _release_cuda_cache(self._model_device())
+
+    async def _encode_strict(
+        self,
+        texts: list[str],
+        *,
+        normalize_embeddings: bool,
+        task: str | None,
+        prompt_name: str | None,
+    ) -> list[list[float]]:
+        if self._inference_lock is None:
+            self._inference_lock = asyncio.Lock()
+        async with self._inference_lock:
+            return await asyncio.to_thread(
+                self._encode_strict_sync,
+                texts,
+                normalize_embeddings,
+                task,
+                prompt_name,
+            )
+
+    def _encode_strict_sync(
+        self,
+        texts: list[str],
+        normalize_embeddings: bool,
+        task: str | None,
+        prompt_name: str | None,
+    ) -> list[list[float]]:
+        encode_kwargs = self.store._encode_kwargs(  # noqa: SLF001
+            task,
+            prompt_name=prompt_name,
+        )
+        encode_kwargs["batch_size"] = len(texts)
+        raw_embeddings = self.store.model.encode(
+            texts,
+            normalize_embeddings=normalize_embeddings,
+            **encode_kwargs,
+        )
+        return self.store._embedding_matrix(raw_embeddings)  # noqa: SLF001
+
+    def _tokenizer(self) -> object:
+        model = self.store.model
+        tokenizer = getattr(model, "tokenizer", None)
+        if tokenizer is None:
+            tokenizer = self.store.chunk_tokenizer
+        return tokenizer
+
+    def _model_device(self) -> str:
+        return str(getattr(self.store, "_model_device", "unknown"))
+
+    def _expects_cuda(self) -> bool:
+        return (
+            self.config.cuda_enabled
+            and self.config.ray_embedding_actor_num_gpus > 0
+        )
+
+    def _require_expected_device(self) -> None:
+        if self._expects_cuda() and not self._model_device().startswith("cuda"):
+            raise RuntimeError(
+                "Embedding warmup required CUDA but the model is not on CUDA."
+            )
+
+    def _record_warmup_failure(self, error: Exception) -> None:
+        self._warmup_state = "failed"
+        self._warmup_error = str(error)
 
     def health(self) -> dict[str, object]:
         vector_size = getattr(self.store, "_vector_size", None)
         ready = getattr(self.store, "_model", None) is not None and bool(vector_size)
+        ready = ready and self._warmup_state == "ready"
         if not ready:
-            raise RuntimeError("Document embedding actor is not warmed up.")
+            detail = f": {self._warmup_error}" if self._warmup_error else ""
+            raise RuntimeError(
+                "Document embedding actor is not warmed up "
+                f"(state={self._warmup_state}){detail}."
+            )
         return {
             "ready": True,
             "model": self.store.config.embedding_model,
             "vector_size": int(vector_size),
             "device": str(getattr(self.store, "_model_device", "unknown")),
+            "warmup": {
+                "state": self._warmup_state,
+                "last_report": self._last_warmup_report,
+            },
             "dynamic_batching": {
                 "enabled": self.config.embedding_dynamic_batch_enabled,
                 "max_size": self.config.embedding_dynamic_batch_max_size,
@@ -206,6 +544,10 @@ class RerankerActor:
         from app.reranker import Reranker
 
         self.reranker = Reranker(config, use_ray=False)
+        self.config = config
+        self._warmup_state = "cold"
+        self._warmup_error = ""
+        self._last_warmup_report: dict[str, object] = {}
 
     def rerank(
         self,
@@ -215,16 +557,196 @@ class RerankerActor:
     ) -> list[Any]:
         return self.reranker.rerank(query, contexts, top_k=top_k)
 
-    def warmup(self) -> None:
-        self.reranker.warmup()
+    def load_model(self) -> dict[str, object]:
+        self._warmup_state = "loading"
+        self._warmup_error = ""
+        started_at = time.perf_counter()
+        try:
+            self.reranker.model
+            self._require_expected_device()
+            self._warmup_state = "loaded"
+            report = _stage_report(
+                role="reranker",
+                stage="load",
+                device=self._model_device(),
+                started_at=started_at,
+            )
+            self._last_warmup_report = report
+            return report
+        except Exception as exc:
+            self._record_warmup_failure(exc)
+            raise
+
+    def capacity_probe(
+        self,
+        document_count: int,
+        document_tokens: int,
+        query_tokens: int,
+    ) -> dict[str, object]:
+        return self._run_probe(
+            stage="capacity",
+            document_count=document_count,
+            document_tokens=document_tokens,
+            query_tokens=query_tokens,
+            rounds=1,
+        )
+
+    def performance_warmup(
+        self,
+        document_count: int,
+        document_tokens: int,
+        query_tokens: int,
+        rounds: int,
+    ) -> dict[str, object]:
+        return self._run_probe(
+            stage="performance",
+            document_count=document_count,
+            document_tokens=document_tokens,
+            query_tokens=query_tokens,
+            rounds=rounds,
+        )
+
+    def warmup(self) -> dict[str, object]:
+        self.load_model()
+        if self.config.model_warmup_capacity_enabled and self._expects_cuda():
+            self.capacity_probe(
+                _reranker_warmup_document_count(self.config),
+                _reranker_capacity_document_tokens(self.config),
+                self.config.reranker_warmup_capacity_query_tokens,
+            )
+            self.release_cuda_cache()
+        return self.performance_warmup(
+            _reranker_warmup_document_count(self.config),
+            self.config.reranker_warmup_representative_document_tokens,
+            self.config.reranker_warmup_representative_query_tokens,
+            self.config.reranker_warmup_rounds,
+        )
+
+    def release_cuda_cache(self) -> dict[str, object]:
+        return _release_cuda_cache(self._model_device())
+
+    def _run_probe(
+        self,
+        *,
+        stage: str,
+        document_count: int,
+        document_tokens: int,
+        query_tokens: int,
+        rounds: int,
+    ) -> dict[str, object]:
+        self._warmup_state = stage
+        self._warmup_error = ""
+        started_at = time.perf_counter()
+        try:
+            self._require_expected_device()
+            tokenizer = self._tokenizer()
+            query, actual_query_tokens = _synthetic_text(
+                tokenizer,
+                query_tokens,
+                f"reranker {stage} query",
+            )
+            document, actual_document_tokens = _synthetic_text(
+                tokenizer,
+                document_tokens,
+                f"reranker {stage} document",
+            )
+            documents = [
+                self.reranker._document_text(  # noqa: SLF001
+                    self._warmup_context(document, index)
+                )
+                for index in range(max(1, document_count))
+            ]
+            _reset_cuda_peak_memory(self._model_device())
+            results: object = None
+            for _round in range(max(1, rounds)):
+                results = self.reranker.model.rerank(
+                    query,
+                    documents,
+                    top_n=1,
+                )
+            if not isinstance(results, list) or not results:
+                raise RuntimeError("Reranker warmup returned no results.")
+            self._require_expected_device()
+            self._warmup_state = (
+                "capacity_validated" if stage == "capacity" else "ready"
+            )
+            report = _stage_report(
+                role="reranker",
+                stage=stage,
+                device=self._model_device(),
+                started_at=started_at,
+                document_count=max(1, document_count),
+                document_tokens=actual_document_tokens,
+                query_tokens=actual_query_tokens,
+                total_document_tokens=(
+                    actual_document_tokens * max(1, document_count)
+                ),
+                rounds=max(1, rounds),
+            )
+            self._last_warmup_report = report
+            return report
+        except Exception as exc:
+            self._record_warmup_failure(exc)
+            raise
+
+    def _tokenizer(self) -> object:
+        model = self.reranker.model
+        ensure_tokenizer = getattr(model, "_ensure_tokenizer", None)
+        if callable(ensure_tokenizer):
+            ensure_tokenizer()
+        tokenizer = getattr(model, "_tokenizer", None)
+        if tokenizer is None:
+            raise RuntimeError("Reranker model did not expose its tokenizer.")
+        return tokenizer
+
+    @staticmethod
+    def _warmup_context(text: str, index: int) -> Any:
+        from app.vector_store import SearchResult
+
+        return SearchResult(
+            text=text,
+            source=f"warmup/candidate-{index}.md",
+            chunk_id=index,
+            score=0.0,
+            headings=("Warmup",),
+        )
+
+    def _model_device(self) -> str:
+        return str(getattr(self.reranker, "_model_device", "unknown"))
+
+    def _expects_cuda(self) -> bool:
+        return (
+            self.config.cuda_enabled
+            and self.config.ray_reranker_actor_num_gpus > 0
+        )
+
+    def _require_expected_device(self) -> None:
+        if self._expects_cuda() and not self._model_device().startswith("cuda"):
+            raise RuntimeError(
+                "Reranker warmup required CUDA but the model is not on CUDA."
+            )
+
+    def _record_warmup_failure(self, error: Exception) -> None:
+        self._warmup_state = "failed"
+        self._warmup_error = str(error)
 
     def health(self) -> dict[str, object]:
-        if getattr(self.reranker, "_model", None) is None:
-            raise RuntimeError("Reranker actor is not warmed up.")
+        ready = getattr(self.reranker, "_model", None) is not None
+        ready = ready and self._warmup_state == "ready"
+        if not ready:
+            detail = f": {self._warmup_error}" if self._warmup_error else ""
+            raise RuntimeError(
+                "Reranker actor is not warmed up "
+                f"(state={self._warmup_state}){detail}."
+            )
         return {
             "ready": True,
             "model": self.reranker.config.reranker_model,
             "device": str(getattr(self.reranker, "_model_device", "unknown")),
+            "warmup": {
+                "state": self._warmup_state,
+                "last_report": self._last_warmup_report,
+            },
         }
 
 
@@ -462,61 +984,211 @@ def mark_ray_unavailable(actor_name: str | None = None, config: Settings = setti
         _unavailable_actor_names.update(actor_names)
 
 
-def warmup_model_actors(config: Settings = settings) -> None:
-    embedding_ref: Any | None = None
-    code_embedding_actor: Any | None = None
-    reranker_refs: list[tuple[str, Any]] = []
+def warmup_model_actors(config: Settings = settings) -> dict[str, object]:
+    """Load and validate the online GPU fleet before retrieval accepts traffic."""
+    started_at = time.perf_counter()
+    report: dict[str, object] = {
+        "ready": False,
+        "load_order": [],
+        "load": {},
+        "capacity": {},
+        "capacity_cache_release": {},
+        "performance": {},
+    }
 
-    try:
-        embedding_actor = get_embedding_actor(config)
-        if embedding_actor is not None:
-            embedding_ref = embedding_actor.warmup.remote()
-    except Exception:
-        logger.exception("Ray document embedding actor startup failed.")
+    embedding_actor = get_embedding_actor(config)
+    if embedding_actor is None:
+        raise ModelWarmupError("Ray document embedding actor is unavailable.")
 
-    if config.code_embedding_preload:
-        try:
-            code_embedding_actor = get_code_embedding_actor(config)
-        except Exception:
-            logger.exception("Ray CodeBERT embedding actor startup failed.")
+    reranker_actors = (
+        get_reranker_actors(config, retry_unavailable=True)
+        if config.reranker_enabled
+        else []
+    )
+    if config.reranker_enabled and (
+        len(reranker_actors) != config.ray_reranker_actor_replicas
+    ):
+        raise ModelWarmupError(
+            "Not all configured Ray reranker replicas are available: "
+            f"expected={config.ray_reranker_actor_replicas} "
+            f"actual={len(reranker_actors)}."
+        )
 
-    if config.reranker_enabled:
-        try:
-            for actor_name, reranker_actor in get_reranker_actors(config):
-                reranker_refs.append((actor_name, reranker_actor.warmup.remote()))
-        except Exception:
-            logger.exception("Ray reranker actor startup failed.")
+    load_reports = report["load"]
+    load_order = report["load_order"]
+    assert isinstance(load_reports, dict)
+    assert isinstance(load_order, list)
 
-    if code_embedding_actor is not None:
-        for attempt in range(1, config.code_embedding_preload_retries + 1):
+    for actor_name, actor in reranker_actors:
+        load_order.append(actor_name)
+        load_reports[actor_name] = _run_remote_stage(
+            actor.load_model.remote(),
+            config,
+            stage=f"{actor_name}.load",
+        )
+
+    load_order.append(config.ray_embedding_actor_name)
+    load_reports[config.ray_embedding_actor_name] = _run_remote_stage(
+        embedding_actor.load_model.remote(),
+        config,
+        stage=f"{config.ray_embedding_actor_name}.load",
+    )
+
+    capacity_reports = report["capacity"]
+    cache_reports = report["capacity_cache_release"]
+    assert isinstance(capacity_reports, dict)
+    assert isinstance(cache_reports, dict)
+    actors = [(config.ray_embedding_actor_name, embedding_actor), *reranker_actors]
+
+    if config.model_warmup_capacity_enabled and config.cuda_enabled:
+        capacity_refs: list[tuple[str, Any]] = [
+            (
+                config.ray_embedding_actor_name,
+                embedding_actor.capacity_probe.remote(
+                    config.embedding_dynamic_batch_max_size,
+                    config.embedding_warmup_capacity_tokens,
+                ),
+            )
+        ]
+        capacity_refs.extend(
+            (
+                actor_name,
+                actor.capacity_probe.remote(
+                    _reranker_warmup_document_count(config),
+                    _reranker_capacity_document_tokens(config),
+                    config.reranker_warmup_capacity_query_tokens,
+                ),
+            )
+            for actor_name, actor in reranker_actors
+        )
+        errors: list[str] = []
+        for actor_name, ref in capacity_refs:
             try:
-                ray_get(code_embedding_actor.warmup.remote(), config)
-                break
-            except Exception as exc:
-                if attempt >= config.code_embedding_preload_retries:
-                    logger.exception("Ray CodeBERT embedding actor warmup failed.")
-                    break
-                logger.warning(
-                    "Ray CodeBERT embedding actor warmup failed; retrying "
-                    "attempt %s/%s in %.1fs: %s",
-                    attempt + 1,
-                    config.code_embedding_preload_retries,
-                    config.code_embedding_preload_retry_seconds,
-                    exc,
+                capacity_reports[actor_name] = _run_remote_stage(
+                    ref,
+                    config,
+                    stage=f"{actor_name}.capacity",
                 )
-                time.sleep(config.code_embedding_preload_retry_seconds)
+            except Exception as exc:
+                errors.append(f"{actor_name}: {exc}")
 
-    if embedding_ref is not None:
-        try:
-            ray_get(embedding_ref, config)
-        except Exception:
-            logger.exception("Ray document embedding actor warmup failed.")
+        release_refs = [
+            (actor_name, actor.release_cuda_cache.remote())
+            for actor_name, actor in actors
+        ]
+        for actor_name, ref in release_refs:
+            try:
+                cache_reports[actor_name] = _run_remote_stage(
+                    ref,
+                    config,
+                    stage=f"{actor_name}.capacity_cache_release",
+                )
+            except Exception as exc:
+                errors.append(f"{actor_name} cache release: {exc}")
 
-    for actor_name, reranker_ref in reranker_refs:
+        if errors:
+            raise ModelWarmupError(
+                "Concurrent maximum-capacity validation failed; retrieval will "
+                "not become ready. " + "; ".join(errors)
+            )
+    else:
+        report["capacity"] = {
+            "skipped": True,
+            "reason": (
+                "disabled"
+                if not config.model_warmup_capacity_enabled
+                else "CUDA disabled"
+            ),
+        }
+
+    performance_reports = report["performance"]
+    assert isinstance(performance_reports, dict)
+    performance_reports[config.ray_embedding_actor_name] = _run_remote_stage(
+        embedding_actor.performance_warmup.remote(
+            config.embedding_dynamic_batch_max_size,
+            config.embedding_warmup_representative_tokens,
+            config.embedding_warmup_rounds,
+        ),
+        config,
+        stage=f"{config.ray_embedding_actor_name}.performance",
+    )
+    for actor_name, actor in reranker_actors:
+        performance_reports[actor_name] = _run_remote_stage(
+            actor.performance_warmup.remote(
+                _reranker_warmup_document_count(config),
+                config.reranker_warmup_representative_document_tokens,
+                config.reranker_warmup_representative_query_tokens,
+                config.reranker_warmup_rounds,
+            ),
+            config,
+            stage=f"{actor_name}.performance",
+        )
+
+    _warmup_code_embedding_actor(config)
+    report["ready"] = True
+    report["duration_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+    logger.info("Ray online model fleet warmup complete: %s", report)
+    return report
+
+
+def _run_remote_stage(
+    ref: Any,
+    config: Settings,
+    *,
+    stage: str,
+) -> object:
+    try:
+        return ray_get(
+            ref,
+            config,
+            timeout_seconds=config.model_warmup_timeout_seconds,
+        )
+    except Exception as exc:
+        raise ModelWarmupError(f"Model warmup stage {stage} failed: {exc}") from exc
+
+
+def _reranker_warmup_document_count(config: Settings) -> int:
+    return max(
+        1,
+        min(config.rrf_top_k, config.reranker_max_documents_per_call),
+    )
+
+
+def _reranker_capacity_document_tokens(config: Settings) -> int:
+    return (
+        config.chunk_body_max_tokens
+        + (2 * config.chunk_overlap_max_tokens)
+    )
+
+
+def _warmup_code_embedding_actor(config: Settings) -> None:
+    if not config.code_embedding_preload:
+        return
+    try:
+        actor = get_code_embedding_actor(config)
+    except Exception:
+        logger.exception("Ray CodeBERT embedding actor startup failed.")
+        return
+    if actor is None:
+        return
+
+    for attempt in range(1, config.code_embedding_preload_retries + 1):
         try:
-            ray_get(reranker_ref, config)
-        except Exception:
-            logger.exception("Ray reranker actor %s warmup failed.", actor_name)
+            ray_get(actor.warmup.remote(), config)
+            return
+        except Exception as exc:
+            if attempt >= config.code_embedding_preload_retries:
+                logger.exception("Ray CodeBERT embedding actor warmup failed.")
+                return
+            logger.warning(
+                "Ray CodeBERT embedding actor warmup failed; retrying "
+                "attempt %s/%s in %.1fs: %s",
+                attempt + 1,
+                config.code_embedding_preload_retries,
+                config.code_embedding_preload_retry_seconds,
+                exc,
+            )
+            time.sleep(config.code_embedding_preload_retry_seconds)
 
 
 def _get_or_create_actor(

@@ -13,6 +13,7 @@ x-ray-worker-env: &ray-worker-env
   HF_HOME: ${HF_HOME:-/root/.cache/huggingface}
   HF_HUB_DISABLE_XET: ${HF_HUB_DISABLE_XET:-1}
   GRPC_ENABLE_FORK_SUPPORT: ${GRPC_ENABLE_FORK_SUPPORT:-0}
+  PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
   HTTP_PROXY: ${DOCKER_HTTP_PROXY:-}
   HTTPS_PROXY: ${DOCKER_HTTPS_PROXY:-}
   NO_PROXY: ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,minio,docs-indexer,${DOCKER_NO_PROXY:-postgres,pgbouncer,redis,session-archiver,qdrant,minio,vllm,main,ray-head,ray-worker-embedding-bootstrap,ray-worker-embedding-1,ray-worker-reranker-1,ray-worker-reranker-2,docs-indexer,localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
@@ -375,7 +376,8 @@ services:
         }
         trap on_index_error ERR
         python scripts/init_docs_on_build.py \
-          --build-id-file /app/.image_build_id
+          --build-id-file /app/.image_build_id \
+          --destroy-embedding-actor-on-exit
         python scripts/startup_pipeline_state.py ready \
           --run-id-file /startup-state/run-id \
           --ready-file /startup-state/docs-ready \
@@ -423,7 +425,7 @@ services:
       RAY_NAMESPACE: ${RAY_NAMESPACE:-kba}
       RAY_ACTOR_NUM_CPUS: ${RAY_ACTOR_NUM_CPUS:-1}
       RAY_EMBEDDING_ACTOR_NUM_GPUS: ${RAY_EMBEDDING_ACTOR_NUM_GPUS:-0.5}
-      RAY_EMBEDDING_ACTOR_NAME: ${RAY_EMBEDDING_ACTOR_NAME:-kba_embedding}
+      RAY_EMBEDDING_ACTOR_NAME: ${RAY_BOOTSTRAP_EMBEDDING_ACTOR_NAME:-kba_embedding_bootstrap}
       RAY_EMBEDDING_ACTOR_RESOURCE: ${RAY_EMBEDDING_ACTOR_RESOURCE:-ray_worker_embedding}
       RAY_TASK_TIMEOUT_SECONDS: ${RAY_TASK_TIMEOUT_SECONDS:-300}
     volumes:
@@ -873,6 +875,11 @@ services:
       EMBEDDING_DYNAMIC_BATCH_MAX_SIZE: ${EMBEDDING_DYNAMIC_BATCH_MAX_SIZE:-16}
       EMBEDDING_DYNAMIC_BATCH_WAIT_MS: ${EMBEDDING_DYNAMIC_BATCH_WAIT_MS:-10}
       EMBEDDING_OFFLINE_BATCH_SIZE: ${EMBEDDING_OFFLINE_BATCH_SIZE:-64}
+      MODEL_WARMUP_CAPACITY_ENABLED: ${MODEL_WARMUP_CAPACITY_ENABLED:-1}
+      MODEL_WARMUP_TIMEOUT_SECONDS: ${MODEL_WARMUP_TIMEOUT_SECONDS:-900}
+      EMBEDDING_WARMUP_CAPACITY_TOKENS: ${EMBEDDING_WARMUP_CAPACITY_TOKENS:-3000}
+      EMBEDDING_WARMUP_REPRESENTATIVE_TOKENS: ${EMBEDDING_WARMUP_REPRESENTATIVE_TOKENS:-256}
+      EMBEDDING_WARMUP_ROUNDS: ${EMBEDDING_WARMUP_ROUNDS:-2}
       CHUNK_TOKENIZER_MODEL: ${CHUNK_TOKENIZER_MODEL:-jinaai/jina-embeddings-v5-text-small}
       CHUNK_TOKENIZER_TRUST_REMOTE_CODE: ${CHUNK_TOKENIZER_TRUST_REMOTE_CODE:-1}
       CHUNK_BODY_TARGET_TOKENS: ${CHUNK_BODY_TARGET_TOKENS:-1600}
@@ -890,6 +897,10 @@ services:
       RERANKER_TRUST_REMOTE_CODE: ${RERANKER_TRUST_REMOTE_CODE:-1}
       RERANKER_DTYPE: ${RERANKER_DTYPE:-auto}
       RERANKER_MAX_DOCUMENTS_PER_CALL: ${RERANKER_MAX_DOCUMENTS_PER_CALL:-64}
+      RERANKER_WARMUP_CAPACITY_QUERY_TOKENS: ${RERANKER_WARMUP_CAPACITY_QUERY_TOKENS:-512}
+      RERANKER_WARMUP_REPRESENTATIVE_QUERY_TOKENS: ${RERANKER_WARMUP_REPRESENTATIVE_QUERY_TOKENS:-256}
+      RERANKER_WARMUP_REPRESENTATIVE_DOCUMENT_TOKENS: ${RERANKER_WARMUP_REPRESENTATIVE_DOCUMENT_TOKENS:-1800}
+      RERANKER_WARMUP_ROUNDS: ${RERANKER_WARMUP_ROUNDS:-1}
       RAY_ENABLED: ${RAY_ENABLED:-1}
       RAY_ADDRESS: ${RAY_ADDRESS:-ray://ray-head:10001}
       RAY_LOCAL_FALLBACK: ${RAY_LOCAL_FALLBACK:-0}

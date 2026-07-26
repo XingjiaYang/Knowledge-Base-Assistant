@@ -88,6 +88,11 @@ def assert_llm_settings() -> None:
         embedding_dynamic_batch_max_size=16,
         embedding_dynamic_batch_wait_ms=10.0,
         embedding_offline_batch_size=64,
+        model_warmup_capacity_enabled=True,
+        model_warmup_timeout_seconds=45.0,
+        embedding_warmup_capacity_tokens=2048,
+        embedding_warmup_representative_tokens=128,
+        embedding_warmup_rounds=3,
         docs_commit_url="http://main:8080/internal/docs/index",
         docs_commit_token="test-commit-token",
         docs_commit_http_timeout_seconds=900.0,
@@ -113,6 +118,10 @@ def assert_llm_settings() -> None:
         reranker_preload=True,
         reranker_dtype="auto",
         reranker_max_documents_per_call=32,
+        reranker_warmup_capacity_query_tokens=256,
+        reranker_warmup_representative_query_tokens=64,
+        reranker_warmup_representative_document_tokens=1200,
+        reranker_warmup_rounds=2,
         ray_enabled=True,
         ray_address="ray://localhost:10001",
         ray_local_fallback=False,
@@ -179,6 +188,14 @@ def assert_llm_settings() -> None:
     ):
         raise AssertionError("Embedding dynamic batching should be configurable.")
     if (
+        not config.model_warmup_capacity_enabled
+        or config.model_warmup_timeout_seconds != 45.0
+        or config.embedding_warmup_capacity_tokens != 2048
+        or config.embedding_warmup_representative_tokens != 128
+        or config.embedding_warmup_rounds != 3
+    ):
+        raise AssertionError("Embedding startup warmup should be configurable.")
+    if (
         config.docs_commit_url != "http://main:8080/internal/docs/index"
         or config.docs_commit_token != "test-commit-token"
         or config.docs_commit_http_timeout_seconds != 900.0
@@ -225,6 +242,13 @@ def assert_llm_settings() -> None:
         raise AssertionError("Reranker dtype should be configurable.")
     if config.reranker_max_documents_per_call != 32:
         raise AssertionError("Reranker per-call document limit should be configurable.")
+    if (
+        config.reranker_warmup_capacity_query_tokens != 256
+        or config.reranker_warmup_representative_query_tokens != 64
+        or config.reranker_warmup_representative_document_tokens != 1200
+        or config.reranker_warmup_rounds != 2
+    ):
+        raise AssertionError("Reranker startup warmup should be configurable.")
     if (
         not config.ray_enabled
         or config.ray_address != "ray://localhost:10001"
@@ -745,6 +769,14 @@ def assert_invalid_settings_rejected() -> None:
         {"recall_top_k": 0},
         {"rrf_top_k": 0},
         {"embedding_offline_batch_size": 0},
+        {"model_warmup_timeout_seconds": 0},
+        {"embedding_warmup_capacity_tokens": 0},
+        {"embedding_warmup_representative_tokens": 0},
+        {
+            "embedding_warmup_capacity_tokens": 8,
+            "embedding_warmup_representative_tokens": 9,
+        },
+        {"embedding_warmup_rounds": 0},
         {"docs_commit_url": "http://main/internal", "docs_commit_token": ""},
         {"docs_commit_http_timeout_seconds": 0},
         {"docs_commit_drain_timeout_seconds": 0},
@@ -770,6 +802,19 @@ def assert_invalid_settings_rejected() -> None:
         {"reranker_model": ""},
         {"reranker_dtype": ""},
         {"reranker_max_documents_per_call": 0},
+        {"reranker_warmup_capacity_query_tokens": 0},
+        {"reranker_warmup_representative_query_tokens": 0},
+        {
+            "reranker_warmup_capacity_query_tokens": 8,
+            "reranker_warmup_representative_query_tokens": 9,
+        },
+        {"reranker_warmup_representative_document_tokens": 0},
+        {
+            "chunk_body_max_tokens": 100,
+            "chunk_overlap_max_tokens": 10,
+            "reranker_warmup_representative_document_tokens": 121,
+        },
+        {"reranker_warmup_rounds": 0},
         {"ray_actor_num_cpus": 0},
         {"ray_embedding_actor_num_gpus": -0.1},
         {"ray_reranker_actor_num_gpus": -0.1},
@@ -904,6 +949,21 @@ def assert_default_embedding_settings() -> None:
         raise AssertionError("Default reranker actor should request fractional GPU.")
     if config.ray_reranker_actor_replicas != 2:
         raise AssertionError("Default reranker actor replicas should be two.")
+    if (
+        not config.model_warmup_capacity_enabled
+        or config.model_warmup_timeout_seconds != 900.0
+        or config.embedding_warmup_capacity_tokens != 3000
+        or config.embedding_warmup_representative_tokens != 256
+        or config.embedding_warmup_rounds != 2
+    ):
+        raise AssertionError("Default embedding startup warmup envelope changed.")
+    if (
+        config.reranker_warmup_capacity_query_tokens != 512
+        or config.reranker_warmup_representative_query_tokens != 256
+        or config.reranker_warmup_representative_document_tokens != 1800
+        or config.reranker_warmup_rounds != 1
+    ):
+        raise AssertionError("Default reranker startup warmup envelope changed.")
     if config.health_probe_interval_seconds != 10.0:
         raise AssertionError("Default healthy probe interval should be 10 seconds.")
     if config.health_probe_degraded_interval_seconds != 3.0:
