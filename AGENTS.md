@@ -198,11 +198,16 @@ warning, and server logs write the degradation booleans.
 Conversation memory defaults to API-scale context windows:
 `LLM_CONTEXT_MAX_TOKENS=256000`, safety margin `8192`, prompt overhead `2048`,
 `CONVERSATION_SUMMARY_MAX_CHARS=256000`, `SUMMARY_HISTORY_MAX_CHARS=200000`,
-and `SUMMARY_MAX_TOKENS=4096`. History is not count-truncated before
+and `SUMMARY_MAX_TOKENS=4096`. Questions and stored messages have no
+application-level 8K/16K character cap. History is not count-truncated before
 compaction (`HISTORY_MAX_MESSAGES=0`); compaction runs only when estimated
 summary + uncompressed history would exceed the active context window after
 reserving output, question, safety, prompt overhead, and expected retrieved
-reference tokens.
+reference tokens. Intent-router character budgets apply only to temporary
+classification views and never truncate or mutate Redis/PostgreSQL session
+messages. On compaction, only messages older than the latest
+`HISTORY_RECENT_TURNS` are merged into the rolling summary; raw messages remain
+stored and `compacted_message_count` excludes them from later prompt loading.
 
 The intent router is layered: keyword rules short-circuit explicit/domain
 cases, general technical/database questions outside the local corpus, and

@@ -671,7 +671,7 @@ class RAGPipeline:
             clean.append(
                 ChatMessage(
                     role=message.role,
-                    content=self.budget.trim_message(content),
+                    content=content,
                     used_rag=getattr(message, "used_rag", None),
                     route=getattr(message, "route", ""),
                     context_count=max(

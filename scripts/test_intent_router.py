@@ -568,12 +568,14 @@ def assert_classification_text_prioritizes_current_question() -> None:
             intent_embedding_text_max_chars=180,
         )
     )
+    history = [
+        Message("user", "Earlier user context " + ("x" * 200)),
+        Message("assistant", "Earlier assistant context " + ("y" * 200)),
+    ]
+    original_content = [message.content for message in history]
     text = router._classification_text(
         "What is the current routing question?",
-        [
-            Message("user", "Earlier user context " + ("x" * 200)),
-            Message("assistant", "Earlier assistant context " + ("y" * 200)),
-        ],
+        history,
         "Long compact summary " + ("z" * 400),
     )
 
@@ -581,8 +583,10 @@ def assert_classification_text_prioritizes_current_question() -> None:
         raise AssertionError("Intent embedding text should prioritize current question.")
     if len(text) > 180:
         raise AssertionError("Intent embedding text should respect total budget.")
+    if [message.content for message in history] != original_content:
+        raise AssertionError("Intent input budgeting must not mutate session history.")
 
-    print("Classification text current-question priority -> ok")
+    print("Classification text priority and session isolation -> ok")
 
 
 def assert_direct_task_matching_is_case_insensitive() -> None:

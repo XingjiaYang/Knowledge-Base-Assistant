@@ -15,8 +15,6 @@ class PromptMessage(Protocol):
 
 @dataclass(frozen=True)
 class PromptBudget:
-    message_max_chars: int
-    history_compact_after_turns: int
     conversation_summary_max_chars: int
     summary_history_max_chars: int
     summary_max_tokens: int
@@ -31,11 +29,6 @@ class PromptBudget:
     @classmethod
     def from_config(cls, config: object) -> "PromptBudget":
         return cls(
-            message_max_chars=getattr(config, "message_max_chars"),
-            history_compact_after_turns=getattr(
-                config,
-                "history_compact_after_turns",
-            ),
             conversation_summary_max_chars=getattr(
                 config,
                 "conversation_summary_max_chars",
@@ -65,9 +58,6 @@ class PromptBudget:
                 "intent_embedding_text_max_chars",
             ),
         )
-
-    def trim_message(self, content: str) -> str:
-        return self.trim_text(content, self.message_max_chars, strategy="middle")
 
     def trim_summary(self, summary: str) -> str:
         return self.trim_text(
