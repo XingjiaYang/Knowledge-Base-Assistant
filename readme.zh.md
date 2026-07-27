@@ -528,6 +528,8 @@ context上限约束的是batch内每条sequence，
 不是整个GPU batch的token总和。Actor的轻量`health()`响应和检索压测报告会暴露
 配置batch size、等待时间、队列深度、batch数、请求数和实际平均batch size。
 `SEARCH_QUERY_MAX_CHARS=3000`仍是检索query的字符级保护，与模型token上限相互独立。
+它只约束由最近用户消息组装、供BM25/Qdrant召回使用的辅助query，不会截断Session
+存储内容，也不会截断最终LLM Prompt中的当前问题或历史消息。
 
 意图路由是状态感知的，但不会把所有历史塞给每一层。第一层会把当前语料外的通用
 技术/数据库问题判 direct；也只在上一轮 assistant 确实使用过检索 contexts，且
@@ -543,10 +545,15 @@ context上限约束的是batch内每条sequence，
 
 对话 summary 的默认预算按 API 长上下文模型设置：
 `LLM_CONTEXT_MAX_TOKENS=256000`、安全余量 `8192`、prompt overhead `2048`。
-`HISTORY_MAX_MESSAGES=0` 表示压缩前不按消息条数截断；`RAGPipeline` 会估算
+问题和已存储消息不再有应用层 8K/16K 字符上限，
+`HISTORY_MAX_MESSAGES=0` 表示压缩前也不按消息条数截断；`RAGPipeline` 会估算
 summary + 未压缩 history，并在扣除输出、当前 query、安全余量、prompt overhead 和
-预期引用 token 后接近上下文上限时才触发压缩。唯一 superuser 可以在 Admin UI
-修改运行时 LLM context window，后续回答会使用该值。
+预期引用 token 后接近上下文上限时才触发压缩。触发后，最近
+`HISTORY_RECENT_TURNS=16`轮之前的消息会合并进滚动summary；原始消息继续保存在
+Redis/PostgreSQL中，只通过`compacted_message_count`从后续Prompt加载范围排除。
+Intent Router只读取独立裁剪后的分类输入副本，其预算不会截断或改写Redis/PG
+Session消息。唯一superuser可以在Admin UI修改运行时LLM context window，后续回答
+会使用该值。
 
 `CUDA=TRUE` 是默认值，Ray model worker 会暴露 GPU 资源，并把 1 个 Jina
 embedding actor 和 2 个 Jina reranker actor replica 作为 detached named actor

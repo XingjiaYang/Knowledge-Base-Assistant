@@ -648,8 +648,6 @@ LLM_ANTHROPIC_VERSION=2023-06-01
 
 API_TOP_K_MAX=20
 API_RECALL_TOP_K_MAX=1000
-API_MESSAGE_MAX_CHARS=16000
-API_QUESTION_MAX_CHARS=16000
 API_SUMMARY_MAX_CHARS=12000
 API_HISTORY_MAX_MESSAGES=120
 
@@ -713,9 +711,7 @@ RERANKER_DTYPE=auto
 RERANKER_MAX_DOCUMENTS_PER_CALL=64
 
 HISTORY_RECENT_TURNS=16
-HISTORY_COMPACT_AFTER_TURNS=40
 HISTORY_MAX_MESSAGES=0
-MESSAGE_MAX_CHARS=8000
 CONVERSATION_SUMMARY_MAX_CHARS=256000
 SUMMARY_HISTORY_MAX_CHARS=200000
 SUMMARY_MAX_TOKENS=4096
@@ -770,7 +766,10 @@ of all sequences in a GPU batch. The actor's lightweight `health()` response
 and the retrieval benchmark expose the configured size, wait time, queue depth,
 batch count, request count, and observed average batch size.
 `SEARCH_QUERY_MAX_CHARS=3000` remains the retrieval-query character guard and
-is independent of the model's token limit.
+is independent of the model's token limit. It applies only to the auxiliary
+query assembled from recent user turns for BM25/Qdrant recall; it never
+truncates stored session messages or the current/history messages assembled
+into the final LLM prompt.
 
 Intent routing is state-aware without feeding all history to every layer. The
 first keyword layer routes general technical/database topics outside the local
@@ -790,11 +789,17 @@ the route as `rag_only`.
 
 Conversation memory is sized for large API-context models. The default context
 window is `256000` tokens, with an `8192` token safety margin and `2048` token
-prompt-overhead reserve. History is not count-truncated before compaction
-(`HISTORY_MAX_MESSAGES=0`); instead, `RAGPipeline` estimates summary plus
-uncompressed history and compacts only when that estimate would exceed the
-active context window after reserving output, the current question, safety,
-prompt overhead, and expected retrieved references. The superuser can override
+prompt-overhead reserve. Questions and stored messages have no application-level
+8K/16K character cap, and history is not count-truncated before compaction
+(`HISTORY_MAX_MESSAGES=0`). `RAGPipeline` estimates summary plus uncompressed
+history and compacts only when that estimate would exceed the active context
+window after reserving output, the current question, safety, prompt overhead,
+and expected retrieved references. When compaction triggers, messages older
+than the latest `HISTORY_RECENT_TURNS=16` turns are merged into the rolling
+summary; the original messages remain in Redis/PostgreSQL, while
+`compacted_message_count` excludes them from subsequent prompt loading. Intent
+routing receives independently bounded classification copies; those budgets
+never truncate or mutate Redis/PG session messages. The superuser can override
 the runtime LLM context-window size from the Admin UI.
 
 When intent routing chooses RAG, the pipeline now performs hybrid recall before

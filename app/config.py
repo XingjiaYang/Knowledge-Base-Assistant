@@ -401,8 +401,6 @@ class Settings:
         "2023-06-01",
     )
 
-    api_message_max_chars: int = _env_int("API_MESSAGE_MAX_CHARS", 16000)
-    api_question_max_chars: int = _env_int("API_QUESTION_MAX_CHARS", 16000)
     api_summary_max_chars: int = _env_int("API_SUMMARY_MAX_CHARS", 12000)
     api_history_max_messages: int = _env_int("API_HISTORY_MAX_MESSAGES", 120)
     auth_enabled: bool = True
@@ -473,9 +471,7 @@ class Settings:
     )
 
     history_recent_turns: int = _env_int("HISTORY_RECENT_TURNS", 16)
-    history_compact_after_turns: int = _env_int("HISTORY_COMPACT_AFTER_TURNS", 40)
     history_max_messages: int = _env_int("HISTORY_MAX_MESSAGES", 0)
-    message_max_chars: int = _env_int("MESSAGE_MAX_CHARS", 8000)
     conversation_summary_max_chars: int = _env_int(
         "CONVERSATION_SUMMARY_MAX_CHARS",
         256000,
@@ -799,10 +795,6 @@ class Settings:
             raise ValueError(
                 "LLM_CONTEXT_PROMPT_OVERHEAD_TOKENS must be greater than or equal to 0."
             )
-        if self.api_message_max_chars <= 0:
-            raise ValueError("API_MESSAGE_MAX_CHARS must be greater than 0.")
-        if self.api_question_max_chars <= 0:
-            raise ValueError("API_QUESTION_MAX_CHARS must be greater than 0.")
         if self.api_summary_max_chars < 0:
             raise ValueError(
                 "API_SUMMARY_MAX_CHARS must be greater than or equal to 0."

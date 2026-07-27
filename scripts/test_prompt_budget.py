@@ -71,10 +71,10 @@ def assert_summary_middle_truncation() -> None:
     print("Summary middle truncation -> ok")
 
 
-def assert_history_normalization_budget() -> None:
-    config = Settings(history_max_messages=2, message_max_chars=60)
+def assert_history_normalization_preserves_message_content() -> None:
+    config = Settings(history_max_messages=2)
     pipeline = make_pipeline(config)
-    long_message = "MESSAGE_START " + ("x" * 120) + " MESSAGE_END"
+    long_message = "MESSAGE_START " + ("x" * 20000) + " MESSAGE_END"
 
     clean = pipeline._normalize_history(
         [
@@ -88,13 +88,10 @@ def assert_history_normalization_budget() -> None:
         raise AssertionError("History max message count was not applied.")
     if clean[0].role != "user" or clean[1].content != "recent message":
         raise AssertionError("History should keep the most recent messages.")
-    if (
-        "MESSAGE_START" not in clean[0].content
-        or "MESSAGE_END" not in clean[0].content
-    ):
-        raise AssertionError("Message trim should preserve both head and tail.")
+    if clean[0].content != long_message:
+        raise AssertionError("History normalization must preserve full message content.")
 
-    print("History normalization budget -> ok")
+    print("History normalization preserves message content -> ok")
 
 
 def assert_search_query_budget() -> None:
@@ -144,6 +141,7 @@ def assert_compaction_threshold() -> None:
         chunk_body_max_tokens=20,
         chunk_overlap_target_tokens=0,
         chunk_overlap_max_tokens=0,
+        reranker_warmup_representative_document_tokens=20,
     )
     pipeline = make_pipeline(config)
     history = [
@@ -163,7 +161,7 @@ def assert_compaction_threshold() -> None:
 
 def main() -> None:
     assert_summary_middle_truncation()
-    assert_history_normalization_budget()
+    assert_history_normalization_preserves_message_content()
     assert_search_query_budget()
     assert_compaction_threshold()
 

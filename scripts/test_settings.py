@@ -25,8 +25,6 @@ def assert_api_limits() -> None:
     config = Settings(
         api_top_k_max=9,
         api_recall_top_k_max=321,
-        api_message_max_chars=123,
-        api_question_max_chars=456,
         api_summary_max_chars=789,
         api_history_max_messages=10,
         bm25_top_k=111,
@@ -47,10 +45,6 @@ def assert_api_limits() -> None:
         raise AssertionError("RRF top_k should be configurable.")
     if config.retrieve_top_k != 5:
         raise AssertionError("Final top_k should be configurable.")
-    if config.api_message_max_chars != 123:
-        raise AssertionError("API message char limit should be configurable.")
-    if config.api_question_max_chars != 456:
-        raise AssertionError("API question char limit should be configurable.")
     if config.api_summary_max_chars != 789:
         raise AssertionError("API summary char limit should be configurable.")
     if config.api_history_max_messages != 10:
@@ -585,33 +579,38 @@ def assert_app_lifespan_recreates_resources() -> None:
 
 
 def assert_rag_endpoint_accepts_original_body_shape() -> None:
-    from app.main import RAGRequest
+    from app.main import ChatMessageRequest, CodeSearchRequest, RAGRequest
 
+    long_text = "x" * 20000
     request = RAGRequest(
-        question="Hello",
+        question=long_text,
         top_k=1,
         bm25_top_k=9,
         recall_top_k=10,
         rrf_top_k=8,
         rag_only=True,
-        history=[],
+        history=[ChatMessageRequest(role="user", content=long_text)],
         conversation_summary="",
     )
     if (
-        request.question != "Hello"
+        request.question != long_text
         or request.top_k != 1
         or request.bm25_top_k != 9
         or request.recall_top_k != 10
         or request.rrf_top_k != 8
         or request.rag_only is not True
-        or request.history != []
+        or len(request.history) != 1
+        or request.history[0].content != long_text
         or request.conversation_summary != ""
     ):
         raise AssertionError(
             "RAG request should keep accepting the original body shape."
         )
+    code_request = CodeSearchRequest(query=long_text)
+    if code_request.query != long_text:
+        raise AssertionError("Code search should not impose a question char limit.")
 
-    print("RAG endpoint body shape -> ok")
+    print("RAG endpoint body shape and unrestricted message length -> ok")
 
 
 def assert_rag_endpoint_requires_login() -> None:
@@ -840,8 +839,6 @@ def assert_invalid_settings_rejected() -> None:
 
 def assert_prompt_budget_settings() -> None:
     config = Settings(
-        message_max_chars=111,
-        history_compact_after_turns=22,
         conversation_summary_max_chars=222,
         summary_history_max_chars=333,
         summary_max_tokens=44,
@@ -856,8 +853,6 @@ def assert_prompt_budget_settings() -> None:
     budget = PromptBudget.from_config(config)
 
     expected = {
-        "message_max_chars": 111,
-        "history_compact_after_turns": 22,
         "conversation_summary_max_chars": 222,
         "summary_history_max_chars": 333,
         "summary_max_tokens": 44,

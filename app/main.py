@@ -281,19 +281,11 @@ async def no_store_static_cache(request: Request, call_next):
 
 class ChatMessageRequest(BaseModel):
     role: Literal["user", "assistant"]
-    content: str = Field(
-        ...,
-        min_length=1,
-        max_length=settings.api_message_max_chars,
-    )
+    content: str = Field(..., min_length=1)
 
 
 class RAGRequest(BaseModel):
-    question: str = Field(
-        ...,
-        min_length=1,
-        max_length=settings.api_question_max_chars,
-    )
+    question: str = Field(..., min_length=1)
     session_id: UUID | None = None
     top_k: int | None = Field(default=None, ge=1, le=settings.api_top_k_max)
     bm25_top_k: int | None = Field(
@@ -334,11 +326,7 @@ class DocumentIndexCommitRequest(BaseModel):
 
 
 class CodeSearchRequest(BaseModel):
-    query: str = Field(
-        ...,
-        min_length=1,
-        max_length=settings.api_question_max_chars,
-    )
+    query: str = Field(..., min_length=1)
     session_id: UUID | None = None
     repository_ids: list[str] = Field(default_factory=list)
     file_top_k: int | None = Field(
